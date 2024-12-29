@@ -1,101 +1,87 @@
+import os
 import discord
 from discord.ext import commands, tasks
-import asyncio
-from blockfrost import BlockFrostApi
-from datetime import datetime
-import config
+from dotenv import load_dotenv
 from database import Database
+import blockfrost
+from datetime import datetime, timedelta
 
-# Initialize Discord bot with intents and disable voice
+load_dotenv()
+
+# Bot setup with DM permissions
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
-bot = commands.Bot(command_prefix=config.COMMAND_PREFIX, intents=intents)
-bot.voice_clients = None  # Disable voice functionality
+intents.dm_messages = True
 
-# Initialize Blockfrost API
-blockfrost = BlockFrostApi(
-    project_id=config.BLOCKFROST_API_KEY,
-    base_url=config.BLOCKFROST_BASE_URL
-)
-
-# Initialize database
+bot = discord.Bot(intents=intents)
 db = Database()
+
+# Blockfrost setup
+project_id = os.getenv('BLOCKFROST_API_KEY')
+blockfrost_client = blockfrost.BlockFrostApi(
+    project_id=project_id,
+    base_url='https://cardano-mainnet.blockfrost.io/api'
+)
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
+    print(f'{bot.user} is ready and online!')
     check_wallets.start()
 
-async def check_bud_balance(wallet_address):
-    """Check if wallet has required BUD tokens"""
+def has_minimum_bud(address):
     try:
-        # Note: Replace with actual BUD token policy ID
-        assets = await blockfrost.account_addresses_assets(wallet_address)
+        assets = blockfrost_client.address_assets(address)
         for asset in assets:
-            if asset.unit == "BUD_TOKEN_POLICY_ID":  # Replace with actual policy ID
-                return asset.quantity >= config.REQUIRED_BUD_TOKENS
+            # Replace with actual BUD policy ID and asset name
+            if asset.unit == "BUD_POLICY_ID.BUD":  # Update this with actual BUD token ID
+                return asset.quantity >= 20000
         return False
     except Exception as e:
         print(f"Error checking BUD balance: {e}")
         return False
 
-@bot.command(name='addwallet')
+@bot.slash_command(name="addwallet", description="Add a Cardano wallet for tracking")
 async def add_wallet(ctx, wallet_address: str):
-    """Add a wallet to track"""
-    try:
-        # Verify wallet address format
-        if not wallet_address.startswith('addr'):
-            await ctx.send("Invalid wallet address format. Please provide a valid Cardano address.")
-            return
+    # Allow command only in DMs
+    if not isinstance(ctx.channel, discord.DMChannel):
+        await ctx.respond("This command can only be used in DMs!", ephemeral=True)
+        return
 
-        # Check if user has required BUD tokens
-        has_tokens = await check_bud_balance(wallet_address)
-        if not has_tokens:
-            await ctx.send(f"Insufficient BUD tokens. You need at least {config.REQUIRED_BUD_TOKENS:,} BUD tokens to track this wallet.")
-            return
-
-        # Add wallet to database
+    if has_minimum_bud(wallet_address):
         db.add_user(str(ctx.author.id))
         if db.add_wallet(str(ctx.author.id), wallet_address):
             db.update_wallet_status(wallet_address, True)
-            await ctx.send(f"Successfully added wallet {wallet_address} for tracking!")
+            await ctx.respond(f"Wallet {wallet_address} added successfully! You will receive DM notifications for transactions.")
         else:
-            await ctx.send("Error adding wallet. This wallet might already be registered.")
+            await ctx.respond("Error adding wallet. Please try again.")
+    else:
+        await ctx.respond("This wallet doesn't have the minimum required BUD tokens (20,000).")
 
-    except Exception as e:
-        await ctx.send(f"An error occurred: {str(e)}")
-
-@tasks.loop(seconds=config.POLLING_INTERVAL)
+@tasks.loop(minutes=5)
 async def check_wallets():
-    """Check all active wallets for new transactions"""
     active_wallets = db.get_all_active_wallets()
     
     for wallet_address, discord_id in active_wallets:
         try:
-            # Check if wallet still meets token requirements
-            has_tokens = await check_bud_balance(wallet_address)
-            if not has_tokens:
-                db.update_wallet_status(wallet_address, False)
-                user = await bot.fetch_user(int(discord_id))
-                await user.send(f"Wallet {wallet_address} has insufficient BUD tokens. Tracking disabled.")
-                continue
-
-            # Get recent transactions
-            transactions = await blockfrost.address_transactions(wallet_address)
+            # Get transactions from the last 5 minutes
+            now = datetime.now()
+            txs = blockfrost_client.address_transactions(
+                wallet_address,
+                from_block=str(int((now - timedelta(minutes=5)).timestamp()))
+            )
             
-            # Process new transactions and send notifications
-            for tx in transactions[:5]:  # Limit to recent 5 transactions
-                # Add your transaction processing logic here
+            if txs:
                 user = await bot.fetch_user(int(discord_id))
-                await user.send(f"New transaction detected for wallet {wallet_address}:\nTransaction ID: {tx.tx_hash}")
-
+                if user:
+                    for tx in txs:
+                        # Send DM notification
+                        message = f"New transaction in wallet {wallet_address}:\nTransaction ID: {tx.tx_hash}"
+                        try:
+                            await user.send(message)
+                        except discord.Forbidden:
+                            print(f"Cannot send DM to user {discord_id}")
+                        
         except Exception as e:
             print(f"Error checking wallet {wallet_address}: {e}")
 
-def run_bot():
-    """Run the Discord bot"""
-    bot.run(config.DISCORD_TOKEN)
-
-if __name__ == "__main__":
-    run_bot()
+bot.run(os.getenv('DISCORD_TOKEN'))
