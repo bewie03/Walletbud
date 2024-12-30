@@ -44,10 +44,10 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to initialize database: {str(e)}")
             raise
-        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
         try:
+            self.tree = app_commands.CommandTree(self)
             synced = await self.tree.sync()
             logger.info(f"Synced {len(synced)} command(s)")
         except Exception as e:
