@@ -1,18 +1,14 @@
 import os
 import sys
-import json
-import asyncio
 import logging
 import sqlite3
+import asyncio
 from datetime import datetime, timedelta
-from uuid import uuid4
-from functools import wraps
-
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from blockfrost import BlockFrostApi
-import aiohttp
+from blockfrost import BlockFrostApi, ApiError
+from dotenv import load_dotenv
 
 from config import *
 
@@ -197,7 +193,7 @@ class WalletBud(commands.Bot):
             intents=intents,
             help_command=None  # Disable default help command
         )
-        
+
         # Initialize database
         try:
             # Get database path
@@ -221,20 +217,143 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to initialize database: {str(e)}")
             raise
-        
-        # Initialize locks for task management
-        self.wallet_task_lock = asyncio.Lock()
-        self.processing_wallets = False
-        
-        # Initialize rate limiting
-        self.request_count = 0
-        self.last_request_time = datetime.utcnow()
-        self.rate_limit_lock = asyncio.Lock()
-        
-        # Initialize core components
+
+        # Initialize other attributes
         self.blockfrost_client = None
         self.monitoring_paused = False
+
+    async def setup_hook(self):
+        """Called when the bot starts up"""
+        try:
+            logger.info("Bot is starting up...")
+
+            # Call setup_commands to register commands
+            self.setup_commands()
+
+            # Clear existing commands and sync globally
+            await self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            logger.info(f"Registered commands: {[cmd.name for cmd in self.tree.get_commands()]}")
+            
+            # Initialize Blockfrost
+            logger.info("Initializing Blockfrost...")
+            if not await self.init_blockfrost():
+                logger.error("Failed to initialize Blockfrost API")
+                self.monitoring_paused = True
+
+            # Start wallet monitoring if everything is ready
+            if not self.monitoring_paused:
+                logger.info("Starting wallet monitoring task...")
+                self.check_wallets.start()
+            else:
+                logger.warning("Wallet monitoring is paused due to initialization errors")
+
+        except Exception as e:
+            logger.error(f"Error during bot setup: {str(e)}")
+            self.monitoring_paused = True
+            raise
+
+    def setup_commands(self):
+        """Set up bot commands"""
+        logger.info("Setting up commands...")
         
+        # Add health check command
+        @self.tree.command(name="health", description="Check bot health")
+        async def health(interaction: discord.Interaction):
+            command_list = [cmd.name for cmd in self.tree.get_commands()]
+            await interaction.response.send_message(
+                f"Bot is running!\nRegistered commands: {', '.join(command_list)}", 
+                ephemeral=True
+            )
+
+        # Add wallet commands
+        @self.tree.command(name="addwallet", description="Add a wallet to monitor")
+        @app_commands.check(dm_only)
+        @app_commands.check(has_blockfrost)
+        @app_commands.check(not_monitoring_paused)
+        async def addwallet(interaction: discord.Interaction):
+            await self.cmd_addwallet(interaction)
+            
+        @self.tree.command(name="removewallet", description="Stop monitoring a wallet")
+        @app_commands.check(dm_only)
+        async def removewallet(interaction: discord.Interaction, address: str):
+            await self.cmd_removewallet(interaction, address)
+                
+        @self.tree.command(name="listwallets", description="List your monitored wallets")
+        @app_commands.check(dm_only)
+        async def listwallets(interaction: discord.Interaction):
+            await self.cmd_listwallets(interaction)
+        
+        @self.tree.command(name="status", description="Check bot status")
+        async def status(interaction: discord.Interaction):
+            await self.cmd_status(interaction)
+            
+        logger.info(f"Commands setup complete! Registered: {[cmd.name for cmd in self.tree.get_commands()]}")
+
+    # Command callbacks
+    async def cmd_addwallet(self, interaction: discord.Interaction):
+        """Add a wallet to monitor"""
+        await interaction.response.send_modal(WalletModal(self))
+        
+    async def cmd_removewallet(self, interaction: discord.Interaction, address: str):
+        """Remove a wallet from monitoring"""
+        try:
+            self.cursor.execute(
+                'DELETE FROM wallets WHERE address = ? AND discord_id = ?',
+                (address, str(interaction.user.id))
+            )
+            self.conn.commit()
+            await interaction.response.send_message("✅ Wallet removed from monitoring", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error removing wallet: {str(e)}")
+            await interaction.response.send_message("❌ Failed to remove wallet", ephemeral=True)
+            
+    async def cmd_listwallets(self, interaction: discord.Interaction):
+        """List monitored wallets"""
+        try:
+            self.cursor.execute(
+                'SELECT address FROM wallets WHERE discord_id = ?',
+                (str(interaction.user.id),)
+            )
+            wallets = self.cursor.fetchall()
+            
+            if not wallets:
+                await interaction.response.send_message("You are not monitoring any wallets", ephemeral=True)
+                return
+                
+            embed = discord.Embed(
+                title="Your Monitored Wallets",
+                color=discord.Color.blue()
+            )
+            for i, (address,) in enumerate(wallets, 1):
+                embed.add_field(
+                    name=f"Wallet {i}",
+                    value=f"`{address}`",
+                    inline=False
+                )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error listing wallets: {str(e)}")
+            await interaction.response.send_message("❌ Failed to list wallets", ephemeral=True)
+
+    async def cmd_status(self, interaction: discord.Interaction):
+        """Check bot status"""
+        embed = discord.Embed(
+            title="Bot Status",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="Monitoring Status",
+            value="Active" if not self.monitoring_paused else "Paused",
+            inline=False
+        )
+        embed.add_field(
+            name="Blockfrost API",
+            value="Ready" if self.blockfrost_client else "Not Ready",
+            inline=False
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
     def init_db(self):
         """Initialize database tables"""
         try:
@@ -256,102 +375,6 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to create database tables: {str(e)}")
             raise
-        
-    async def setup_hook(self):
-        """Called when the bot starts up"""
-        logger.info("Setting up bot...")
-        try:
-            # Initialize Blockfrost client
-            await self.init_blockfrost()
-            
-            # Start wallet monitoring task
-            if not self.monitoring_paused:
-                self.check_wallets.start()
-                logger.info("Wallet monitoring task started")
-            
-            # Sync commands
-            await self.tree.sync()
-            logger.info("Commands synced globally")
-            
-        except Exception as e:
-            logger.error(f"Setup failed: {str(e)}")
-            raise
-
-    def setup_commands(self):
-        """Set up bot commands"""
-        logger.info("Setting up commands...")
-        
-        @self.tree.command(name="addwallet", description="Add a wallet to monitor")
-        @app_commands.check(dm_only)
-        @app_commands.check(has_blockfrost)
-        @app_commands.check(not_monitoring_paused)
-        async def addwallet(interaction: discord.Interaction):
-            """Add a wallet to monitor"""
-            await interaction.response.send_modal(WalletModal(self))
-            
-        @self.tree.command(name="removewallet", description="Stop monitoring a wallet")
-        @app_commands.check(dm_only)
-        async def removewallet(interaction: discord.Interaction, address: str):
-            """Remove a wallet from monitoring"""
-            try:
-                self.cursor.execute(
-                    'DELETE FROM wallets WHERE address = ? AND discord_id = ?',
-                    (address, str(interaction.user.id))
-                )
-                self.conn.commit()
-                await interaction.response.send_message("✅ Wallet removed from monitoring", ephemeral=True)
-            except Exception as e:
-                logger.error(f"Error removing wallet: {str(e)}")
-                await interaction.response.send_message("❌ Failed to remove wallet", ephemeral=True)
-                
-        @self.tree.command(name="listwallets", description="List your monitored wallets")
-        @app_commands.check(dm_only)
-        async def listwallets(interaction: discord.Interaction):
-            """List monitored wallets"""
-            try:
-                self.cursor.execute(
-                    'SELECT address FROM wallets WHERE discord_id = ?',
-                    (str(interaction.user.id),)
-                )
-                wallets = self.cursor.fetchall()
-                
-                if not wallets:
-                    await interaction.response.send_message("You are not monitoring any wallets", ephemeral=True)
-                    return
-                    
-                embed = discord.Embed(
-                    title="Your Monitored Wallets",
-                    color=discord.Color.blue()
-                )
-                for i, (address,) in enumerate(wallets, 1):
-                    embed.add_field(
-                        name=f"Wallet {i}",
-                        value=f"`{address}`",
-                        inline=False
-                    )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-            except Exception as e:
-                logger.error(f"Error listing wallets: {str(e)}")
-                await interaction.response.send_message("❌ Failed to list wallets", ephemeral=True)
-        
-        @self.tree.command(name="status", description="Check bot status")
-        async def status(interaction: discord.Interaction):
-            """Check bot status"""
-            embed = discord.Embed(
-                title="Bot Status",
-                color=discord.Color.blue()
-            )
-            embed.add_field(
-                name="Monitoring Status",
-                value="Active" if not self.monitoring_paused else "Paused",
-                inline=False
-            )
-            embed.add_field(
-                name="Blockfrost API",
-                value="Ready" if self.blockfrost_client else "Not Ready",
-                inline=False
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
         
     async def on_ready(self):
         """Called when the bot is ready"""
