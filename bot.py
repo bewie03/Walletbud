@@ -467,7 +467,7 @@ class WalletBud(commands.Bot):
             # Get wallet's total balance including all assets
             try:
                 address_info = await self.rate_limited_request(
-                    self.blockfrost_client.address_total,
+                    self.blockfrost_client.address_details,
                     address=wallet_address
                 )
                 logger.info(f"Received address info: {address_info}")
@@ -476,32 +476,15 @@ class WalletBud(commands.Bot):
                     logger.warning(f"No address info found for {wallet_address}")
                     return True, 0  # No assets means 0 balance, but not an error
                 
-            except Exception as e:
-                logger.error(f"Error fetching address info: {str(e)}")
-                if "not found" in str(e).lower():
-                    return False, "Wallet not found on the blockchain. Please check the address and try again."
-                raise
-            
-            # Get detailed asset list
-            try:
-                address_assets = await self.rate_limited_request(
-                    self.blockfrost_client.address_addresses,
-                    address=wallet_address
-                )
-                logger.info(f"Received address assets: {address_assets}")
-                
-                if not address_assets or not hasattr(address_assets, 'amount'):
-                    logger.warning(f"No assets found for {wallet_address}")
-                    return True, 0
-                
                 # Find YUMMI token balance
                 yummi_balance = 0
-                for asset in address_assets.amount:
-                    logger.debug(f"Checking asset: {asset.unit}")
-                    if asset.unit == YUMMI_POLICY_ID:
-                        yummi_balance = int(asset.quantity)
-                        logger.info(f"Found YUMMI balance: {yummi_balance}")
-                        break
+                if hasattr(address_info, 'amount'):
+                    for asset in address_info.amount:
+                        logger.debug(f"Checking asset: {asset.unit}")
+                        if asset.unit == YUMMI_POLICY_ID:
+                            yummi_balance = int(asset.quantity)
+                            logger.info(f"Found YUMMI balance: {yummi_balance}")
+                            break
                 
                 # Check if balance meets requirement
                 if yummi_balance < REQUIRED_BUD_TOKENS:
@@ -510,7 +493,9 @@ class WalletBud(commands.Bot):
                 return True, yummi_balance
                 
             except Exception as e:
-                logger.error(f"Error fetching address assets: {str(e)}")
+                logger.error(f"Error fetching address info: {str(e)}")
+                if "not found" in str(e).lower():
+                    return False, "Wallet not found on the blockchain. Please check the address and try again."
                 raise
             
         except Exception as e:
