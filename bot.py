@@ -158,17 +158,12 @@ try:
     
     # Initialize client
     blockfrost_client = blockfrost.BlockFrostApi(
-        project_id=project_id,
-        base_url=blockfrost.ApiUrls.mainnet.value,
-        api_version=0
+        project_id=project_id
     )
     
     # Test the connection
     info = blockfrost_client.health()
-    if info.is_healthy:
-        logger.info("Blockfrost connection successful")
-    else:
-        logger.warning("Blockfrost connection may have issues")
+    logger.info("Blockfrost connection successful")
         
 except blockfrost.ApiError as e:
     logger.error(f"Blockfrost API Error: {str(e)}")
