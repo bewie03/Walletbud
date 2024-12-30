@@ -189,7 +189,7 @@ class WalletBud(commands.Bot):
                         logger.info(f"Verifying address {address} exists...")
                         await self.rate_limited_request(
                             self.blockfrost_client.address,
-                            address=address
+                            address
                         )
                         
                         # Check YUMMI token balance
@@ -360,7 +360,7 @@ class WalletBud(commands.Bot):
                     # Get total balance using address/total endpoint
                     balance_info = await self.rate_limited_request(
                         self.blockfrost_client.address_total,
-                        address=address
+                        address
                     )
                     
                     if not balance_info or not balance_info.received_sum:
@@ -473,8 +473,8 @@ class WalletBud(commands.Bot):
             
             # Create client with correct base URL
             self.blockfrost_client = BlockFrostApi(
-                project_id=BLOCKFROST_API_KEY,
-                base_url="https://cardano-mainnet.blockfrost.io/api/v0"  # Correct mainnet URL
+                api_key=BLOCKFROST_API_KEY,
+                base_url="https://cardano-mainnet.blockfrost.io/api/v0"
             )
             
             # Test connection with address endpoint
@@ -517,10 +517,34 @@ class WalletBud(commands.Bot):
             self.blockfrost_client = None
             return False
 
-    async def rate_limited_request(self, method, **kwargs):
-        """Make a rate-limited request to Blockfrost"""
+    async def rate_limited_request(self, func, *args, **kwargs):
+        """Make a rate-limited request to the Blockfrost API
+        
+        Args:
+            func: The Blockfrost API function to call
+            *args: Positional arguments for the function
+            **kwargs: Keyword arguments for the function
+            
+        Returns:
+            The result of the API call
+            
+        Raises:
+            Exception: If the API call fails
+        """
         await self.rate_limiter.acquire()
-        return await asyncio.to_thread(method, **kwargs)
+        try:
+            loop = asyncio.get_event_loop()
+            if args and not kwargs:
+                # If only positional args, pass them directly
+                return await loop.run_in_executor(None, func, *args)
+            elif kwargs and not args:
+                # If only keyword args, pass them as kwargs
+                return await loop.run_in_executor(None, lambda: func(**kwargs))
+            else:
+                # If both, combine them
+                return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+        finally:
+            self.rate_limiter.release()
 
     async def check_wallets(self):
         """Background task to check all wallets periodically"""
@@ -542,7 +566,7 @@ class WalletBud(commands.Bot):
                     for wallet in wallets:
                         tg.create_task(self.check_wallet(wallet['address']))
                 
-            except* Exception as e:
+            except Exception as e:
                 logger.error(f"Error in check_wallets task: {str(e)}")
                 
             finally:
@@ -556,10 +580,7 @@ class WalletBud(commands.Bot):
                 # Get current assets
                 assets = await self.rate_limited_request(
                     self.blockfrost_client.address_utxos,
-                    address=address,
-                    count=100,  # Reasonable limit
-                    page=1,
-                    order='desc'
+                    address
                 )
                 
                 # Check YUMMI balance
@@ -572,7 +593,7 @@ class WalletBud(commands.Bot):
                 # Get recent transactions
                 txs = await self.rate_limited_request(
                     self.blockfrost_client.address_transactions,
-                    address=address,
+                    address,
                     count=10,  # Only get recent transactions
                     page=1,    # First page
                     order='desc'  # Latest first
@@ -603,7 +624,7 @@ class WalletBud(commands.Bot):
             # Get YUMMI token UTXOs directly using the asset endpoint
             assets = await self.rate_limited_request(
                 self.blockfrost_client.address_utxos_asset,
-                address=address,
+                address,
                 asset=f"{YUMMI_POLICY_ID}"
             )
             
