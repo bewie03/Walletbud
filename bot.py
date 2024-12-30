@@ -467,41 +467,28 @@ class WalletBud(commands.Bot):
         try:
             logger.info(f"Checking YUMMI balance for wallet: {wallet_address}")
             
-            # Get wallet's total balance including all assets
             try:
-                # First, check if address exists and get basic info
-                address_info = await self.rate_limited_request(
-                    self.blockfrost_client.addresses_total,  # /addresses/{address}/total
+                # Get wallet's total balance and assets
+                address_assets = await self.rate_limited_request(
+                    self.blockfrost_client.address_assets,  # Correct method from SDK
                     address=wallet_address
                 )
-                logger.info(f"Received address info: {address_info}")
+                logger.info(f"Received address assets: {address_assets}")
                 
-                if not address_info:
-                    logger.warning(f"No address info found for {wallet_address}")
+                if not address_assets:
+                    logger.warning(f"No assets found for {wallet_address}")
                     return True, 0  # No assets means 0 balance, but not an error
                 
-                # Get detailed UTxOs to find YUMMI tokens
-                utxos = await self.rate_limited_request(
-                    self.blockfrost_client.addresses_utxos,  # /addresses/{address}/utxos
-                    address=wallet_address
-                )
-                logger.info(f"Received UTXOs: {utxos}")
-                
-                # Find YUMMI token balance across all UTXOs
+                # Find YUMMI token balance
                 yummi_balance = 0
-                if utxos:
-                    for utxo in utxos:
-                        if hasattr(utxo, 'amount'):
-                            for asset in utxo.amount:
-                                logger.debug(f"Checking asset: {asset.unit}")
-                                if asset.unit == YUMMI_POLICY_ID:
-                                    yummi_balance += int(asset.quantity)
-                                    logger.info(f"Found YUMMI balance in UTXO: {asset.quantity}")
-                
-                logger.info(f"Total YUMMI balance: {yummi_balance}")
+                for asset in address_assets:
+                    if asset.unit == YUMMI_POLICY_ID:
+                        yummi_balance = int(asset.quantity)
+                        logger.info(f"Found YUMMI balance: {yummi_balance}")
+                        break
                 
                 # Check if balance meets requirement
-                if yummi_balance < REQUIRED_YUMMI_TOKENS:  
+                if yummi_balance < REQUIRED_YUMMI_TOKENS:
                     return False, f"Insufficient YUMMI balance. Required: {REQUIRED_YUMMI_TOKENS:,}, Current: {yummi_balance:,}"
                 
                 return True, yummi_balance
@@ -522,7 +509,7 @@ class WalletBud(commands.Bot):
         try:
             # Get wallet transactions (latest first)
             transactions = await self.rate_limited_request(
-                self.blockfrost_client.addresses_transactions,  # /addresses/{address}/transactions
+                self.blockfrost_client.address_transactions,  # Correct method from SDK
                 address=wallet_address,
                 order='desc',
                 count=10
@@ -544,9 +531,10 @@ class WalletBud(commands.Bot):
                         break
                     
                 try:
-                    # Get transaction details
+                    # Get transaction UTXOs
                     tx_details = await self.rate_limited_request(
-                        self.blockfrost_client.transaction_utxos,  # /txs/{hash}/utxos
+                        self.blockfrost_client.address_utxos,  # Correct method from SDK
+                        address=wallet_address,
                         hash=tx.hash
                     )
                     
@@ -554,7 +542,7 @@ class WalletBud(commands.Bot):
                     received_ada = 0
                     received_assets = {}
                     
-                    for output in tx_details.outputs:
+                    for output in tx_details:
                         if output.address == wallet_address:
                             # Add ADA amount (in lovelace)
                             received_ada += int(output.amount[0].quantity) / 1_000_000
