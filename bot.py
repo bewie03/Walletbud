@@ -398,11 +398,127 @@ class WalletBud(commands.Bot):
         finally:
             self.processing_wallets = False
 
+    async def check_rate_limits(self):
+        """Check Blockfrost API rate limits"""
+        try:
+            # Get current rate limit status
+            url = "https://cardano-mainnet.blockfrost.io/api/v0/health/clock"
+            headers = {
+                "project_id": BLOCKFROST_API_KEY,
+                "Content-Type": "application/json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    # Check rate limit headers
+                    remaining = int(response.headers.get('x-ratelimit-remaining', 0))
+                    reset_in = int(response.headers.get('x-ratelimit-reset', 0))
+                    
+                    logger.info(f"Rate limit status - Remaining: {remaining}, Reset in: {reset_in}s")
+                    
+                    if remaining < 50:  # Warning threshold
+                        logger.warning(f"Rate limit running low! Only {remaining} requests remaining")
+                        if remaining < 10:  # Critical threshold
+                            logger.error("Rate limit critically low! Waiting for reset...")
+                            await asyncio.sleep(reset_in)
+                    
+                    return remaining, reset_in
+        except Exception as e:
+            logger.error(f"Failed to check rate limits: {e}")
+            return None, None
+
+    async def rate_limited_request(self, func, *args, **kwargs):
+        """Execute a rate-limited API request with retries"""
+        max_retries = 3
+        base_delay = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Check rate limits before making request
+                remaining, reset_in = await self.check_rate_limits()
+                
+                if remaining is not None and remaining < 10:
+                    logger.warning(f"Rate limit low, waiting {reset_in}s before retry...")
+                    await asyncio.sleep(reset_in)
+                
+                # Make the actual request
+                return await func(*args, **kwargs)
+                
+            except Exception as e:
+                if "rate limit exceeded" in str(e).lower():
+                    delay = base_delay * (attempt + 1)
+                    logger.warning(f"Rate limit exceeded, attempt {attempt + 1}/{max_retries}. Waiting {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    raise
+        
+        raise Exception("Max retries exceeded for rate-limited request")
+
+    async def check_yummi_balance(self, wallet_address):
+        """Check YUMMI token balance"""
+        try:
+            logger.info(f"Checking YUMMI balance for wallet: {wallet_address}")
+            
+            # Get wallet's total balance including all assets
+            try:
+                address_info = await self.rate_limited_request(
+                    self.blockfrost_client.address_total,
+                    address=wallet_address
+                )
+                logger.info(f"Received address info: {address_info}")
+                
+                if not address_info:
+                    logger.warning(f"No address info found for {wallet_address}")
+                    return True, 0  # No assets means 0 balance, but not an error
+                
+            except Exception as e:
+                logger.error(f"Error fetching address info: {str(e)}")
+                if "not found" in str(e).lower():
+                    return False, "Wallet not found on the blockchain. Please check the address and try again."
+                raise
+            
+            # Get detailed asset list
+            try:
+                address_assets = await self.rate_limited_request(
+                    self.blockfrost_client.address_addresses,
+                    address=wallet_address
+                )
+                logger.info(f"Received address assets: {address_assets}")
+                
+                if not address_assets or not hasattr(address_assets, 'amount'):
+                    logger.warning(f"No assets found for {wallet_address}")
+                    return True, 0
+                
+                # Find YUMMI token balance
+                yummi_balance = 0
+                for asset in address_assets.amount:
+                    logger.debug(f"Checking asset: {asset.unit}")
+                    if asset.unit == YUMMI_POLICY_ID:
+                        yummi_balance = int(asset.quantity)
+                        logger.info(f"Found YUMMI balance: {yummi_balance}")
+                        break
+                
+                # Check if balance meets requirement
+                if yummi_balance < REQUIRED_BUD_TOKENS:
+                    return False, f"Insufficient YUMMI balance. Required: {REQUIRED_BUD_TOKENS:,}, Current: {yummi_balance:,}"
+                
+                return True, yummi_balance
+                
+            except Exception as e:
+                logger.error(f"Error fetching address assets: {str(e)}")
+                raise
+            
+        except Exception as e:
+            error_msg = f"Failed to check YUMMI balance: {str(e)}"
+            logger.error(error_msg)
+            return False, "Failed to check YUMMI balance. Please try again later."
+
     async def check_wallet_transactions(self, wallet_address, discord_id):
         """Check transactions for a wallet"""
         try:
             # Get wallet transactions (latest first)
-            transactions = await self.blockfrost_client.address_transactions(
+            transactions = await self.rate_limited_request(
+                self.blockfrost_client.address_transactions,
                 address=wallet_address,
                 order='desc',
                 count=10
@@ -433,7 +549,8 @@ class WalletBud(commands.Bot):
             for tx in reversed(new_txs):
                 try:
                     # Get transaction details
-                    tx_details = await self.blockfrost_client.transaction_utxos(
+                    tx_details = await self.rate_limited_request(
+                        self.blockfrost_client.transaction_utxos,
                         hash=tx.hash
                     )
                     
@@ -492,36 +609,6 @@ class WalletBud(commands.Bot):
                     
         except Exception as e:
             logger.error(f"Error checking transactions for wallet {wallet_address}: {e}")
-
-    async def check_yummi_balance(self, wallet_address):
-        """Check YUMMI token balance"""
-        try:
-            # Get wallet's specific asset balance
-            address_info = await self.blockfrost_client.addresses(
-                address=wallet_address
-            )
-            
-            if not address_info or not hasattr(address_info, 'amount'):
-                return True, 0  # No assets means 0 balance, but not an error
-            
-            # Find YUMMI token balance
-            yummi_balance = 0
-            for asset in address_info.amount:
-                if asset.unit == YUMMI_POLICY_ID:
-                    yummi_balance = int(asset.quantity)
-                    break
-            
-            # Check if balance meets requirement
-            if yummi_balance < REQUIRED_BUD_TOKENS:
-                return False, f"Insufficient YUMMI balance. Required: {REQUIRED_BUD_TOKENS:,}, Current: {yummi_balance:,}"
-            
-            return True, yummi_balance
-            
-        except Exception as e:
-            if "not found" in str(e).lower():
-                return False, "Wallet not found on the blockchain. Please check the address and try again."
-            logger.error(f"Error checking YUMMI balance: {e}")
-            return False, "Failed to check YUMMI balance. Please try again later."
 
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
