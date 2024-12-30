@@ -3,7 +3,6 @@ import sys
 import json
 import asyncio
 import logging
-import sqlite3
 from datetime import datetime, timedelta
 from uuid import uuid4
 from functools import wraps
@@ -16,7 +15,15 @@ from blockfrost import BlockFrostApi
 import aiohttp
 
 from config import *
-from database import init_db, get_db_connection, add_wallet, remove_wallet, update_last_checked
+from database import (
+    init_db,
+    add_wallet,
+    remove_wallet,
+    get_wallet,
+    get_all_wallets,
+    update_last_checked,
+    add_transaction
+)
 
 # Create request ID for logging
 def get_request_id():
@@ -130,11 +137,6 @@ class WalletBud(commands.Bot):
             burst_limit=BURST_LIMIT
         )
         
-        # Initialize database connection
-        self.conn = None
-        self.cursor = None
-        self.db_lock = asyncio.Lock()
-        
         # Initialize Blockfrost client
         self.blockfrost_client = None
         
@@ -145,152 +147,6 @@ class WalletBud(commands.Bot):
         
         # Register commands only once during initialization
         self.setup_commands()
-
-    async def ensure_db_connection(self):
-        """Ensure database connection is active"""
-        try:
-            if self.conn is None:
-                self.conn = sqlite3.connect('wallets.db')
-                self.conn.row_factory = sqlite3.Row
-                self.cursor = self.conn.cursor()
-                
-                # Set busy timeout to avoid "database is locked" errors
-                self.cursor.execute('PRAGMA busy_timeout = 30000')
-                self.cursor.execute('PRAGMA journal_mode = WAL')
-                self.conn.commit()
-                
-                logger.info("Database connection established")
-                return True
-                
-            # Test connection
-            self.cursor.execute('SELECT 1')
-            return True
-            
-        except Exception as e:
-            logger.error(f"Database connection error: {str(e)}")
-            await self.close_db()
-            return False
-
-    async def close_db(self):
-        """Close database connection"""
-        try:
-            if self.conn:
-                self.conn.close()
-                self.conn = None
-                self.cursor = None
-                logger.info("Database connection closed")
-        except Exception as e:
-            logger.error(f"Error closing database: {str(e)}")
-
-    async def execute_db(self, query, params=None):
-        """Execute database query with automatic reconnection"""
-        async with self.db_lock:
-            try:
-                if not await self.ensure_db_connection():
-                    raise Exception("Failed to establish database connection")
-                    
-                if params:
-                    self.cursor.execute(query, params)
-                else:
-                    self.cursor.execute(query)
-                    
-                self.conn.commit()
-                return True
-                
-            except Exception as e:
-                logger.error(f"Database error: {str(e)}")
-                return False
-
-    async def close(self):
-        """Clean up resources when bot shuts down"""
-        await self.close_db()
-        await super().close()
-
-    async def init_database(self):
-        """Initialize database schema"""
-        try:
-            # Create tables if they don't exist
-            await self.execute_db('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    discord_id TEXT UNIQUE NOT NULL
-                )
-            ''')
-            
-            await self.execute_db('''
-                CREATE TABLE IF NOT EXISTS wallets (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    address TEXT UNIQUE NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(id)
-                )
-            ''')
-            
-            await self.execute_db('''
-                CREATE TABLE IF NOT EXISTS transactions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    wallet_id INTEGER NOT NULL,
-                    tx_hash TEXT NOT NULL,
-                    amount REAL NOT NULL,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (wallet_id) REFERENCES wallets(id)
-                )
-            ''')
-            
-            logger.info("Database schema initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize database schema: {str(e)}")
-            return False
-
-    def setup_commands(self):
-        """Set up bot commands using app_commands"""
-        try:
-            logger.info("Setting up commands...")
-            
-            # Add command checks
-            addwallet = app_commands.command(
-                name='addwallet',
-                description='Add a wallet to monitor'
-            )(self.addwallet)
-            addwallet.add_check(dm_only())
-            
-            removewallet = app_commands.command(
-                name='removewallet',
-                description='Remove a wallet from monitoring'
-            )(self.removewallet)
-            removewallet.add_check(dm_only())
-            
-            listwallets = app_commands.command(
-                name='listwallets',
-                description='List your monitored wallets'
-            )(self.listwallets)
-            listwallets.add_check(dm_only())
-            
-            help_cmd = app_commands.command(
-                name='help',
-                description='Show bot help and commands'
-            )(self.help)
-            
-            health = app_commands.command(
-                name='health',
-                description='Check bot health status'
-            )(self.health)
-            
-            # Add commands to tree
-            self.tree.add_command(addwallet)
-            self.tree.add_command(removewallet)
-            self.tree.add_command(listwallets)
-            self.tree.add_command(help_cmd)
-            self.tree.add_command(health)
-            
-            logger.info("Commands set up successfully")
-            
-        except Exception as e:
-            logger.error(f"Error setting up commands: {str(e)}")
-            raise
 
     async def setup_hook(self):
         """Called when the bot starts up"""
@@ -314,45 +170,6 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Error in setup_hook: {str(e)}")
             raise
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-        """Called when the bot is ready"""
-        try:
-            logger.info(f"Logged in as {self.user.name} ({self.user.id})")
-            logger.info(f"Discord API version: {discord.__version__}")
-            logger.info(f"Connected to {len(self.guilds)} guilds")
-            
-            # Log guild information
-            for guild in self.guilds:
-                logger.info(f"Connected to guild: {guild.name} ({guild.id})")
-                
-        except Exception as e:
-            logger.error(f"Error in on_ready: {str(e)}")
-
-    @commands.Cog.listener()
-    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        """Handle command errors"""
-        error_msg = None
-        
-        if isinstance(error, app_commands.CommandOnCooldown):
-            error_msg = f"This command is on cooldown. Try again in {error.retry_after:.2f} seconds."
-        elif isinstance(error, app_commands.CheckFailure):
-            # Already handled by dm_only check
-            return
-        elif isinstance(error, app_commands.CommandInvokeError):
-            logger.error(f"Command error: {str(error.original)}")
-            error_msg = "An error occurred while processing your command. Please try again later."
-        else:
-            logger.error(f"Unhandled command error: {str(error)}")
-            error_msg = "An unexpected error occurred. Please try again later."
-        
-        if error_msg:
-            try:
-                await interaction.response.send_message(error_msg, ephemeral=True)
-            except:
-                if not interaction.response.is_done():
-                    await interaction.followup.send(error_msg, ephemeral=True)
 
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
@@ -457,11 +274,7 @@ class WalletBud(commands.Bot):
                 return
                 
             # Get user's wallets
-            wallets = await self.execute_db(
-                "SELECT * FROM wallets WHERE user_id = ? AND is_active = TRUE",
-                (str(interaction.user.id),),
-                fetch_all=True
-            )
+            wallets = await get_all_wallets(str(interaction.user.id))
             
             if not wallets:
                 await self.send_response(
@@ -579,9 +392,6 @@ class WalletBud(commands.Bot):
                 except Exception as e:
                     logger.error(f"Failed to check Blockfrost health: {str(e)}")
             
-            # Check database status
-            db_status = "✅ Connected" if await self.ensure_db_connection() else "❌ Not Connected"
-            
             # Create status embed
             embed = discord.Embed(
                 title="🔍 Bot Status",
@@ -590,7 +400,6 @@ class WalletBud(commands.Bot):
             )
             
             embed.add_field(name="Bot Status", value="✅ Online", inline=True)
-            embed.add_field(name="Database", value=db_status, inline=True)
             embed.add_field(name="Blockfrost API", value=blockfrost_status, inline=True)
             embed.add_field(name="Monitoring", value="✅ Active" if not self.monitoring_paused else "⏸️ Paused", inline=True)
             
@@ -669,11 +478,8 @@ class WalletBud(commands.Bot):
         """Process new transactions for a wallet"""
         try:
             # Get last known transaction
-            result = await self.execute_db(
-                "SELECT last_tx_hash FROM wallets WHERE address = ? AND user_id = ?",
-                (address, user_id)
-            )
-            last_tx = result[0] if result else None
+            result = await get_wallet(address, user_id)
+            last_tx = result['last_tx_hash'] if result else None
             
             # Check for new transactions
             for tx in txs:
@@ -687,14 +493,7 @@ class WalletBud(commands.Bot):
                 )
                 
                 # Store transaction
-                await self.execute_db(
-                    """
-                    INSERT INTO transactions (wallet_id, tx_hash, amount, block_height, timestamp)
-                    VALUES ((SELECT id FROM wallets WHERE address = ? AND user_id = ?), ?, ?, ?, ?)
-                    """,
-                    (address, user_id, tx['hash'], tx_details['output_amount'][0]['quantity'], 
-                     tx_details['block_height'], tx_details['block_time'])
-                )
+                await add_transaction(address, tx['hash'], tx_details['output_amount'][0]['quantity'], tx_details['block_height'], tx_details['block_time'])
                 
                 # Notify user
                 try:
@@ -716,10 +515,7 @@ class WalletBud(commands.Bot):
             
             # Update last transaction
             if txs:
-                await self.execute_db(
-                    "UPDATE wallets SET last_tx_hash = ? WHERE address = ? AND user_id = ?",
-                    (txs[0]['hash'], address, user_id)
-                )
+                await update_last_checked(address, user_id, txs[0]['hash'])
             
         except Exception as e:
             logger.error(f"Error processing transactions: {str(e)}")
@@ -779,10 +575,7 @@ class WalletBud(commands.Bot):
                 self.processing_wallets = True
                 
                 # Get all active wallets
-                wallets = await self.execute_db(
-                    "SELECT * FROM wallets WHERE is_active = TRUE",
-                    fetch_all=True
-                )
+                wallets = await get_all_wallets()
                 
                 if not wallets:
                     return
@@ -847,10 +640,7 @@ class WalletBud(commands.Bot):
                     logger.error(f"Error notifying user about low YUMMI: {str(e)}")
             
             # Update last checked timestamp
-            await self.execute_db(
-                "UPDATE wallets SET last_checked = CURRENT_TIMESTAMP WHERE address = ? AND user_id = ?",
-                (address, user_id)
-            )
+            await update_last_checked(address, user_id)
             
         except Exception as e:
             logger.error(f"Error processing wallet {address}: {str(e)}")
@@ -879,6 +669,99 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Error sending response: {str(e)}")
             return False
+
+    def setup_commands(self):
+        """Set up bot commands using app_commands"""
+        try:
+            logger.info("Setting up commands...")
+            
+            # Add command checks
+            addwallet = app_commands.command(
+                name='addwallet',
+                description='Add a wallet to monitor'
+            )(self.addwallet)
+            addwallet.add_check(dm_only())
+            
+            removewallet = app_commands.command(
+                name='removewallet',
+                description='Remove a wallet from monitoring'
+            )(self.removewallet)
+            removewallet.add_check(dm_only())
+            
+            listwallets = app_commands.command(
+                name='listwallets',
+                description='List your monitored wallets'
+            )(self.listwallets)
+            listwallets.add_check(dm_only())
+            
+            help_cmd = app_commands.command(
+                name='help',
+                description='Show bot help and commands'
+            )(self.help)
+            
+            health = app_commands.command(
+                name='health',
+                description='Check bot health status'
+            )(self.health)
+            
+            # Add commands to tree
+            self.tree.add_command(addwallet)
+            self.tree.add_command(removewallet)
+            self.tree.add_command(listwallets)
+            self.tree.add_command(help_cmd)
+            self.tree.add_command(health)
+            
+            # Sync commands with Discord
+            logger.info("Syncing commands with Discord...")
+            
+            logger.info("Commands set up successfully")
+            
+        except Exception as e:
+            logger.error(f"Error setting up commands: {str(e)}")
+            raise
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Called when the bot is ready"""
+        try:
+            logger.info(f"Logged in as {self.user.name} ({self.user.id})")
+            logger.info(f"Discord API version: {discord.__version__}")
+            logger.info(f"Connected to {len(self.guilds)} guilds")
+            
+            # Log guild information
+            for guild in self.guilds:
+                logger.info(f"Connected to guild: {guild.name} ({guild.id})")
+                
+            # Sync commands
+            await self.tree.sync()
+            logger.info("Commands synced with Discord")
+            
+        except Exception as e:
+            logger.error(f"Error in on_ready: {str(e)}")
+
+    @commands.Cog.listener()
+    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """Handle command errors"""
+        error_msg = None
+        
+        if isinstance(error, app_commands.CommandOnCooldown):
+            error_msg = f"This command is on cooldown. Try again in {error.retry_after:.2f} seconds."
+        elif isinstance(error, app_commands.CheckFailure):
+            # Already handled by dm_only check
+            return
+        elif isinstance(error, app_commands.CommandInvokeError):
+            logger.error(f"Command error: {str(error.original)}")
+            error_msg = "An error occurred while processing your command. Please try again later."
+        else:
+            logger.error(f"Unhandled command error: {str(error)}")
+            error_msg = "An unexpected error occurred. Please try again later."
+        
+        if error_msg:
+            try:
+                await interaction.response.send_message(error_msg, ephemeral=True)
+            except:
+                if not interaction.response.is_done():
+                    await interaction.followup.send(error_msg, ephemeral=True)
 
 if __name__ == "__main__":
     try:

@@ -4,8 +4,7 @@ import re
 from dotenv import load_dotenv
 
 # Load environment variables
-if not load_dotenv():
-    print("Warning: .env file not found. Using system environment variables.")
+load_dotenv()
 
 # Set up logging
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -32,17 +31,6 @@ def validate_hex(value, length, name):
         raise ValueError(f"Invalid {name} format: {value}. Must be a {length}-character hexadecimal string.")
     return value
 
-def validate_sqlite_db_path(path, default, name):
-    """Ensure the SQLite database file path is valid or fallback to a default"""
-    dir_path = os.path.dirname(path) or '.'
-    if not os.path.exists(dir_path):
-        logger.warning(f"{name} directory '{dir_path}' does not exist. Using default: {default}")
-        return default
-    if not os.access(dir_path, os.W_OK):
-        logger.warning(f"{name} path '{dir_path}' is not writable. Using default: {default}")
-        return default
-    return path
-
 # Discord Bot Configuration
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 if not DISCORD_TOKEN or not DISCORD_TOKEN.strip():
@@ -62,81 +50,32 @@ YUMMI_POLICY_ID = validate_hex(
     'YUMMI_POLICY_ID'
 )
 
-REQUIRED_YUMMI_TOKENS = validate_positive_int(
-    os.getenv('REQUIRED_YUMMI_TOKENS', '20000'),
-    1000000,
-    'REQUIRED_YUMMI_TOKENS'
-)
+REQUIRED_YUMMI_TOKENS = int(os.getenv('REQUIRED_YUMMI_TOKENS', '20000'))
+MAX_REQUESTS_PER_SECOND = int(os.getenv('MAX_REQUESTS_PER_SECOND', '10'))
+BURST_LIMIT = int(os.getenv('BURST_LIMIT', '20'))
+RATE_LIMIT_DELAY = float(os.getenv('RATE_LIMIT_DELAY', '0.1'))
+WALLET_BATCH_SIZE = int(os.getenv('WALLET_BATCH_SIZE', '10'))
+WALLET_CHECK_DELAY = float(os.getenv('WALLET_CHECK_DELAY', '1.0'))
+TRANSACTION_CHECK_INTERVAL = int(os.getenv('TRANSACTION_CHECK_INTERVAL', '5'))
+WALLET_CHECK_INTERVAL = int(os.getenv('WALLET_CHECK_INTERVAL', '5'))
+YUMMI_CHECK_INTERVAL = int(os.getenv('YUMMI_CHECK_INTERVAL', '24'))  # hours
+MAX_TX_HISTORY = int(os.getenv('MAX_TX_HISTORY', '10'))
+API_RETRY_ATTEMPTS = int(os.getenv('API_RETRY_ATTEMPTS', '3'))
+API_RETRY_DELAY = float(os.getenv('API_RETRY_DELAY', '1.0'))
+WALLET_PROCESS_DELAY = float(os.getenv('WALLET_PROCESS_DELAY', '0.2'))
 
-# Database Configuration
-DATABASE_NAME = validate_sqlite_db_path(
-    os.getenv('DATABASE_NAME', 'wallets.db'),
-    'wallets.db',
-    'DATABASE_NAME'
-)
+# Validate required environment variables
+if not all([DISCORD_TOKEN, BLOCKFROST_API_KEY, YUMMI_POLICY_ID]):
+    raise ValueError("Missing required environment variables")
 
 # Rate Limiting Configuration
-MAX_REQUESTS_PER_SECOND = validate_positive_int(
-    os.getenv('MAX_REQUESTS_PER_SECOND', '10'),
-    10,
-    'MAX_REQUESTS_PER_SECOND'
-)
-
-BURST_LIMIT = validate_positive_int(
-    os.getenv('BURST_LIMIT', '500'),
-    500,
-    'BURST_LIMIT'
-)
-
 BURST_COOLDOWN = BURST_LIMIT / MAX_REQUESTS_PER_SECOND  # 50 seconds
-RATE_LIMIT_DELAY = validate_positive_int(
-    os.getenv('RATE_LIMIT_DELAY', '0.1'),
-    0.1,
-    'RATE_LIMIT_DELAY'
-)
 
 # Wallet Monitoring Configuration
-TRANSACTION_CHECK_INTERVAL = validate_positive_int(
-    os.getenv('TRANSACTION_CHECK_INTERVAL', '5'),
-    5,
-    'TRANSACTION_CHECK_INTERVAL'
-)
-
-WALLET_CHECK_INTERVAL = validate_positive_int(
-    os.getenv('WALLET_CHECK_INTERVAL', '5'),
-    5,
-    'WALLET_CHECK_INTERVAL'
-)
-
-YUMMI_CHECK_INTERVAL = validate_positive_int(
-    os.getenv('YUMMI_CHECK_INTERVAL', '24'),
-    24,
-    'YUMMI_CHECK_INTERVAL'
-)
-
-MAX_TX_HISTORY = validate_positive_int(
-    os.getenv('MAX_TX_HISTORY', '10'),
-    50,
-    'MAX_TX_HISTORY'
-)
 
 # API Retry Configuration
-API_RETRY_ATTEMPTS = validate_positive_int(
-    os.getenv('API_RETRY_ATTEMPTS', '3'),
-    3,
-    'API_RETRY_ATTEMPTS'
-)
-
-API_RETRY_DELAY = validate_positive_int(
-    os.getenv('API_RETRY_DELAY', '1'),
-    1,
-    'API_RETRY_DELAY'
-)
 
 # Wallet Check Settings
-WALLET_BATCH_SIZE = 10  # Reduced to avoid hitting rate limits
-WALLET_CHECK_DELAY = 1.0  # Increased to respect rate limits
-WALLET_PROCESS_DELAY = 0.2  # Increased to respect rate limits
 
 # Logging Settings
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
@@ -147,7 +86,6 @@ LOG_BACKUP_COUNT = 5
 # Load configuration
 logger.info(
     "Loaded configuration:\n"
-    f"  DATABASE_NAME: {DATABASE_NAME}\n"
     f"  REQUIRED_YUMMI_TOKENS: {REQUIRED_YUMMI_TOKENS}\n"
     f"  MAX_REQUESTS_PER_SECOND: {MAX_REQUESTS_PER_SECOND}\n"
     f"  RATE_LIMIT_DELAY: {RATE_LIMIT_DELAY}s\n"
