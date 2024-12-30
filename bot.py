@@ -283,60 +283,44 @@ class WalletBud(commands.Bot):
         logger.info("Setting up commands...")
         
         # Register command error handler
-        @self.event
-        async def on_command_error(ctx, error):
-            if isinstance(error, commands.NoPrivateMessage):
-                await ctx.send("This command can only be used in DMs for security.")
-            elif isinstance(error, commands.CheckFailure):
+        @self.tree.error
+        async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+            if isinstance(error, app_commands.NoPrivateMessage):
+                await interaction.response.send_message("This command can only be used in DMs for security.")
+            elif isinstance(error, app_commands.CheckFailure):
                 # Don't send message as the check should have sent one
                 pass
             else:
                 logger.error(f"Command error: {str(error)}")
-                await ctx.send("An error occurred while processing your command.")
+                await interaction.response.send_message("An error occurred while processing your command.")
         
-        # Register commands
-        @self.tree.command(name='addwallet', description="Add a wallet to monitor")
-        @dm_only()
-        @has_blockfrost()
-        @not_monitoring_paused()
-        @cooldown_5s()
-        async def add_wallet(ctx, wallet_address: str = None):
+        # Create wallet command group
+        wallet_group = app_commands.Group(name="wallet", description="Wallet management commands")
+        
+        # Add wallet command
+        @wallet_group.command(name="add", description="Add a wallet to monitor")
+        @app_commands.check(dm_only)
+        @app_commands.check(has_blockfrost)
+        @app_commands.check(not_monitoring_paused)
+        async def add_wallet(interaction: discord.Interaction, address: str):
             """Add a wallet to monitor"""
-            try:
-                # Basic input validation
-                if not wallet_address:
-                    await ctx.send("Please provide a wallet address. Usage: !addwallet <address>")
-                    return
-                    
-                logger.info(f"Processing add wallet request from {ctx.author.id} for address: {wallet_address}")
-                
-                # Check if wallet exists and get YUMMI balance
-                success, result = await self.check_yummi_balance(wallet_address)
-                
-                if success:
-                    # Add wallet to database
-                    try:
-                        self.cursor.execute(
-                            "INSERT INTO wallets (address, discord_id) VALUES (?, ?)",
-                            (wallet_address, str(ctx.author.id))
-                        )
-                        self.conn.commit()
-                        await ctx.send(f"Wallet added successfully! Current YUMMI balance: {result:,}")
-                        logger.info(f"Wallet {wallet_address} added for user {ctx.author.id}")
-                    except sqlite3.IntegrityError:
-                        await ctx.send("This wallet is already being monitored!")
-                        logger.warning(f"Duplicate wallet add attempt: {wallet_address}")
-                else:
-                    await ctx.send(result)  # Result contains error message
-                    logger.warning(f"Add wallet failed - {result}")
-                    
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Error in add_wallet command: {error_msg}")
-                await ctx.send(
-                    "An error occurred while processing your request. Please try again later. "
-                    "If the problem persists, contact support."
-                )
+            await self.add_wallet_slash(interaction, address)
+        
+        # Remove wallet command
+        @wallet_group.command(name="remove", description="Remove a wallet from monitoring")
+        @app_commands.check(dm_only)
+        async def remove_wallet(interaction: discord.Interaction, address: str):
+            """Remove a wallet from monitoring"""
+            await self.remove_wallet_slash(interaction, address)
+        
+        # Status command
+        @self.tree.command(name="status", description="Check bot status")
+        async def status(interaction: discord.Interaction):
+            """Check bot status"""
+            await self.status_slash(interaction)
+        
+        # Add commands to the bot
+        self.tree.add_command(wallet_group)
         
         logger.info("Commands setup complete")
 
@@ -429,62 +413,35 @@ class WalletBud(commands.Bot):
         """Global error handler for events"""
         logger.error(f'Error in {event_method}:', exc_info=True)
 
-    async def rate_limited_request(self, method, **kwargs):
+    async def rate_limited_request(self, method):
         """Handle rate limiting for Blockfrost API requests"""
-        request_id = get_request_id()
-        max_retries = 3
-        
         async with self.rate_limit_lock:
-            current_time = datetime.utcnow()
-            time_diff = (current_time - self.last_request_time).total_seconds()
-            
-            # Reset counter if more than 50 seconds have passed
-            if time_diff > 50:
-                logger.debug(f"[{request_id}] Resetting rate limit counter after {time_diff} seconds")
-                self.request_count = 0
-            
-            # If we've hit the burst limit, wait
-            if self.request_count >= 500:
-                wait_time = 50 - time_diff
-                if wait_time > 0:
-                    logger.warning(f"[{request_id}] Rate limit burst reached, waiting {wait_time} seconds")
+            # Check if we need to wait
+            now = datetime.utcnow()
+            if self.request_count >= 10:  # Max 10 requests per second
+                time_since_last = (now - self.last_request_time).total_seconds()
+                if time_since_last < 1:
+                    wait_time = 1 - time_since_last
+                    logger.debug(f"Rate limit hit, waiting {wait_time:.2f}s")
                     await asyncio.sleep(wait_time)
                     self.request_count = 0
+                    self.last_request_time = datetime.utcnow()
             
-            # If we're making requests too fast, wait
-            if time_diff < 0.1:  # Ensure at least 100ms between requests
-                wait_time = 0.1 - time_diff
-                logger.debug(f"[{request_id}] Request too fast, waiting {wait_time} seconds")
-                await asyncio.sleep(wait_time)
-            
-            # Update counters
-            self.request_count += 1
-            self.last_request_time = current_time
-        
-        for attempt in range(max_retries):
+            # Make the request
             try:
-                logger.debug(f"[{request_id}] Making API request to {method.__name__} with args: {kwargs}")
-                response = await method(**kwargs)
-                logger.debug(f"[{request_id}] API response received")
-                return response
+                result = await method()
+                
+                # Update rate limit tracking
+                self.request_count += 1
+                if (datetime.utcnow() - self.last_request_time).total_seconds() >= 1:
+                    self.request_count = 1
+                    self.last_request_time = datetime.utcnow()
+                
+                return result
                 
             except Exception as e:
-                logger.error(f"[{request_id}] API request failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
-                
-                if "rate limit" in str(e).lower():
-                    # If we hit the rate limit, wait longer
-                    wait_time = 60 if attempt == 0 else 120
-                    logger.warning(f"[{request_id}] Rate limit hit, waiting {wait_time} seconds")
-                    await asyncio.sleep(wait_time)
-                    continue
-                    
-                if attempt < max_retries - 1:
-                    delay = 1 * (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
-                    logger.info(f"[{request_id}] Retrying in {delay} seconds...")
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error(f"[{request_id}] Max retries reached. Giving up.")
-                    raise
+                logger.error(f"API request failed: {str(e)}")
+                raise
 
     async def check_yummi_balance(self, wallet_address):
         """Check YUMMI token balance"""
@@ -501,8 +458,9 @@ class WalletBud(commands.Bot):
                 # Get wallet's total balance and assets using rate-limited request
                 logger.debug(f"[{request_id}] Requesting address info from Blockfrost...")
                 address_info = await self.rate_limited_request(
-                    self.blockfrost_client.address_total,
-                    address=wallet_address
+                    lambda: self.blockfrost_client.address_total(
+                        address=wallet_address
+                    )
                 )
                 logger.debug(f"[{request_id}] Raw address info response: {address_info}")
                 
@@ -625,8 +583,9 @@ class WalletBud(commands.Bot):
         try:
             # Get transactions using rate-limited request
             transactions = await self.rate_limited_request(
-                self.blockfrost_client.address_transactions,
-                address=wallet_address
+                lambda: self.blockfrost_client.address_transactions(
+                    address=wallet_address
+                )
             )
             
             if not transactions:
@@ -648,8 +607,9 @@ class WalletBud(commands.Bot):
                 try:
                     # Get transaction details using rate-limited request
                     tx_details = await self.rate_limited_request(
-                        self.blockfrost_client.transaction,
-                        hash=tx.hash
+                        lambda: self.blockfrost_client.transaction(
+                            hash=tx.hash
+                        )
                     )
                     
                     if not tx_details:
@@ -725,9 +685,16 @@ class WalletBud(commands.Bot):
             
             # Initialize client
             try:
+                base_url = {
+                    'mainnet': 'https://cardano-mainnet.blockfrost.io/api/v0',
+                    'preprod': 'https://cardano-preprod.blockfrost.io/api/v0',
+                    'preview': 'https://cardano-preview.blockfrost.io/api/v0'
+                }[network]
+                
                 self.blockfrost_client = BlockFrostApi(
                     project_id=BLOCKFROST_API_KEY,
-                    base_url=f"https://cardano-{network}.blockfrost.io/api/v0"
+                    base_url=base_url,
+                    session_kwargs={'headers': {'project_id': BLOCKFROST_API_KEY}}
                 )
                 logger.debug("BlockFrostApi instance created")
             except Exception as e:
@@ -738,14 +705,14 @@ class WalletBud(commands.Bot):
             try:
                 logger.debug("Testing Blockfrost connection...")
                 health = await self.rate_limited_request(
-                    self.blockfrost_client.health
+                    lambda: self.blockfrost_client.health()
                 )
                 logger.debug(f"Health check response: {health}")
                 
                 # Also test a simple API call
                 logger.debug("Testing API call...")
                 network = await self.rate_limited_request(
-                    self.blockfrost_client.network
+                    lambda: self.blockfrost_client.network()
                 )
                 logger.debug(f"Network info: {network}")
                 
@@ -772,6 +739,150 @@ class WalletBud(commands.Bot):
             logger.error(f"Failed to initialize Blockfrost API: {str(e)}")
             self.blockfrost_client = None
             return False
+
+    async def add_wallet_slash(self, interaction: discord.Interaction, wallet_address: str):
+        """Add a wallet to monitor"""
+        try:
+            # Basic input validation
+            if not wallet_address:
+                await interaction.response.send_message("Please provide a wallet address.")
+                return
+                
+            logger.info(f"Processing add wallet request from {interaction.user.id} for address: {wallet_address}")
+            
+            # Check if wallet exists and get YUMMI balance
+            success, result = await self.check_yummi_balance(wallet_address)
+            
+            if success:
+                # Add wallet to database
+                try:
+                    self.cursor.execute(
+                        "INSERT INTO wallets (address, discord_id) VALUES (?, ?)",
+                        (wallet_address, str(interaction.user.id))
+                    )
+                    self.conn.commit()
+                    
+                    embed = discord.Embed(
+                        title="✅ Wallet Added",
+                        description=f"Now monitoring wallet: `{wallet_address}`",
+                        color=discord.Color.green()
+                    )
+                    embed.add_field(name="YUMMI Balance", value=f"{result:,}", inline=False)
+                    await interaction.response.send_message(embed=embed)
+                    
+                    logger.info(f"Wallet {wallet_address} added for user {interaction.user.id}")
+                except sqlite3.IntegrityError:
+                    embed = discord.Embed(
+                        title="❌ Error",
+                        description="This wallet is already being monitored!",
+                        color=discord.Color.red()
+                    )
+                    await interaction.response.send_message(embed=embed)
+                    logger.warning(f"Duplicate wallet add attempt: {wallet_address}")
+            else:
+                embed = discord.Embed(
+                    title="❌ Error",
+                    description=result,  # Result contains error message
+                    color=discord.Color.red()
+                )
+                await interaction.response.send_message(embed=embed)
+                logger.warning(f"Add wallet failed - {result}")
+                
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error in add_wallet command: {error_msg}")
+            embed = discord.Embed(
+                title="❌ Error",
+                description="An error occurred while processing your request. Please try again later.",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed)
+            
+    async def remove_wallet_slash(self, interaction: discord.Interaction, wallet_address: str):
+        """Remove a wallet from monitoring"""
+        try:
+            # Check if wallet exists and belongs to user
+            self.cursor.execute(
+                "SELECT * FROM wallets WHERE address = ? AND discord_id = ?",
+                (wallet_address, str(interaction.user.id))
+            )
+            wallet = self.cursor.fetchone()
+            
+            if not wallet:
+                embed = discord.Embed(
+                    title="❌ Error",
+                    description="This wallet is not being monitored or doesn't belong to you.",
+                    color=discord.Color.red()
+                )
+                await interaction.response.send_message(embed=embed)
+                return
+                
+            # Remove wallet
+            self.cursor.execute(
+                "DELETE FROM wallets WHERE address = ? AND discord_id = ?",
+                (wallet_address, str(interaction.user.id))
+            )
+            self.conn.commit()
+            
+            embed = discord.Embed(
+                title="✅ Wallet Removed",
+                description=f"Stopped monitoring wallet: `{wallet_address}`",
+                color=discord.Color.green()
+            )
+            await interaction.response.send_message(embed=embed)
+            logger.info(f"Wallet {wallet_address} removed for user {interaction.user.id}")
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error in remove_wallet command: {error_msg}")
+            embed = discord.Embed(
+                title="❌ Error",
+                description="An error occurred while processing your request. Please try again later.",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed)
+            
+    async def status_slash(self, interaction: discord.Interaction):
+        """Check bot status"""
+        try:
+            # Get monitored wallet count
+            self.cursor.execute("SELECT COUNT(*) FROM wallets")
+            wallet_count = self.cursor.fetchone()[0]
+            
+            # Create status embed
+            embed = discord.Embed(
+                title="🤖 Bot Status",
+                color=discord.Color.blue()
+            )
+            
+            # Add status fields
+            embed.add_field(
+                name="Monitoring Status",
+                value="✅ Active" if not self.monitoring_paused else "❌ Paused",
+                inline=True
+            )
+            embed.add_field(
+                name="Blockfrost API",
+                value="✅ Connected" if self.blockfrost_client else "❌ Disconnected",
+                inline=True
+            )
+            embed.add_field(
+                name="Monitored Wallets",
+                value=str(wallet_count),
+                inline=True
+            )
+            
+            await interaction.response.send_message(embed=embed)
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error in status command: {error_msg}")
+            embed = discord.Embed(
+                title="❌ Error",
+                description="An error occurred while checking status. Please try again later.",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed)
 
 if __name__ == "__main__":
     try:
