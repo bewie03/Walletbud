@@ -404,7 +404,7 @@ class WalletBud(commands.Bot):
             transactions = await self.blockfrost_client.address_transactions(
                 address=wallet_address,
                 count=10,
-                order='desc'
+                order='desc'  # API default is 'asc', we want newest first
             )
             
             if not transactions:
@@ -432,7 +432,7 @@ class WalletBud(commands.Bot):
             for tx in reversed(new_txs):
                 try:
                     # Get transaction details
-                    tx_details = await self.blockfrost_client.transaction_utxos(tx.tx_hash)
+                    tx_details = await self.blockfrost_client.transaction_utxos(tx.hash)
                     
                     # Calculate total ADA and assets received
                     received_ada = 0
@@ -440,17 +440,18 @@ class WalletBud(commands.Bot):
                     
                     for output in tx_details.outputs:
                         if output.address == wallet_address:
-                            # Add ADA amount
+                            # Add ADA amount (in lovelace)
                             received_ada += int(output.amount[0].quantity) / 1_000_000
                             
                             # Add other assets
-                            for asset in output.amount[1:]:
-                                asset_name = asset.unit
-                                quantity = int(asset.quantity)
-                                if asset_name in received_assets:
-                                    received_assets[asset_name] += quantity
-                                else:
-                                    received_assets[asset_name] = quantity
+                            if len(output.amount) > 1:  # If there are additional assets
+                                for asset in output.amount[1:]:
+                                    asset_name = asset.unit
+                                    quantity = int(asset.quantity)
+                                    if asset_name in received_assets:
+                                        received_assets[asset_name] += quantity
+                                    else:
+                                        received_assets[asset_name] = quantity
                     
                     # Only notify if wallet received something
                     if received_ada > 0 or received_assets:
@@ -466,7 +467,7 @@ class WalletBud(commands.Bot):
                             else:
                                 message.append(f"• Received: {quantity:,} of asset {asset_id}")
                         
-                        message.append(f"\nTransaction: `{tx.tx_hash}`")
+                        message.append(f"\nTransaction: `{tx.hash}`")
                         
                         # Send notification
                         user = await self.fetch_user(int(discord_id))
@@ -474,7 +475,7 @@ class WalletBud(commands.Bot):
                             await user.send("\n".join(message))
                     
                 except Exception as e:
-                    logger.error(f"Error processing transaction {tx.tx_hash}: {e}")
+                    logger.error(f"Error processing transaction {tx.hash}: {e}")
                     continue
                 
                 # Update last checked transaction
@@ -482,7 +483,7 @@ class WalletBud(commands.Bot):
                     cursor = conn.cursor()
                     cursor.execute(
                         'UPDATE wallets SET last_tx_hash = ? WHERE address = ? AND discord_id = ?',
-                        (tx.tx_hash, wallet_address, discord_id)
+                        (tx.hash, wallet_address, discord_id)
                     )
                     conn.commit()
                     
@@ -493,16 +494,16 @@ class WalletBud(commands.Bot):
         """Check YUMMI token balance"""
         try:
             # Get wallet's specific asset balance
-            assets = await self.blockfrost_client.address_assets(
+            address_info = await self.blockfrost_client.address_total(
                 address=wallet_address
             )
             
-            if not assets:
+            if not address_info or not hasattr(address_info, 'received_sum'):
                 return True, 0  # No assets means 0 balance, but not an error
             
             # Find YUMMI token balance
             yummi_balance = 0
-            for asset in assets:
+            for asset in address_info.received_sum:
                 if asset.unit == YUMMI_POLICY_ID:
                     yummi_balance = int(asset.quantity)
                     break
@@ -533,16 +534,30 @@ class WalletBud(commands.Bot):
                 )
                 
                 # Test connection with health check endpoint
-                health = await self.blockfrost_client.health()
-                if health.is_healthy:
-                    logger.info("Blockfrost API initialized successfully")
-                    return
-                else:
-                    raise Exception("Blockfrost API health check failed")
+                try:
+                    health = await self.blockfrost_client.health()
+                    logger.info(f"Blockfrost health response: {health}")
+                    if hasattr(health, 'is_healthy') and health.is_healthy:
+                        logger.info("Blockfrost API initialized successfully")
+                        return
+                    else:
+                        logger.warning(f"Unexpected health response format: {health}")
+                        raise Exception("Blockfrost API health check returned unexpected format")
+                except Exception as health_error:
+                    logger.error(f"Health check error details: {str(health_error)}")
+                    raise
                 
             except Exception as e:
-                logger.warning(f"Blockfrost initialization attempt {attempt + 1} failed: {e}")
+                logger.warning(f"Blockfrost initialization attempt {attempt + 1} failed: {str(e)}")
                 self.blockfrost_client = None
+                
+                # Try to get more error details
+                if hasattr(e, 'response'):
+                    try:
+                        error_details = await e.response.text()
+                        logger.error(f"Error response details: {error_details}")
+                    except:
+                        pass
                 
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay * (attempt + 1))
