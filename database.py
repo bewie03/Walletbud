@@ -116,15 +116,26 @@ async def get_wallet(user_id: str, address: str):
         logger.error(f"Error getting wallet: {str(e)}")
         return None
 
-async def get_all_wallets():
-    """Get all wallets"""
+async def get_all_wallets(user_id: str) -> list[str]:
+    """Get all wallets for a user
+    
+    Args:
+        user_id (str): Discord user ID
+        
+    Returns:
+        list[str]: List of wallet addresses
+    """
     try:
         pool = await init_db()
         async with pool.acquire() as conn:
-            return await conn.fetch('SELECT * FROM wallets')
+            rows = await conn.fetch(
+                'SELECT address FROM wallets WHERE user_id = $1',
+                user_id
+            )
+            return [row['address'] for row in rows]
             
     except Exception as e:
-        logger.error(f"Error getting all wallets: {str(e)}")
+        logger.error(f"Error getting wallets for user {user_id}: {str(e)}")
         return []
 
 async def update_last_checked(wallet_id: int, timestamp: datetime = None):
@@ -166,7 +177,7 @@ async def main():
     try:
         await init_db()
         await add_wallet("1234567890", "addr1...")
-        print(await get_all_wallets())
+        print(await get_all_wallets("1234567890"))
         await remove_wallet("1234567890", "addr1...")
     except Exception as e:
         logger.error(f"Error during database operation: {e}")

@@ -178,7 +178,7 @@ class WalletBud(commands.Bot):
             async def help(interaction: discord.Interaction):
                 await self.help_command(interaction)
             
-            @self.tree.command(name='health', description='Check bot health status')
+            @self.tree.command(name='health', description='Check bot and API status')
             async def health(interaction: discord.Interaction):
                 await self.health_command(interaction)
             
@@ -239,228 +239,250 @@ class WalletBud(commands.Bot):
     async def addwallet_command(self, interaction: discord.Interaction, address: str):
         """Handle the addwallet command"""
         try:
-            if not await self.process_interaction(interaction):
-                return
-                
-            # Verify YUMMI balance
-            if not await self.verify_yummi_balance(address):
-                await self.send_response(
-                    interaction,
-                    content=f"Insufficient YUMMI tokens. Required: {REQUIRED_YUMMI_TOKENS:,}",
+            # Defer the response since this might take time
+            await interaction.response.defer(ephemeral=True)
+            logger.info(f"Adding wallet {address} for user {interaction.user.id}")
+            
+            # Validate address format
+            if not address or len(address) < 10:
+                logger.warning(f"Invalid wallet address format: {address}")
+                await interaction.followup.send(
+                    "❌ Invalid wallet address. Please check and try again.",
                     ephemeral=True
                 )
                 return
-                
-            # Check wallet exists
-            balance, txs, _ = await self.check_wallet(address)
-            if not balance:
-                await self.send_response(
-                    interaction,
-                    content="Invalid wallet address or API error",
-                    ephemeral=True
-                )
-                return
-                
+            
             # Add wallet to database
-            success = await add_wallet(address, str(interaction.user.id))
-            if success:
-                embed = discord.Embed(
-                    title="Wallet Added",
-                    description=f"Now monitoring wallet `{address}`",
-                    color=discord.Color.green()
-                )
-                embed.add_field(name="Balance", value=f"{balance['amount'][0]['quantity']} ADA", inline=True)
-                embed.add_field(name="Transactions", value=str(len(txs)), inline=True)
+            try:
+                logger.debug(f"Adding wallet {address} to database")
+                success = await add_wallet(interaction.user.id, address)
                 
-                await self.send_response(interaction, embed=embed, ephemeral=True)
-                logger.info(f"Added wallet {address} for user {interaction.user.id}")
-            else:
-                await self.send_response(
-                    interaction,
-                    content="Failed to add wallet. Please try again.",
+                if success:
+                    logger.info(f"Successfully added wallet {address}")
+                    await interaction.followup.send(
+                        f"✅ Successfully added wallet `{address}` to monitoring.",
+                        ephemeral=True
+                    )
+                else:
+                    logger.error(f"Failed to add wallet {address} to database")
+                    await interaction.followup.send(
+                        "❌ Failed to add wallet. Please try again later.",
+                        ephemeral=True
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Error adding wallet to database: {str(e)}")
+                await interaction.followup.send(
+                    "❌ Failed to add wallet. Please try again later.",
                     ephemeral=True
                 )
                 
         except Exception as e:
             logger.error(f"Error in addwallet command: {str(e)}")
-            await self.send_response(
-                interaction,
-                content="An error occurred. Please try again later.",
-                ephemeral=True
-            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ An error occurred. Please try again later.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "❌ An error occurred. Please try again later.",
+                    ephemeral=True
+                )
 
     async def removewallet_command(self, interaction: discord.Interaction, address: str):
         """Handle the removewallet command"""
         try:
-            if not await self.process_interaction(interaction):
-                return
+            # Defer the response since this might take time
+            await interaction.response.defer(ephemeral=True)
+            logger.info(f"Removing wallet {address} for user {interaction.user.id}")
+            
+            # Remove wallet from database
+            try:
+                logger.debug(f"Removing wallet {address} from database")
+                success = await remove_wallet(interaction.user.id, address)
                 
-            # Remove wallet
-            if await remove_wallet(str(interaction.user.id), address):
-                await self.send_response(
-                    interaction,
-                    content=f"✅ Successfully removed wallet `{address}` from monitoring.",
-                    ephemeral=True
-                )
-            else:
-                await self.send_response(
-                    interaction,
-                    content=f"❌ Failed to remove wallet `{address}`. Please try again later.",
+                if success:
+                    logger.info(f"Successfully removed wallet {address}")
+                    await interaction.followup.send(
+                        f"✅ Successfully removed wallet `{address}` from monitoring.",
+                        ephemeral=True
+                    )
+                else:
+                    logger.warning(f"Wallet {address} not found for user {interaction.user.id}")
+                    await interaction.followup.send(
+                        f"❌ Wallet `{address}` was not found in your monitored wallets.",
+                        ephemeral=True
+                    )
+                
+            except Exception as e:
+                logger.error(f"Error removing wallet from database: {str(e)}")
+                await interaction.followup.send(
+                    "❌ Failed to remove wallet. Please try again later.",
                     ephemeral=True
                 )
                 
         except Exception as e:
-            logger.error(f"Error removing wallet: {str(e)}")
-            await self.send_response(
-                interaction,
-                content="❌ An error occurred while removing the wallet. Please try again later.",
-                ephemeral=True
-            )
+            logger.error(f"Error in removewallet command: {str(e)}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ An error occurred. Please try again later.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "❌ An error occurred. Please try again later.",
+                    ephemeral=True
+                )
 
     async def listwallets_command(self, interaction: discord.Interaction):
         """Handle the listwallets command"""
         try:
-            if not await self.process_interaction(interaction):
-                return
-                
-            # Get user's wallets
-            wallets = await get_all_wallets(str(interaction.user.id))
+            # Defer the response since this might take time
+            await interaction.response.defer(ephemeral=True)
+            logger.info(f"Fetching wallets for user {interaction.user.id}")
             
-            if not wallets:
-                await self.send_response(
-                    interaction,
-                    content="You have no monitored wallets.",
-                    ephemeral=True
+            # Get wallets from database
+            try:
+                logger.debug("Querying database for wallets...")
+                wallets = await get_all_wallets(interaction.user.id)
+                logger.debug(f"Found {len(wallets) if wallets else 0} wallets")
+                
+                if not wallets:
+                    await interaction.followup.send(
+                        "You don't have any wallets being monitored.",
+                        ephemeral=True
+                    )
+                    return
+                
+                # Create embed
+                embed = discord.Embed(
+                    title="🔍 Your Monitored Wallets",
+                    color=discord.Color.blue()
                 )
-                return
                 
-            # Create embed
-            embed = discord.Embed(
-                title="Your Monitored Wallets",
-                color=discord.Color.blue(),
-                timestamp=datetime.utcnow()
-            )
-            
-            # Add wallet info
-            for wallet in wallets:
-                balance, txs, assets = await self.check_wallet(wallet['address'])
-                if balance:
-                    value = f"Balance: {balance['amount'][0]['quantity']} ADA\n"
-                    value += f"Recent Txs: {len(txs)}\n"
-                    value += f"Last Checked: <t:{int(datetime.fromisoformat(wallet['last_checked']).timestamp())}:R>"
-                    
+                # Add wallets
+                for wallet in wallets:
                     embed.add_field(
-                        name=f"Wallet: `{wallet['address']}`",
-                        value=value,
+                        name="Wallet Address",
+                        value=f"`{wallet}`",
                         inline=False
                     )
-                    
-            await self.send_response(interaction, embed=embed, ephemeral=True)
-            logger.info(f"Listed wallets for user {interaction.user.id}")
-            
+                
+                logger.debug("Sending wallet list response")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                
+            except Exception as e:
+                logger.error(f"Failed to list wallets: {str(e)}")
+                await interaction.followup.send(
+                    "❌ Failed to list wallets. Please try again later.",
+                    ephemeral=True
+                )
+                
         except Exception as e:
             logger.error(f"Error in listwallets command: {str(e)}")
-            await self.send_response(
-                interaction,
-                content="An error occurred. Please try again later.",
-                ephemeral=True
-            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ An error occurred. Please try again later.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "❌ An error occurred. Please try again later.",
+                    ephemeral=True
+                )
 
     async def help_command(self, interaction: discord.Interaction):
         """Handle the help command"""
         try:
-            if not await self.process_interaction(interaction, ephemeral=True):
-                return
-            
-            # Create help embed
             embed = discord.Embed(
-                title="🤖 Wallet Bud Help",
-                description="Here are all available commands:",
-                color=discord.Color.blue(),
-                timestamp=datetime.utcnow()
+                title="📚 Wallet Bud Help",
+                description="Monitor your Cardano wallets for YUMMI token transactions",
+                color=discord.Color.blue()
             )
             
             # Add command descriptions
             embed.add_field(
                 name="/addwallet <address>",
-                value="Add a Cardano wallet to monitor. Requires YUMMI tokens.",
+                value="Add a wallet to monitor (DM only)",
                 inline=False
             )
-            
             embed.add_field(
                 name="/removewallet <address>",
-                value="Remove a wallet from monitoring.",
+                value="Remove a wallet from monitoring (DM only)",
                 inline=False
             )
-            
             embed.add_field(
                 name="/listwallets",
-                value="List all your monitored wallets.",
+                value="List your monitored wallets (DM only)",
                 inline=False
             )
-            
-            embed.add_field(
-                name="/help",
-                value="Show this help message.",
-                inline=False
-            )
-            
             embed.add_field(
                 name="/health",
-                value="Check bot and API status.",
+                value="Check bot and API status",
                 inline=False
             )
             
-            # Add footer with version
-            embed.set_footer(text="Wallet Bud v1.0.0")
+            # Add footer
+            embed.set_footer(text="For support, please contact the bot owner")
             
-            # Send the help embed
-            await self.send_response(interaction, embed=embed, ephemeral=True)
-            logger.info(f"Help command used by {interaction.user.id}")
+            await interaction.response.send_message(embed=embed)
             
         except Exception as e:
             logger.error(f"Error in help command: {str(e)}")
-            await self.send_response(
-                interaction,
-                content="An error occurred while showing help. Please try again later.",
+            await interaction.response.send_message(
+                "❌ Failed to show help. Please try again later.",
                 ephemeral=True
             )
 
     async def health_command(self, interaction: discord.Interaction):
         """Handle the health command"""
         try:
-            if not await self.process_interaction(interaction, ephemeral=True):
-                return
+            # Check Blockfrost connection
+            blockfrost_status = "✅ Connected" if self.blockfrost_client else "❌ Not Connected"
+            try:
+                if self.blockfrost_client:
+                    health = await asyncio.wait_for(
+                        asyncio.to_thread(self.blockfrost_client.health),
+                        timeout=5.0
+                    )
+                    if not health:
+                        blockfrost_status = "❌ Not Connected"
+            except Exception:
+                blockfrost_status = "❌ Not Connected"
             
-            # Check Blockfrost API status
-            blockfrost_status = "❌ Not Connected"
-            if self.blockfrost_client:
-                try:
-                    health = await self.blockfrost_client.health()
-                    if health:
-                        blockfrost_status = "✅ Connected"
-                except Exception as e:
-                    logger.error(f"Failed to check Blockfrost health: {str(e)}")
-            
-            # Create status embed
+            # Create embed
             embed = discord.Embed(
                 title="🔍 Bot Status",
-                color=discord.Color.blue(),
-                timestamp=datetime.utcnow()
+                color=discord.Color.blue()
             )
             
-            embed.add_field(name="Bot Status", value="✅ Online", inline=True)
-            embed.add_field(name="Blockfrost API", value=blockfrost_status, inline=True)
-            embed.add_field(name="Monitoring", value="✅ Active" if not self.monitoring_paused else "⏸️ Paused", inline=True)
+            # Add fields
+            embed.add_field(
+                name="Bot Status",
+                value="✅ Online",
+                inline=True
+            )
+            embed.add_field(
+                name="Blockfrost API",
+                value=blockfrost_status,
+                inline=True
+            )
+            embed.add_field(
+                name="Monitoring",
+                value="✅ Active" if not self.monitoring_paused else "❌ Paused",
+                inline=True
+            )
             
-            await self.send_response(interaction, embed=embed, ephemeral=True)
-            logger.info(f"Health command used by {interaction.user.id}")
+            # Add timestamp
+            embed.timestamp = discord.utils.utcnow()
+            
+            await interaction.response.send_message(embed=embed)
             
         except Exception as e:
             logger.error(f"Error in health command: {str(e)}")
-            await self.send_response(
-                interaction,
-                content="An error occurred while checking health. Please try again later.",
+            await interaction.response.send_message(
+                "❌ Failed to get bot status. Please try again later.",
                 ephemeral=True
             )
 
