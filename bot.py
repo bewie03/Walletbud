@@ -50,19 +50,13 @@ class WalletBud(commands.Bot):
         try:
             synced = await self.tree.sync()
             logger.info(f"Synced {len(synced)} command(s)")
-            check_wallets.start()
-            logger.info("Started wallet checking task")
         except Exception as e:
             logger.error(f"Error in setup_hook: {str(e)}")
             raise
 
     async def on_ready(self):
-        logger.info(f'{self.user} has connected to Discord!')
-        logger.info(f'Bot is in {len(self.guilds)} guilds')
+        logger.info(f'Bot {self.user} is ready and online!')
         try:
-            synced = await self.tree.sync()
-            logger.info(f"Re-synced {len(synced)} command(s) on ready")
-            
             # Set bot presence
             await self.change_presence(
                 activity=discord.Activity(
@@ -70,9 +64,13 @@ class WalletBud(commands.Bot):
                     name="YUMMI wallets | DM me!"
                 )
             )
-            logger.info("Bot presence updated")
+            logger.info("Bot presence set")
+            
+            # Start the wallet checking task
+            check_wallets.start()
+            logger.info("Started wallet checking task")
         except Exception as e:
-            logger.error(f"Error in on_ready: {str(e)}")
+            logger.error(f"Error during startup: {e}")
 
 # Constants
 YUMMI_POLICY_ID = YUMMI_POLICY_ID
@@ -84,21 +82,6 @@ blockfrost_client = blockfrost.BlockFrostApi(
     project_id=project_id,
     base_url='https://cardano-mainnet.blockfrost.io/api/v0'
 )
-
-@WalletBud.event
-async def on_ready():
-    logger.info(f'Bot {self.user} is ready and online!')
-    try:
-        # Set bot presence
-        await self.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name="YUMMI wallets | DM me!"
-            )
-        )
-        logger.info("Bot presence set")
-    except Exception as e:
-        logger.error(f"Error during startup: {e}")
 
 def check_yummi_balance(wallet_address):
     """Check if wallet has required amount of YUMMI tokens"""
