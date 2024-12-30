@@ -113,9 +113,6 @@ class WalletBud(commands.Bot):
         self.wallet_task_lock = asyncio.Lock()
         self.processing_wallets = False
 
-        # Initialize command tree
-        self.tree = app_commands.CommandTree(self)
-
     async def setup_hook(self):
         """Called when the bot starts up"""
         try:
@@ -148,11 +145,6 @@ class WalletBud(commands.Bot):
             except Exception as e:
                 logger.error(f"Failed to set up commands: {str(e)}")
                 raise
-            
-            # Start background tasks
-            logger.info("Starting background tasks...")
-            # Temporarily commenting out background task
-            # self.check_wallets.start()
             
             logger.info("Bot initialization complete!")
             
