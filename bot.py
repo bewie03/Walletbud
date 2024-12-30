@@ -417,7 +417,7 @@ class WalletBud(commands.Bot):
             # Create client
             self.blockfrost_client = BlockFrostApi(
                 project_id=BLOCKFROST_API_KEY,
-                base_url="https://cardano-mainnet.blockfrost.io/api"
+                base_url="https://cardano-mainnet.blockfrost.io/api/v0"  # Added /v0 for API version
             )
             
             # Test connection
