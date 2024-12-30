@@ -9,7 +9,10 @@ if not load_dotenv():
 
 # Set up logging
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
-logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 def validate_positive_int(value, default, name):
@@ -22,6 +25,23 @@ def validate_positive_int(value, default, name):
     except (ValueError, TypeError):
         logger.warning(f"Invalid {name} value '{value}'. Using default: {default}")
         return default
+
+def validate_hex(value, length, name):
+    """Validate hexadecimal string of a specific length"""
+    if not value or not re.fullmatch(rf"(?i)[a-f0-9]{{{length}}}", value):
+        raise ValueError(f"Invalid {name} format: {value}. Must be a {length}-character hexadecimal string.")
+    return value
+
+def validate_sqlite_db_path(path, default, name):
+    """Ensure the SQLite database file path is valid or fallback to a default"""
+    dir_path = os.path.dirname(path) or '.'
+    if not os.path.exists(dir_path):
+        logger.warning(f"{name} directory '{dir_path}' does not exist. Using default: {default}")
+        return default
+    if not os.access(dir_path, os.W_OK):
+        logger.warning(f"{name} path '{dir_path}' is not writable. Using default: {default}")
+        return default
+    return path
 
 # Discord Bot Configuration
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
@@ -36,9 +56,11 @@ if not BLOCKFROST_API_KEY or not BLOCKFROST_API_KEY.strip():
     raise ValueError("No valid Blockfrost API key found! Make sure BLOCKFROST_API_KEY is set in .env")
 
 # Database Configuration
-DATABASE_NAME = os.getenv('DATABASE_NAME', 'wallets.db')
-if not os.access(os.path.dirname(DATABASE_NAME) or '.', os.W_OK):
-    raise ValueError(f"Database path {DATABASE_NAME} is not writable.")
+DATABASE_NAME = validate_sqlite_db_path(
+    os.getenv('DATABASE_NAME', 'wallets.db'),
+    'wallets.db',
+    'DATABASE_NAME'
+)
 
 # Token Configuration
 REQUIRED_YUMMI_TOKENS = validate_positive_int(
@@ -47,11 +69,11 @@ REQUIRED_YUMMI_TOKENS = validate_positive_int(
     'REQUIRED_YUMMI_TOKENS'
 )
 
-YUMMI_POLICY_ID = os.getenv('YUMMI_POLICY_ID')
-if not YUMMI_POLICY_ID:
-    raise ValueError("No YUMMI_POLICY_ID found! Make sure YUMMI_POLICY_ID is set in .env")
-if not re.fullmatch(r"(?i)[a-f0-9]{56}", YUMMI_POLICY_ID):
-    raise ValueError(f"Invalid YUMMI_POLICY_ID format: {YUMMI_POLICY_ID}. Must be a 56-character hexadecimal string.")
+YUMMI_POLICY_ID = validate_hex(
+    os.getenv('YUMMI_POLICY_ID'),
+    56,
+    'YUMMI_POLICY_ID'
+)
 
 # Monitoring Settings
 TRANSACTION_CHECK_INTERVAL = validate_positive_int(
@@ -78,21 +100,38 @@ MAX_TX_HISTORY = validate_positive_int(
     'MAX_TX_HISTORY'
 )
 
-# Rate Limiting
-API_RETRY_DELAY = validate_positive_int(
-    os.getenv('API_RETRY_DELAY', '2'),
-    2,
-    'API_RETRY_DELAY'
-)
-WALLET_CHECK_DELAY = validate_positive_int(
-    os.getenv('WALLET_CHECK_DELAY', '60'),
-    60,
-    'WALLET_CHECK_DELAY'
-)
-WALLET_PROCESS_DELAY = validate_positive_int(
-    os.getenv('WALLET_PROCESS_DELAY', '1'),
-    1,
-    'WALLET_PROCESS_DELAY'
+# Rate Limiting Settings
+MAX_REQUESTS_PER_SECOND = 10
+RATE_LIMIT_DELAY = 5  # seconds to wait when rate limit is hit
+API_RETRY_ATTEMPTS = 3
+API_RETRY_DELAY = 1  # seconds between retries
+
+# Wallet Check Settings
+WALLET_BATCH_SIZE = 50  # Number of wallets to check in each batch
+WALLET_CHECK_DELAY = 0.5  # seconds between wallet checks
+WALLET_PROCESS_DELAY = 0.1  # seconds between processing each wallet
+
+# Logging Settings
+LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
+LOG_FILE = 'logs/bot.log'
+LOG_MAX_SIZE = 5 * 1024 * 1024  # 5 MB
+LOG_BACKUP_COUNT = 5
+
+# Load configuration
+logger.info(
+    "Loaded configuration:\n"
+    f"  DATABASE_NAME: {DATABASE_NAME}\n"
+    f"  REQUIRED_YUMMI_TOKENS: {REQUIRED_YUMMI_TOKENS}\n"
+    f"  MAX_REQUESTS_PER_SECOND: {MAX_REQUESTS_PER_SECOND}\n"
+    f"  RATE_LIMIT_DELAY: {RATE_LIMIT_DELAY}s\n"
+    f"  WALLET_BATCH_SIZE: {WALLET_BATCH_SIZE}\n"
+    f"  WALLET_CHECK_DELAY: {WALLET_CHECK_DELAY}s\n"
+    f"  TRANSACTION_CHECK_INTERVAL: {TRANSACTION_CHECK_INTERVAL}s\n"
+    f"  WALLET_CHECK_INTERVAL: {WALLET_CHECK_INTERVAL}s\n"
+    f"  YUMMI_CHECK_INTERVAL: {YUMMI_CHECK_INTERVAL} hours\n"
+    f"  MAX_TX_HISTORY: {MAX_TX_HISTORY}\n"
+    f"  API_RETRY_DELAY: {API_RETRY_DELAY}s\n"
+    f"  WALLET_PROCESS_DELAY: {WALLET_PROCESS_DELAY}s\n"
 )
 
 # Error Messages
@@ -110,10 +149,3 @@ ERROR_MESSAGES = {
     'monitoring_paused': "Wallet monitoring is currently paused.",
     'db_error': "Database error occurred. Please try again later.",
 }
-
-# Log loaded configuration (excluding sensitive info)
-logger.info(f"Loaded configuration:\nDATABASE_NAME: {DATABASE_NAME}\n"
-            f"REQUIRED_YUMMI_TOKENS: {REQUIRED_YUMMI_TOKENS}\n"
-            f"TRANSACTION_CHECK_INTERVAL: {TRANSACTION_CHECK_INTERVAL}s\n"
-            f"WALLET_CHECK_INTERVAL: {WALLET_CHECK_INTERVAL}s\n"
-            f"YUMMI_CHECK_INTERVAL: {YUMMI_CHECK_INTERVAL} hours\n")
