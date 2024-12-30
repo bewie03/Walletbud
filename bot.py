@@ -467,7 +467,7 @@ class WalletBud(commands.Bot):
             # Get wallet's total balance including all assets
             try:
                 address_info = await self.rate_limited_request(
-                    self.blockfrost_client.address_details,
+                    self.blockfrost_client.address_total,  # Using address_total() for overall balances
                     address=wallet_address
                 )
                 logger.info(f"Received address info: {address_info}")
@@ -476,15 +476,25 @@ class WalletBud(commands.Bot):
                     logger.warning(f"No address info found for {wallet_address}")
                     return True, 0  # No assets means 0 balance, but not an error
                 
-                # Find YUMMI token balance
+                # Get detailed UTXOs to find YUMMI tokens
+                utxos = await self.rate_limited_request(
+                    self.blockfrost_client.address_utxos,  # Using address_utxos() for detailed asset info
+                    address=wallet_address
+                )
+                logger.info(f"Received UTXOs: {utxos}")
+                
+                # Find YUMMI token balance across all UTXOs
                 yummi_balance = 0
-                if hasattr(address_info, 'amount'):
-                    for asset in address_info.amount:
-                        logger.debug(f"Checking asset: {asset.unit}")
-                        if asset.unit == YUMMI_POLICY_ID:
-                            yummi_balance = int(asset.quantity)
-                            logger.info(f"Found YUMMI balance: {yummi_balance}")
-                            break
+                if utxos:
+                    for utxo in utxos:
+                        if hasattr(utxo, 'amount'):
+                            for asset in utxo.amount:
+                                logger.debug(f"Checking asset: {asset.unit}")
+                                if asset.unit == YUMMI_POLICY_ID:
+                                    yummi_balance += int(asset.quantity)
+                                    logger.info(f"Found YUMMI balance in UTXO: {asset.quantity}")
+                
+                logger.info(f"Total YUMMI balance: {yummi_balance}")
                 
                 # Check if balance meets requirement
                 if yummi_balance < REQUIRED_BUD_TOKENS:
