@@ -144,9 +144,6 @@ class WalletBud(commands.Bot):
         self.monitoring_paused = False
         self.wallet_task_lock = asyncio.Lock()
         self.processing_wallets = False
-        
-        # Register commands only once during initialization
-        self.setup_commands()
 
     async def setup_hook(self):
         """Called when the bot starts up"""
@@ -160,6 +157,10 @@ class WalletBud(commands.Bot):
             # Initialize Blockfrost client
             logger.info("Initializing Blockfrost client...")
             await self.init_blockfrost()
+            
+            # Setup commands
+            logger.info("Setting up commands...")
+            await self.setup_commands()
             
             # Start background tasks
             logger.info("Starting background tasks...")
@@ -214,7 +215,47 @@ class WalletBud(commands.Bot):
             self.blockfrost_client = None
             return False
 
-    async def addwallet(self, interaction: discord.Interaction, address: str):
+    async def setup_commands(self):
+        """Set up bot commands using app_commands"""
+        try:
+            logger.info("Setting up commands...")
+            
+            # Create command tree
+            self.tree = app_commands.CommandTree(self)
+            
+            # Add commands
+            @self.tree.command(name='addwallet', description='Add a wallet to monitor')
+            @app_commands.check(dm_only())
+            async def addwallet(interaction: discord.Interaction, address: str):
+                await self.addwallet_command(interaction, address)
+            
+            @self.tree.command(name='removewallet', description='Remove a wallet from monitoring')
+            @app_commands.check(dm_only())
+            async def removewallet(interaction: discord.Interaction, address: str):
+                await self.removewallet_command(interaction, address)
+            
+            @self.tree.command(name='listwallets', description='List your monitored wallets')
+            @app_commands.check(dm_only())
+            async def listwallets(interaction: discord.Interaction):
+                await self.listwallets_command(interaction)
+            
+            @self.tree.command(name='help', description='Show bot help and commands')
+            async def help(interaction: discord.Interaction):
+                await self.help_command(interaction)
+            
+            @self.tree.command(name='health', description='Check bot health status')
+            async def health(interaction: discord.Interaction):
+                await self.health_command(interaction)
+            
+            # Sync commands with Discord
+            await self.tree.sync()
+            logger.info("Commands synced with Discord")
+            
+        except Exception as e:
+            logger.error(f"Error setting up commands: {str(e)}")
+            raise
+
+    async def addwallet_command(self, interaction: discord.Interaction, address: str):
         """Handle the addwallet command"""
         try:
             if not await self.process_interaction(interaction):
@@ -267,7 +308,35 @@ class WalletBud(commands.Bot):
                 ephemeral=True
             )
 
-    async def listwallets(self, interaction: discord.Interaction):
+    async def removewallet_command(self, interaction: discord.Interaction, address: str):
+        """Handle the removewallet command"""
+        try:
+            if not await self.process_interaction(interaction):
+                return
+                
+            # Remove wallet
+            if await remove_wallet(str(interaction.user.id), address):
+                await self.send_response(
+                    interaction,
+                    content=f"✅ Successfully removed wallet `{address}` from monitoring.",
+                    ephemeral=True
+                )
+            else:
+                await self.send_response(
+                    interaction,
+                    content=f"❌ Failed to remove wallet `{address}`. Please try again later.",
+                    ephemeral=True
+                )
+                
+        except Exception as e:
+            logger.error(f"Error removing wallet: {str(e)}")
+            await self.send_response(
+                interaction,
+                content="❌ An error occurred while removing the wallet. Please try again later.",
+                ephemeral=True
+            )
+
+    async def listwallets_command(self, interaction: discord.Interaction):
         """Handle the listwallets command"""
         try:
             if not await self.process_interaction(interaction):
@@ -316,7 +385,7 @@ class WalletBud(commands.Bot):
                 ephemeral=True
             )
 
-    async def help(self, interaction: discord.Interaction):
+    async def help_command(self, interaction: discord.Interaction):
         """Handle the help command"""
         try:
             if not await self.process_interaction(interaction, ephemeral=True):
@@ -376,7 +445,7 @@ class WalletBud(commands.Bot):
                 ephemeral=True
             )
 
-    async def health(self, interaction: discord.Interaction):
+    async def health_command(self, interaction: discord.Interaction):
         """Handle the health command"""
         try:
             if not await self.process_interaction(interaction, ephemeral=True):
@@ -669,56 +738,6 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Error sending response: {str(e)}")
             return False
-
-    def setup_commands(self):
-        """Set up bot commands using app_commands"""
-        try:
-            logger.info("Setting up commands...")
-            
-            # Add command checks
-            addwallet = app_commands.command(
-                name='addwallet',
-                description='Add a wallet to monitor'
-            )(self.addwallet)
-            addwallet.add_check(dm_only())
-            
-            removewallet = app_commands.command(
-                name='removewallet',
-                description='Remove a wallet from monitoring'
-            )(self.removewallet)
-            removewallet.add_check(dm_only())
-            
-            listwallets = app_commands.command(
-                name='listwallets',
-                description='List your monitored wallets'
-            )(self.listwallets)
-            listwallets.add_check(dm_only())
-            
-            help_cmd = app_commands.command(
-                name='help',
-                description='Show bot help and commands'
-            )(self.help)
-            
-            health = app_commands.command(
-                name='health',
-                description='Check bot health status'
-            )(self.health)
-            
-            # Add commands to tree
-            self.tree.add_command(addwallet)
-            self.tree.add_command(removewallet)
-            self.tree.add_command(listwallets)
-            self.tree.add_command(help_cmd)
-            self.tree.add_command(health)
-            
-            # Sync commands with Discord
-            logger.info("Syncing commands with Discord...")
-            
-            logger.info("Commands set up successfully")
-            
-        except Exception as e:
-            logger.error(f"Error setting up commands: {str(e)}")
-            raise
 
     @commands.Cog.listener()
     async def on_ready(self):
