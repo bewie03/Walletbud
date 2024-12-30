@@ -462,30 +462,47 @@ class WalletBud(commands.Bot):
         
         raise Exception(f"Failed after {max_retries} retries")
 
+    async def init_blockfrost(self):
+        """Initialize Blockfrost API client"""
+        try:
+            logger.info("Initializing Blockfrost API client...")
+            self.blockfrost_client = BlockFrostApi(
+                project_id=os.getenv('BLOCKFROST_PROJECT_ID')
+            )
+            # Use SDK's health method directly
+            health_info = await self.blockfrost_client.health()
+            logger.info(f"Blockfrost health response: {health_info}")
+            logger.info("Blockfrost API initialized successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to initialize Blockfrost API: {str(e)}")
+            return False
+
     async def check_yummi_balance(self, wallet_address):
         """Check YUMMI token balance"""
         try:
             logger.info(f"Checking YUMMI balance for wallet: {wallet_address}")
             
             try:
-                # Get wallet's total balance and assets
-                address_assets = await self.rate_limited_request(
-                    self.blockfrost_client.address_assets,  # Correct method from SDK
+                # Get wallet's total balance and assets using correct method
+                address_info = await self.rate_limited_request(
+                    self.blockfrost_client.address_total,  # Correct method name
                     address=wallet_address
                 )
-                logger.info(f"Received address assets: {address_assets}")
+                logger.info(f"Received address info: {address_info}")
                 
-                if not address_assets:
-                    logger.warning(f"No assets found for {wallet_address}")
-                    return True, 0  # No assets means 0 balance, but not an error
+                if not address_info:
+                    logger.warning(f"No address info found for {wallet_address}")
+                    return True, 0
                 
                 # Find YUMMI token balance
                 yummi_balance = 0
-                for asset in address_assets:
-                    if asset.unit == YUMMI_POLICY_ID:
-                        yummi_balance = int(asset.quantity)
-                        logger.info(f"Found YUMMI balance: {yummi_balance}")
-                        break
+                if hasattr(address_info, 'amount'):
+                    for asset in address_info.amount:
+                        if asset.unit == YUMMI_POLICY_ID:
+                            yummi_balance = int(asset.quantity)
+                            logger.info(f"Found YUMMI balance: {yummi_balance}")
+                            break
                 
                 # Check if balance meets requirement
                 if yummi_balance < REQUIRED_YUMMI_TOKENS:
@@ -507,12 +524,12 @@ class WalletBud(commands.Bot):
     async def check_wallet_transactions(self, wallet_address, discord_id):
         """Check for new transactions in wallet"""
         try:
-            # Get wallet transactions (latest first)
+            # Get wallet transactions with proper filters
             transactions = await self.rate_limited_request(
-                self.blockfrost_client.address_transactions,  # Correct method from SDK
+                self.blockfrost_client.address_transactions,
                 address=wallet_address,
-                order='desc',
-                count=10
+                order='desc',  # Most recent first
+                count=10  # Limit to 10 transactions
             )
             
             if not transactions:
@@ -531,10 +548,9 @@ class WalletBud(commands.Bot):
                         break
                     
                 try:
-                    # Get transaction UTXOs
+                    # Get transaction details using correct endpoint
                     tx_details = await self.rate_limited_request(
-                        self.blockfrost_client.address_utxos,  # Correct method from SDK
-                        address=wallet_address,
+                        self.blockfrost_client.transaction_utxos,  # Correct method for tx details
                         hash=tx.hash
                     )
                     
@@ -593,58 +609,6 @@ class WalletBud(commands.Bot):
                     
         except Exception as e:
             logger.error(f"Error checking transactions for wallet {wallet_address}: {e}")
-
-    async def init_blockfrost(self):
-        """Initialize Blockfrost API client"""
-        max_retries = 3
-        retry_delay = 2  # seconds
-        
-        for attempt in range(max_retries):
-            try:
-                # Create Blockfrost client with correct base URL
-                base_url = "https://cardano-mainnet.blockfrost.io/api/v0"
-                
-                # Initialize BlockFrostApi first
-                self.blockfrost_client = BlockFrostApi(
-                    project_id=BLOCKFROST_API_KEY,
-                    base_url=base_url
-                )
-                
-                # Test connection with health check endpoint
-                try:
-                    url = f"{base_url}/health"
-                    logger.info(f"Making health check request to: {url}")
-                    
-                    headers = {
-                        "project_id": BLOCKFROST_API_KEY,
-                        "Content-Type": "application/json"
-                    }
-                    
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url, headers=headers) as response:
-                            if response.status == 200:
-                                health_data = await response.json()
-                                logger.info(f"Blockfrost health response: {health_data}")
-                                if health_data.get('is_healthy', False):
-                                    logger.info("Blockfrost API initialized successfully")
-                                    return
-                            else:
-                                error_data = await response.text()
-                                logger.error(f"Health check failed with status {response.status}: {error_data}")
-                                raise Exception(f"Health check failed: {error_data}")
-                except Exception as health_error:
-                    logger.error(f"Health check error details: {str(health_error)}")
-                    raise
-                
-            except Exception as e:
-                logger.warning(f"Blockfrost initialization attempt {attempt + 1} failed: {str(e)}")
-                self.blockfrost_client = None
-                
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay * (attempt + 1))
-                else:
-                    logger.error("All Blockfrost initialization attempts failed")
-                    raise
 
 if __name__ == "__main__":
     try:
