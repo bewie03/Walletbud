@@ -399,66 +399,34 @@ class WalletBud(commands.Bot):
             self.processing_wallets = False
 
     async def rate_limited_request(self, method, **kwargs):
-        """Make a rate-limited request to Blockfrost API with burst handling
-        
-        Blockfrost limits:
-        - 10 requests per second
-        - Burst of 500 requests, then cooldown at 10 req/sec
-        """
+        """Make a rate-limited request to Blockfrost API"""
         max_retries = 3
-        base_delay = 0.1  # 100ms between requests to stay under 10/sec
-        burst_cooldown = 50  # 50 seconds cooldown after burst (500/10)
+        base_delay = 1.0  # seconds
         
         for attempt in range(max_retries):
             try:
-                # Add small delay between requests to respect 10/sec limit
-                await asyncio.sleep(base_delay)
+                # Add proper headers for manual requests
+                if 'headers' not in kwargs:
+                    kwargs['headers'] = {
+                        'project_id': os.getenv('BLOCKFROST_API_KEY'),
+                        'Content-Type': 'application/json'
+                    }
                 
-                # Make the actual API request
                 response = await method(**kwargs)
-                
-                # Check rate limit headers
-                if hasattr(response, 'headers'):
-                    remaining = int(response.headers.get('x-ratelimit-remaining', 0))
-                    reset_in = int(response.headers.get('x-ratelimit-reset', 0))
-                    logger.debug(f"Rate limit status - Remaining: {remaining}, Reset in: {reset_in}s")
-                    
-                    # If we're close to burst limit, implement cooldown
-                    if remaining < 50:  # Buffer before burst limit
-                        logger.warning(f"Approaching burst limit. Remaining: {remaining}")
-                        if remaining < 10:  # Critical - enforce cooldown
-                            wait_time = burst_cooldown
-                            logger.warning(f"Burst limit reached. Cooling down for {wait_time}s...")
-                            await asyncio.sleep(wait_time)
-                
                 return response
                 
             except Exception as e:
-                delay = base_delay * (2 ** attempt)  # Exponential backoff starting from base_delay
+                logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
                 
-                if hasattr(e, 'response') and e.response:
-                    status = getattr(e.response, 'status_code', None)
-                    if status == 429:  # Too Many Requests
-                        # Use server's reset time if available, otherwise use burst cooldown
-                        reset_time = getattr(e.response.headers, 'x-ratelimit-reset', burst_cooldown)
-                        wait_time = int(reset_time) + 1  # Add 1s buffer
-                        logger.warning(f"Rate limit exceeded. Waiting {wait_time}s for reset...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    elif status == 400:  # Bad Request
-                        logger.error(f"Bad request error: {str(e)}")
-                        raise  # Don't retry on bad requests
-                    elif status in [500, 502, 503, 504]:  # Server errors
-                        logger.warning(f"Server error {status}. Retrying in {delay}s...")
-                        await asyncio.sleep(delay)
-                        continue
-                
-                logger.error(f"Request failed: {str(e)}")
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {delay}s...")
+                if "rate limit" in str(e).lower():
+                    # Use exponential backoff for rate limits
+                    delay = base_delay * (2 ** attempt)
+                    logger.info(f"Rate limit hit, waiting {delay}s before retry")
                     await asyncio.sleep(delay)
-                    continue
-                raise
+                elif attempt < max_retries - 1:
+                    await asyncio.sleep(base_delay)
+                else:
+                    raise
         
         raise Exception(f"Failed after {max_retries} retries")
 
@@ -466,14 +434,37 @@ class WalletBud(commands.Bot):
         """Initialize Blockfrost API client"""
         try:
             logger.info("Initializing Blockfrost API client...")
+            
+            # Get API key and verify it exists
+            api_key = os.getenv('BLOCKFROST_API_KEY')
+            if not api_key:
+                logger.error("Blockfrost API key is not set!")
+                return False
+                
+            # Log first few characters of key (safely)
+            logger.info(f"Using Blockfrost API key: {api_key[:4]}...")
+            
+            # Initialize client with project_id (API key)
             self.blockfrost_client = BlockFrostApi(
-                project_id=os.getenv('BLOCKFROST_PROJECT_ID')
+                project_id=api_key
             )
-            # Use SDK's health method directly
-            health_info = await self.blockfrost_client.health()
-            logger.info(f"Blockfrost health response: {health_info}")
-            logger.info("Blockfrost API initialized successfully")
-            return True
+            
+            # Test connection with health check
+            try:
+                health = self.blockfrost_client.health()
+                logger.info(f"Blockfrost health check: {health}")
+                
+                if not health.is_healthy:
+                    logger.error("Blockfrost API health check failed")
+                    return False
+                    
+                logger.info("Blockfrost API initialized successfully")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Blockfrost health check failed: {str(e)}")
+                return False
+                
         except Exception as e:
             logger.error(f"Failed to initialize Blockfrost API: {str(e)}")
             return False
