@@ -50,10 +50,23 @@ if not DISCORD_TOKEN or not DISCORD_TOKEN.strip():
 
 COMMAND_PREFIX = os.getenv('COMMAND_PREFIX', '!')
 
-# Blockfrost Configuration
+# Blockfrost API Configuration
 BLOCKFROST_API_KEY = os.getenv('BLOCKFROST_API_KEY')
 if not BLOCKFROST_API_KEY or not BLOCKFROST_API_KEY.strip():
     raise ValueError("No valid Blockfrost API key found! Make sure BLOCKFROST_API_KEY is set in .env")
+
+# YUMMI Token Configuration
+YUMMI_POLICY_ID = validate_hex(
+    os.getenv('YUMMI_POLICY_ID'),
+    56,
+    'YUMMI_POLICY_ID'
+)
+
+REQUIRED_YUMMI_TOKENS = validate_positive_int(
+    os.getenv('REQUIRED_YUMMI_TOKENS', '20000'),
+    1000000,
+    'REQUIRED_YUMMI_TOKENS'
+)
 
 # Database Configuration
 DATABASE_NAME = validate_sqlite_db_path(
@@ -62,20 +75,27 @@ DATABASE_NAME = validate_sqlite_db_path(
     'DATABASE_NAME'
 )
 
-# Token Configuration
-REQUIRED_YUMMI_TOKENS = validate_positive_int(
-    os.getenv('REQUIRED_YUMMI_TOKENS', '20000'),
-    20000,
-    'REQUIRED_YUMMI_TOKENS'
+# Rate Limiting Configuration
+MAX_REQUESTS_PER_SECOND = validate_positive_int(
+    os.getenv('MAX_REQUESTS_PER_SECOND', '10'),
+    10,
+    'MAX_REQUESTS_PER_SECOND'
 )
 
-YUMMI_POLICY_ID = validate_hex(
-    os.getenv('YUMMI_POLICY_ID'),
-    56,
-    'YUMMI_POLICY_ID'
+BURST_LIMIT = validate_positive_int(
+    os.getenv('BURST_LIMIT', '500'),
+    500,
+    'BURST_LIMIT'
 )
 
-# Monitoring Settings
+BURST_COOLDOWN = BURST_LIMIT / MAX_REQUESTS_PER_SECOND  # 50 seconds
+RATE_LIMIT_DELAY = validate_positive_int(
+    os.getenv('RATE_LIMIT_DELAY', '0.1'),
+    0.1,
+    'RATE_LIMIT_DELAY'
+)
+
+# Wallet Monitoring Configuration
 TRANSACTION_CHECK_INTERVAL = validate_positive_int(
     os.getenv('TRANSACTION_CHECK_INTERVAL', '5'),
     5,
@@ -96,24 +116,27 @@ YUMMI_CHECK_INTERVAL = validate_positive_int(
 
 MAX_TX_HISTORY = validate_positive_int(
     os.getenv('MAX_TX_HISTORY', '10'),
-    10,
+    50,
     'MAX_TX_HISTORY'
 )
 
-# API Configuration
-API_RETRY_ATTEMPTS = 3
-API_RETRY_DELAY = 1  # Base delay in seconds between retries
-API_RATE_LIMIT = 10  # Requests per second
-API_BURST_LIMIT = 500  # Maximum requests in burst
+# API Retry Configuration
+API_RETRY_ATTEMPTS = validate_positive_int(
+    os.getenv('API_RETRY_ATTEMPTS', '3'),
+    3,
+    'API_RETRY_ATTEMPTS'
+)
 
-# Rate Limiting Settings
-MAX_REQUESTS_PER_SECOND = 10
-RATE_LIMIT_DELAY = 5  # seconds to wait when rate limit is hit
+API_RETRY_DELAY = validate_positive_int(
+    os.getenv('API_RETRY_DELAY', '1'),
+    1,
+    'API_RETRY_DELAY'
+)
 
 # Wallet Check Settings
-WALLET_BATCH_SIZE = 50  # Number of wallets to check in each batch
-WALLET_CHECK_DELAY = 0.5  # seconds between wallet checks
-WALLET_PROCESS_DELAY = 0.1  # seconds between processing each wallet
+WALLET_BATCH_SIZE = 10  # Reduced to avoid hitting rate limits
+WALLET_CHECK_DELAY = 1.0  # Increased to respect rate limits
+WALLET_PROCESS_DELAY = 0.2  # Increased to respect rate limits
 
 # Logging Settings
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
