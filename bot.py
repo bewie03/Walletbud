@@ -6,6 +6,18 @@ from database import Database
 import blockfrost
 from datetime import datetime, timedelta
 from config import YUMMI_POLICY_ID, REQUIRED_BUD_TOKENS, TRANSACTION_CHECK_INTERVAL, MAX_TX_HISTORY
+import logging
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -34,7 +46,7 @@ blockfrost_client = blockfrost.BlockFrostApi(
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user} is ready and online!')
+    logger.info(f'Bot {bot.user} is ready and online!')
     try:
         # Set bot presence
         await bot.change_presence(
@@ -44,18 +56,18 @@ async def on_ready():
             ),
             status=discord.Status.online
         )
-        print("Bot presence set")
+        logger.info("Bot presence set")
         
         # Sync commands
-        print("Starting to sync commands...")
+        logger.info("Starting to sync commands...")
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} commands")
+        logger.info(f"Synced {len(synced)} commands")
         
         # Start wallet checking
         check_wallets.start()
-        print("Wallet checking started")
+        logger.info("Wallet checking started")
     except Exception as e:
-        print(f"Error during startup: {e}")
+        logger.error(f"Error during startup: {e}")
 
 @bot.event
 async def on_application_command_error(ctx, error):
@@ -65,7 +77,7 @@ async def on_application_command_error(ctx, error):
     elif isinstance(error, discord.app_commands.MissingPermissions):
         await ctx.response.send_message("You don't have permission to use this command.")
     else:
-        print(f"Command error: {str(error)}")
+        logger.error(f"Command error: {str(error)}")
         await ctx.response.send_message("An error occurred while processing your command. Please try again later.")
 
 async def handle_database_error(interaction, operation):
@@ -84,15 +96,15 @@ async def handle_database_error(interaction, operation):
 def check_yummi_balance(wallet_address):
     """Check if wallet has required amount of YUMMI tokens"""
     try:
-        print(f"Checking wallet {wallet_address} for YUMMI tokens")
-        print(f"Using policy ID: {YUMMI_POLICY_ID}")
+        logger.info(f"Checking wallet {wallet_address} for YUMMI tokens")
+        logger.info(f"Using policy ID: {YUMMI_POLICY_ID}")
         
         # First verify the wallet exists
         try:
             wallet = blockfrost_client.address(wallet_address)
-            print(f"Wallet verified: {wallet_address}")
+            logger.info(f"Wallet verified: {wallet_address}")
         except Exception as e:
-            print(f"Error verifying wallet: {str(e)}")
+            logger.error(f"Error verifying wallet: {str(e)}")
             if hasattr(e, 'status_code'):
                 if e.status_code == 404:
                     return False, "Wallet address not found"
@@ -113,33 +125,33 @@ def check_yummi_balance(wallet_address):
                 all_assets.extend(assets)
                 page += 1
                 
-            print(f"Found {len(all_assets)} total assets in wallet")
+            logger.info(f"Found {len(all_assets)} total assets in wallet")
             
             # Look for any asset with the YUMMI policy ID (case insensitive)
             policy_id = YUMMI_POLICY_ID.lower()
             for asset in all_assets:
-                print(f"Checking asset: {asset.unit}")
+                logger.info(f"Checking asset: {asset.unit}")
                 if asset.unit.lower().startswith(policy_id):
                     # Convert quantity from string to integer
                     try:
                         yummi_amount = int(asset.quantity)
-                        print(f"Found YUMMI token with amount: {yummi_amount}")
+                        logger.info(f"Found YUMMI token with amount: {yummi_amount}")
                         if yummi_amount >= MIN_YUMMI_REQUIRED:
                             return True, "Sufficient YUMMI balance"
                         else:
                             return False, f"Insufficient YUMMI balance (has {yummi_amount:,}, needs {MIN_YUMMI_REQUIRED:,})"
                     except ValueError:
-                        print(f"Error converting token quantity: {asset.quantity}")
+                        logger.error(f"Error converting token quantity: {asset.quantity}")
                         return False, "Error reading token balance"
             
             return False, "No YUMMI tokens found in wallet"
             
         except Exception as e:
-            print(f"Error checking assets: {str(e)}")
+            logger.error(f"Error checking assets: {str(e)}")
             return False, "Could not check wallet assets"
             
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         return False, "An unexpected error occurred"
 
 @bot.tree.command(
@@ -203,6 +215,7 @@ class WalletModal(discord.ui.Modal, title="Add Wallet"):
             else:
                 await interaction.response.send_message("Error adding wallet. This wallet might already be registered.")
         except Exception as e:
+            logger.error(f"An error occurred while adding the wallet: {str(e)}")
             await interaction.response.send_message(f"An error occurred while adding the wallet: {str(e)}")
 
 class WalletSelectView(discord.ui.View):
@@ -247,6 +260,7 @@ class WalletSelect(discord.ui.Select):
             else:
                 await interaction.response.send_message("❌ Failed to remove wallet. Please try again.")
         except Exception as e:
+            logger.error(f"An error occurred: {str(e)}")
             await interaction.response.send_message(f"An error occurred: {str(e)}")
 
 @bot.tree.command(
@@ -283,7 +297,7 @@ async def list_wallets(interaction: discord.Interaction):
                     inline=False
                 )
             except Exception as e:
-                print(f"Error processing wallet {wallet}: {e}")
+                logger.error(f"Error processing wallet {wallet}: {e}")
                 embed.add_field(
                     name=f"Wallet (Status Unknown)",
                     value=f"Address: `{wallet[:8]}...{wallet[-8:]}`\nError checking status",
@@ -292,7 +306,7 @@ async def list_wallets(interaction: discord.Interaction):
 
         await interaction.response.send_message(embed=embed)
     except Exception as e:
-        print(f"Error listing wallets: {e}")
+        logger.error(f"Error listing wallets: {e}")
         await handle_database_error(interaction, "listing wallets")
 
 @bot.tree.command(
@@ -315,7 +329,7 @@ async def remove_wallet(interaction: discord.Interaction):
             view=view
         )
     except Exception as e:
-        print(f"Error removing wallet: {e}")
+        logger.error(f"Error removing wallet: {e}")
         await handle_database_error(interaction, "accessing wallet list")
 
 async def process_transaction(wallet_address, discord_id, tx_hash):
@@ -373,10 +387,15 @@ async def process_transaction(wallet_address, discord_id, tx_hash):
                 value=f"{MIN_YUMMI_REQUIRED:,} YUMMI",
                 inline=False
             )
+            deactivate_embed.add_field(
+                name="Wallet",
+                value=f"`{wallet_address[:8]}...{wallet_address[-8:]}`",
+                inline=False
+            )
             await send_dm(discord_id, deactivate_embed)
             
     except Exception as e:
-        print(f"Error processing transaction {tx_hash}: {str(e)}")
+        logger.error(f"Error processing transaction {tx_hash}: {str(e)}")
 
 async def send_dm(user_id, embed):
     """Helper function to send DM to user"""
@@ -384,11 +403,63 @@ async def send_dm(user_id, embed):
         user = await bot.fetch_user(int(user_id))
         if user:
             await user.send(embed=embed)
-            print(f"DM sent to user {user_id}")
+            logger.info(f"DM sent to user {user_id}")
         else:
-            print(f"Could not find user {user_id}")
+            logger.error(f"Could not find user {user_id}")
     except Exception as e:
-        print(f"Error sending DM to {user_id}: {str(e)}")
+        logger.error(f"Error sending DM to {user_id}: {str(e)}")
+
+@bot.tree.command(
+    name="help",
+    description="Show available commands and bot information"
+)
+async def help_command(interaction: discord.Interaction):
+    """Show help information about the bot"""
+    try:
+        embed = discord.Embed(
+            title="🤖 WalletBud Help",
+            description="Monitor your Cardano wallets and YUMMI token transactions",
+            color=discord.Color.blue()
+        )
+
+        # Commands section
+        embed.add_field(
+            name="📝 Commands",
+            value=(
+                "`/addwallet` - Add a Cardano wallet (requires 20,000 YUMMI)\n"
+                "`/list_wallets` - View your registered wallets\n"
+                "`/remove_wallet` - Remove a wallet from tracking\n"
+                "`/help` - Show this help message"
+            ),
+            inline=False
+        )
+
+        # Features section
+        embed.add_field(
+            name="✨ Features",
+            value=(
+                "• DM notifications for transactions\n"
+                "• YUMMI token balance tracking\n"
+                "• Automatic wallet status updates\n"
+                "• Transaction links to Cardanoscan"
+            ),
+            inline=False
+        )
+
+        # Requirements section
+        embed.add_field(
+            name="⚠️ Requirements",
+            value=f"• Minimum {REQUIRED_BUD_TOKENS:,} YUMMI tokens per wallet",
+            inline=False
+        )
+
+        # Footer
+        embed.set_footer(text="Bot checks wallets every 5 minutes | DM for notifications")
+
+        await interaction.response.send_message(embed=embed)
+    except Exception as e:
+        logger.error(f"Error showing help: {e}")
+        await interaction.response.send_message("An error occurred while showing help. Please try again later.")
 
 @tasks.loop(minutes=TRANSACTION_CHECK_INTERVAL)
 async def check_wallets():
@@ -403,7 +474,7 @@ async def check_wallets():
             # First check if wallet still has enough YUMMI tokens
             has_balance, message = check_yummi_balance(wallet_address)
             if not has_balance:
-                print(f"Wallet {wallet_address} no longer has enough YUMMI tokens")
+                logger.info(f"Wallet {wallet_address} no longer has enough YUMMI tokens")
                 db.update_wallet_status(wallet_address, False)
                 user = await bot.fetch_user(int(discord_id))
                 if user:
@@ -436,9 +507,9 @@ async def check_wallets():
                     await process_transaction(wallet_address, discord_id, tx.tx_hash)
                     
             except Exception as e:
-                print(f"Error checking transactions for wallet {wallet_address}: {str(e)}")
+                logger.error(f"Error checking transactions for wallet {wallet_address}: {str(e)}")
                 
         except Exception as e:
-            print(f"Error processing wallet {wallet_address}: {str(e)}")
+            logger.error(f"Error processing wallet {wallet_address}: {str(e)}")
 
 bot.run(os.getenv('DISCORD_TOKEN'))
