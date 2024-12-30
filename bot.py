@@ -50,7 +50,7 @@ def dm_only():
         return True
     return app_commands.check(predicate)
 
-def has_blockfrost():
+def has_blockfrost(func=None):
     """Check if Blockfrost client is available"""
     async def predicate(interaction: discord.Interaction) -> bool:
         if not interaction.client.blockfrost_client:
@@ -60,7 +60,10 @@ def has_blockfrost():
             )
             return False
         return True
-    return app_commands.check(predicate)
+    
+    if func is None:
+        return app_commands.check(predicate)
+    return app_commands.check(predicate)(func)
 
 class RateLimiter:
     """Rate limiter for API requests"""
