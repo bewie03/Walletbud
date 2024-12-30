@@ -202,15 +202,15 @@ class WalletBud(commands.Bot):
                             
                     except Exception as e:
                         logger.error(f"Error sending transaction notification: {str(e)}")
-            
-            # Update last checked time
-            self.db.update_last_checked(wallet_address)
-            
-        except blockfrost.ApiError as e:
-            logger.error(f"Error fetching transactions: {str(e)}")
-            if e.status_code == 429:  # Rate limit
-                return  # Skip this check, will try again next interval
-                
+
+                # Update last checked time after processing all transactions
+                self.db.update_last_checked(wallet_address)
+
+            except blockfrost.ApiError as e:
+                logger.error(f"Error fetching transactions: {str(e)}")
+                if e.status_code == 429:  # Rate limit
+                    return  # Skip this check, will try again next interval
+                    
         except Exception as e:
             logger.error(f"Error in check_wallet_transactions: {str(e)}")
 
