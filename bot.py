@@ -400,12 +400,15 @@ class WalletBud(commands.Bot):
     async def check_wallet_transactions(self, wallet_address, discord_id):
         """Check transactions for a wallet"""
         try:
-            # Get wallet transactions
+            # Get wallet transactions (latest first)
             transactions = await self.blockfrost_client.address_transactions(
                 address=wallet_address,
-                from_=0,
-                to=10
+                count=10,
+                order='desc'
             )
+            
+            if not transactions:
+                return
             
             # Get last checked transaction from database
             last_tx = None
@@ -418,31 +421,70 @@ class WalletBud(commands.Bot):
                     last_tx = result[0]
             
             # Process new transactions
+            new_txs = []
             for tx in transactions:
                 if not last_tx or tx.tx_hash != last_tx:
+                    new_txs.append(tx)
+                else:
+                    break
+            
+            # Process transactions in chronological order (oldest first)
+            for tx in reversed(new_txs):
+                try:
                     # Get transaction details
-                    tx_details = await self.blockfrost_client.transaction_utxos(
-                        hash=tx.tx_hash
-                    )
+                    tx_details = await self.blockfrost_client.transaction_utxos(tx.tx_hash)
                     
-                    # Check if this transaction affects our wallet
+                    # Calculate total ADA and assets received
+                    received_ada = 0
+                    received_assets = {}
+                    
                     for output in tx_details.outputs:
                         if output.address == wallet_address:
-                            # Found a new incoming transaction
-                            user = await self.fetch_user(discord_id)
-                            if user:
-                                await user.send(f"💰 New transaction detected for wallet {wallet_address[:8]}...!\n"
-                                              f"Transaction Hash: {tx.tx_hash}")
+                            # Add ADA amount
+                            received_ada += int(output.amount[0].quantity) / 1_000_000
+                            
+                            # Add other assets
+                            for asset in output.amount[1:]:
+                                asset_name = asset.unit
+                                quantity = int(asset.quantity)
+                                if asset_name in received_assets:
+                                    received_assets[asset_name] += quantity
+                                else:
+                                    received_assets[asset_name] = quantity
                     
-                    # Update last checked transaction
-                    with sqlite3.connect(DATABASE_NAME) as conn:
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            'UPDATE wallets SET last_tx_hash = ? WHERE address = ? AND discord_id = ?',
-                            (tx.tx_hash, wallet_address, discord_id)
-                        )
-                        conn.commit()
-                    break  # Only process the most recent new transaction
+                    # Only notify if wallet received something
+                    if received_ada > 0 or received_assets:
+                        # Create notification message
+                        message = [f"💰 New transaction for wallet `{wallet_address[:8]}...`!"]
+                        
+                        if received_ada > 0:
+                            message.append(f"• Received: {received_ada:.6f} ADA")
+                        
+                        for asset_id, quantity in received_assets.items():
+                            if asset_id == YUMMI_POLICY_ID:
+                                message.append(f"• Received: {quantity:,} YUMMI")
+                            else:
+                                message.append(f"• Received: {quantity:,} of asset {asset_id}")
+                        
+                        message.append(f"\nTransaction: `{tx.tx_hash}`")
+                        
+                        # Send notification
+                        user = await self.fetch_user(int(discord_id))
+                        if user:
+                            await user.send("\n".join(message))
+                    
+                except Exception as e:
+                    logger.error(f"Error processing transaction {tx.tx_hash}: {e}")
+                    continue
+                
+                # Update last checked transaction
+                with sqlite3.connect(DATABASE_NAME) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        'UPDATE wallets SET last_tx_hash = ? WHERE address = ? AND discord_id = ?',
+                        (tx.tx_hash, wallet_address, discord_id)
+                    )
+                    conn.commit()
                     
         except Exception as e:
             logger.error(f"Error checking transactions for wallet {wallet_address}: {e}")
@@ -450,20 +492,24 @@ class WalletBud(commands.Bot):
     async def check_yummi_balance(self, wallet_address):
         """Check YUMMI token balance"""
         try:
-            # Get wallet's asset balance
-            balances = await self.blockfrost_client.address_details(
+            # Get wallet's specific asset balance
+            assets = await self.blockfrost_client.address_assets(
                 address=wallet_address
             )
             
-            if not balances:
-                return False, "No balance information available"
+            if not assets:
+                return True, 0  # No assets means 0 balance, but not an error
             
             # Find YUMMI token balance
             yummi_balance = 0
-            for asset in balances.amount:
+            for asset in assets:
                 if asset.unit == YUMMI_POLICY_ID:
                     yummi_balance = int(asset.quantity)
                     break
+            
+            # Check if balance meets requirement
+            if yummi_balance < REQUIRED_BUD_TOKENS:
+                return False, f"Insufficient YUMMI balance. Required: {REQUIRED_BUD_TOKENS:,}, Current: {yummi_balance:,}"
             
             return True, yummi_balance
             
@@ -475,23 +521,34 @@ class WalletBud(commands.Bot):
 
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
-        try:
-            # Create Blockfrost client
-            self.blockfrost_client = BlockFrostApi(
-                project_id=BLOCKFROST_API_KEY,
-                base_url=BLOCKFROST_BASE_URL
-            )
-            
-            # Test connection with a simple address query
-            await self.blockfrost_client.address(
-                address="addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
-            )
-            logger.info("Blockfrost API initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Blockfrost initialization failed: {e}")
-            self.blockfrost_client = None
-            raise
+        max_retries = 3
+        retry_delay = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Create Blockfrost client
+                self.blockfrost_client = BlockFrostApi(
+                    project_id=BLOCKFROST_API_KEY,
+                    base_url=BLOCKFROST_BASE_URL
+                )
+                
+                # Test connection with health check endpoint
+                health = await self.blockfrost_client.health()
+                if health.is_healthy:
+                    logger.info("Blockfrost API initialized successfully")
+                    return
+                else:
+                    raise Exception("Blockfrost API health check failed")
+                
+            except Exception as e:
+                logger.warning(f"Blockfrost initialization attempt {attempt + 1} failed: {e}")
+                self.blockfrost_client = None
+                
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                else:
+                    logger.error("All Blockfrost initialization attempts failed")
+                    raise
 
 if __name__ == "__main__":
     try:
