@@ -128,158 +128,253 @@ class WalletBud(commands.Bot):
         self.blockfrost_client = None
         self.monitoring_paused = False
         
-        # Register commands
-        self.setup_commands()
-        
-    def setup_commands(self):
-        """Set up bot commands"""
-        logger.info("Setting up commands...")
-        
-        # Register command error handler
-        @self.event
-        async def on_command_error(ctx, error):
-            if isinstance(error, commands.NoPrivateMessage):
-                await ctx.send("This command can only be used in DMs for security.")
-            elif isinstance(error, commands.CheckFailure):
-                # Don't send message as the check should have sent one
-                pass
-            else:
-                logger.error(f"Command error: {str(error)}")
-                await ctx.send("An error occurred while processing your command.")
-        
-        # Register commands
-        @self.command(name='addwallet')
-        @dm_only()
-        @has_blockfrost()
-        @not_monitoring_paused()
-        async def add_wallet(ctx, wallet_address: str = None):
-            """Add a wallet to monitor"""
-            try:
-                # Basic input validation
-                if not wallet_address:
-                    await ctx.send("Please provide a wallet address. Usage: !addwallet <address>")
-                    return
-                    
-                logger.info(f"Processing add wallet request from {ctx.author.id} for address: {wallet_address}")
-                
-                # Check if wallet exists and get YUMMI balance
-                success, result = await self.check_yummi_balance(wallet_address)
-                
-                if success:
-                    try:
-                        # Add wallet to database
-                        add_wallet(wallet_address, str(ctx.author.id))
-                        await ctx.send(f"Wallet added successfully! Current YUMMI balance: {result:,}")
-                        logger.info(f"Wallet {wallet_address} added for user {ctx.author.id}")
-                    except sqlite3.IntegrityError:
-                        await ctx.send("This wallet is already being monitored!")
-                        logger.warning(f"Duplicate wallet add attempt: {wallet_address}")
-                else:
-                    await ctx.send(result)  # Result contains error message
-                    logger.warning(f"Add wallet failed - {result}")
-                    
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Error in add_wallet command: {error_msg}")
-                await ctx.send(
-                    "An error occurred while processing your request. Please try again later. "
-                    "If the problem persists, contact support."
-                )
-                
-        @self.command(name='removewallet')
-        @dm_only()
-        async def remove_wallet(ctx, wallet_address: str = None):
-            """Remove a wallet from monitoring"""
-            try:
-                if not wallet_address:
-                    await ctx.send("Please provide a wallet address. Usage: !removewallet <address>")
-                    return
-                
-                logger.info(f"Processing remove wallet request from {ctx.author.id} for address: {wallet_address}")
-                
-                try:
-                    # Remove wallet from database
-                    remove_wallet(wallet_address, str(ctx.author.id))
-                    await ctx.send(f"Wallet removed successfully!")
-                    logger.info(f"Wallet {wallet_address} removed for user {ctx.author.id}")
-                except Exception as e:
-                    await ctx.send("Failed to remove wallet. Make sure you own this wallet.")
-                    logger.warning(f"Failed to remove wallet {wallet_address}: {str(e)}")
-                    
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Error in remove_wallet command: {error_msg}")
-                await ctx.send("An error occurred while processing your request.")
-                
-        @self.command(name='listwallets')
-        @dm_only()
-        async def list_wallets(ctx):
-            """List all wallets being monitored"""
-            try:
-                # Get user's wallets from database
-                query = '''
-                    SELECT address, last_checked, is_active
-                    FROM wallets
-                    WHERE discord_id = ?
-                    ORDER BY created_at DESC
-                '''
-                self.cursor.execute(query, (str(ctx.author.id),))
-                wallets = self.cursor.fetchall()
-                
-                if not wallets:
-                    await ctx.send("You don't have any wallets being monitored.")
-                    return
-                
-                # Format wallet list
-                wallet_list = ["Your monitored wallets:"]
-                for wallet in wallets:
-                    status = "🟢 Active" if wallet['is_active'] else "🔴 Inactive"
-                    last_checked = wallet['last_checked'] or "Never"
-                    wallet_list.append(
-                        f"• `{wallet['address']}`\n"
-                        f"  Status: {status}\n"
-                        f"  Last checked: {last_checked}"
-                    )
-                
-                await ctx.send("\n".join(wallet_list))
-                logger.info(f"Listed {len(wallets)} wallets for user {ctx.author.id}")
-                
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(f"Error in list_wallets command: {error_msg}")
-                await ctx.send("An error occurred while retrieving your wallets.")
-        
-        logger.info("Commands setup complete")
-        
     async def setup_hook(self):
         """Called when the bot starts up"""
         try:
-            logger.info("Bot is starting up...")
-            
             # Verify environment first
             await self.verify_environment()
             
-            # Initialize Blockfrost client
-            logger.info("Initializing Blockfrost...")
-            if not await self.init_blockfrost():
-                logger.error("Failed to initialize Blockfrost API")
-                self.monitoring_paused = True
+            # Clear existing commands
+            self.tree.clear_commands(guild=None)
+            logger.info("Cleared existing commands")
             
-            # Start wallet monitoring if everything is ready
-            if not self.monitoring_paused:
-                logger.info("Starting wallet monitoring task...")
-                self.check_wallets.start()
-            else:
-                logger.warning("Wallet monitoring is paused due to initialization errors")
-                
-            # Add commands
-            logger.info("Registering commands...")
-            await self.register_commands()
+            # Register slash commands
+            @self.tree.command(name="addwallet", description="Add a wallet to monitor")
+            @app_commands.describe(address="The Cardano wallet address to monitor")
+            @app_commands.checks.cooldown(1, 30.0)  # One use per 30 seconds per user
+            async def addwallet(interaction: discord.Interaction, address: str):
+                """Add a wallet to monitor"""
+                # Check if command is used in DM
+                if interaction.guild is not None:
+                    await interaction.response.send_message(
+                        "❌ This command can only be used in DMs for security reasons.",
+                        ephemeral=True
+                    )
+                    return
+                    
+                try:
+                    if not address:
+                        await interaction.response.send_message(
+                            "❌ Please provide a wallet address.",
+                            ephemeral=True
+                        )
+                        return
+                        
+                    logger.info(f"Processing add wallet request from {interaction.user.id} for address: {address}")
+                    
+                    # Check if wallet exists and get YUMMI balance
+                    success, result = await self.check_yummi_balance(address)
+                    
+                    if success:
+                        try:
+                            # Add wallet to database
+                            add_wallet(address, str(interaction.user.id))
+                            embed = discord.Embed(
+                                title="✅ Wallet Added Successfully!",
+                                color=discord.Color.green(),
+                                timestamp=datetime.utcnow()
+                            )
+                            embed.add_field(name="Address", value=f"`{address}`", inline=False)
+                            embed.add_field(name="YUMMI Balance", value=f"{result:,}", inline=False)
+                            await interaction.response.send_message(embed=embed)
+                            logger.info(f"Wallet {address} added for user {interaction.user.id}")
+                        except sqlite3.IntegrityError:
+                            embed = discord.Embed(
+                                title="❌ Wallet Already Monitored",
+                                description="This wallet is already being monitored!",
+                                color=discord.Color.red()
+                            )
+                            await interaction.response.send_message(embed=embed)
+                            logger.warning(f"Duplicate wallet add attempt: {address}")
+                    else:
+                        embed = discord.Embed(
+                            title="❌ Error Adding Wallet",
+                            description=result,
+                            color=discord.Color.red()
+                        )
+                        await interaction.response.send_message(embed=embed)
+                        logger.warning(f"Add wallet failed - {result}")
+                        
+                except app_commands.CommandOnCooldown as e:
+                    await interaction.response.send_message(
+                        f"⏳ Please wait {e.retry_after:.1f} seconds before using this command again.",
+                        ephemeral=True
+                    )
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(f"Error in addwallet command: {error_msg}")
+                    embed = discord.Embed(
+                        title="❌ Error",
+                        description="An error occurred while processing your request. Please try again later.",
+                        color=discord.Color.red()
+                    )
+                    await interaction.response.send_message(embed=embed)
+            
+            @self.tree.command(name="removewallet", description="Remove a wallet from monitoring")
+            @app_commands.describe(address="The Cardano wallet address to stop monitoring")
+            @app_commands.checks.cooldown(1, 10.0)  # One use per 10 seconds per user
+            async def removewallet(interaction: discord.Interaction, address: str):
+                """Remove a wallet from monitoring"""
+                # Check if command is used in DM
+                if interaction.guild is not None:
+                    await interaction.response.send_message(
+                        "❌ This command can only be used in DMs for security reasons.",
+                        ephemeral=True
+                    )
+                    return
+                    
+                try:
+                    if not address:
+                        await interaction.response.send_message(
+                            "❌ Please provide a wallet address.",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    logger.info(f"Processing remove wallet request from {interaction.user.id} for address: {address}")
+                    
+                    try:
+                        # Remove wallet from database
+                        remove_wallet(address, str(interaction.user.id))
+                        embed = discord.Embed(
+                            title="✅ Wallet Removed",
+                            description=f"Successfully removed wallet: `{address}`",
+                            color=discord.Color.green()
+                        )
+                        await interaction.response.send_message(embed=embed)
+                        logger.info(f"Wallet {address} removed for user {interaction.user.id}")
+                    except Exception as e:
+                        embed = discord.Embed(
+                            title="❌ Error",
+                            description="Failed to remove wallet. Make sure you own this wallet.",
+                            color=discord.Color.red()
+                        )
+                        await interaction.response.send_message(embed=embed)
+                        logger.warning(f"Failed to remove wallet {address}: {str(e)}")
+                        
+                except app_commands.CommandOnCooldown as e:
+                    await interaction.response.send_message(
+                        f"⏳ Please wait {e.retry_after:.1f} seconds before using this command again.",
+                        ephemeral=True
+                    )
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(f"Error in removewallet command: {error_msg}")
+                    embed = discord.Embed(
+                        title="❌ Error",
+                        description="An error occurred while processing your request.",
+                        color=discord.Color.red()
+                    )
+                    await interaction.response.send_message(embed=embed)
+            
+            @self.tree.command(name="listwallets", description="List all your monitored wallets")
+            @app_commands.checks.cooldown(1, 5.0)  # One use per 5 seconds per user
+            async def listwallets(interaction: discord.Interaction):
+                """List all wallets being monitored"""
+                # Check if command is used in DM
+                if interaction.guild is not None:
+                    await interaction.response.send_message(
+                        "❌ This command can only be used in DMs for security reasons.",
+                        ephemeral=True
+                    )
+                    return
+                    
+                try:
+                    # Get user's wallets from database
+                    query = '''
+                        SELECT address, last_checked, is_active
+                        FROM wallets
+                        WHERE discord_id = ?
+                        ORDER BY created_at DESC
+                    '''
+                    self.cursor.execute(query, (str(interaction.user.id),))
+                    wallets = self.cursor.fetchall()
+                    
+                    if not wallets:
+                        embed = discord.Embed(
+                            title="No Wallets Found",
+                            description="You don't have any wallets being monitored.",
+                            color=discord.Color.blue()
+                        )
+                        await interaction.response.send_message(embed=embed)
+                        return
+                    
+                    # Format wallet list
+                    embed = discord.Embed(
+                        title="Your Monitored Wallets",
+                        color=discord.Color.blue(),
+                        timestamp=datetime.utcnow()
+                    )
+                    
+                    for wallet in wallets:
+                        status = "🟢 Active" if wallet['is_active'] else "🔴 Inactive"
+                        last_checked = wallet['last_checked'] or "Never"
+                        embed.add_field(
+                            name=f"Wallet: {wallet['address'][:8]}...{wallet['address'][-8:]}",
+                            value=f"Status: {status}\nLast checked: {last_checked}",
+                            inline=False
+                        )
+                    
+                    await interaction.response.send_message(embed=embed)
+                    logger.info(f"Listed {len(wallets)} wallets for user {interaction.user.id}")
+                    
+                except app_commands.CommandOnCooldown as e:
+                    await interaction.response.send_message(
+                        f"⏳ Please wait {e.retry_after:.1f} seconds before using this command again.",
+                        ephemeral=True
+                    )
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(f"Error in listwallets command: {error_msg}")
+                    embed = discord.Embed(
+                        title="❌ Error",
+                        description="An error occurred while retrieving your wallets.",
+                        color=discord.Color.red()
+                    )
+                    await interaction.response.send_message(embed=embed)
+            
+            # Error handler for cooldown
+            @self.tree.error
+            async def on_app_command_error(
+                interaction: discord.Interaction,
+                error: app_commands.AppCommandError
+            ):
+                if isinstance(error, app_commands.CommandOnCooldown):
+                    await interaction.response.send_message(
+                        f"⏳ Please wait {error.retry_after:.1f} seconds before using this command again.",
+                        ephemeral=True
+                    )
+                elif isinstance(error, app_commands.CheckFailure):
+                    await interaction.response.send_message(
+                        "❌ You don't have permission to use this command.",
+                        ephemeral=True
+                    )
+                else:
+                    logger.error(f"Command error: {str(error)}")
+                    await interaction.response.send_message(
+                        "❌ An error occurred while processing your command.",
+                        ephemeral=True
+                    )
+            
+            # Sync commands with Discord
+            await self.tree.sync()
+            logger.info("Commands synced with Discord")
+            
+            # Initialize Blockfrost client
+            await self.init_blockfrost()
+            
+            # Start background tasks
+            self.check_wallets.start()
+            
+            logger.info("Bot setup completed successfully")
+            await self.notify_admin("Bot started successfully! 🚀")
             
         except Exception as e:
-            logger.error(f"Error during bot setup: {str(e)}")
-            self.monitoring_paused = True
-            
+            error_msg = f"Failed to setup bot: {str(e)}"
+            logger.critical(error_msg)
+            await self.notify_admin(error_msg, "CRITICAL")
+            raise
+
     async def on_ready(self):
         """Called when the bot is ready"""
         try:
@@ -294,51 +389,9 @@ class WalletBud(commands.Bot):
             logger.debug(f"- Required YUMMI: {REQUIRED_YUMMI_TOKENS}")
             logger.debug(f"- Blockfrost initialized: {self.blockfrost_client is not None}")
             
-            # Sync commands
-            try:
-                await self.tree.sync()
-                logger.info("Commands synced globally")
-            except Exception as e:
-                logger.error(f"Failed to sync commands: {str(e)}")
-            
         except Exception as e:
             logger.error(f"Error in on_ready: {str(e)}")
             
-    async def register_commands(self):
-        """Register all commands"""
-        logger.info("Registering commands...")
-        
-        try:
-            # Add command groups
-            wallet_group = app_commands.Group(name="wallet", description="Wallet management commands")
-            self.tree.add_command(wallet_group)
-            
-            # Add commands to groups
-            wallet_group.add_command(app_commands.Command(
-                name="add",
-                description="Add a wallet to monitor",
-                callback=self.add_wallet_slash
-            ))
-            
-            wallet_group.add_command(app_commands.Command(
-                name="remove",
-                description="Remove a wallet from monitoring",
-                callback=self.remove_wallet_slash
-            ))
-            
-            # Add global commands
-            self.tree.add_command(app_commands.Command(
-                name="status",
-                description="Check bot status",
-                callback=self.status_slash
-            ))
-            
-            logger.info("Commands registered successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to register commands: {str(e)}")
-            raise
-
     async def on_error(self, event_method: str, *args, **kwargs):
         """Global error handler for events"""
         logger.error(f'Error in {event_method}:', exc_info=True)
