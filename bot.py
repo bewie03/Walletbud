@@ -410,6 +410,11 @@ class WalletBud(commands.Bot):
             
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        error_data = await response.text()
+                        logger.error(f"Rate limit check failed with status {response.status}: {error_data}")
+                        return None, None
+                        
                     # Check rate limit headers
                     remaining = int(response.headers.get('x-ratelimit-remaining', 0))
                     reset_in = int(response.headers.get('x-ratelimit-reset', 0))
