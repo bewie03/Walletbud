@@ -52,12 +52,12 @@ def dm_only():
 
 def has_blockfrost():
     """Check if Blockfrost client is available"""
-    def predicate(interaction: discord.Interaction) -> bool:
+    async def predicate(interaction: discord.Interaction) -> bool:
         if not interaction.client.blockfrost_client:
-            asyncio.create_task(interaction.response.send_message(
+            await interaction.response.send_message(
                 "❌ Blockfrost API is not available. Please try again later.",
                 ephemeral=True
-            ))
+            )
             return False
         return True
     return app_commands.check(predicate)
