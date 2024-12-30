@@ -1,6 +1,5 @@
 import os
 from dotenv import load_dotenv
-from blockfrost import ApiUrls
 
 load_dotenv()
 
@@ -27,7 +26,8 @@ BLOCKFROST_API_KEY = os.getenv('BLOCKFROST_API_KEY')
 if not BLOCKFROST_API_KEY:
     raise ValueError("No Blockfrost API key found! Make sure BLOCKFROST_API_KEY is set in .env")
 
-BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', ApiUrls.mainnet.value)
+# Use direct URL instead of ApiUrls enum to avoid await issues
+BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v1')
 
 # Database Configuration
 DATABASE_NAME = os.getenv('DATABASE_NAME', 'wallets.db')
