@@ -271,81 +271,27 @@ class WalletBud(commands.Bot):
     async def setup_hook(self):
         """Called when the bot starts up"""
         try:
-            # Verify environment first
-            await self.verify_environment()
+            # Initialize database schema
+            await self.init_database()
+            logger.info("Database initialized successfully")
             
-            # Initialize Blockfrost client
-            blockfrost_ok = await self.init_blockfrost()
-            if not blockfrost_ok:
+            # Initialize Blockfrost API
+            if await self.init_blockfrost():
+                logger.info("Blockfrost API initialized successfully")
+            else:
                 logger.warning("Bot will run with limited functionality due to Blockfrost API issues")
-                await self.notify_admin("Bot started with limited functionality - Blockfrost API unavailable", "WARNING")
             
-            # Sync commands with Discord (only once during startup)
-            try:
-                await self.tree.sync()
-                logger.info("Commands synced with Discord")
-            except discord.HTTPException as e:
-                logger.error(f"Failed to sync commands: {str(e)}")
-                await self.notify_admin(f"Failed to sync commands: {str(e)}", "ERROR")
+            # Sync commands with Discord
+            await self.tree.sync()
+            logger.info("Commands synced with Discord")
             
             # Start background tasks
             self.check_wallets.start()
-            
             logger.info("Bot setup completed successfully")
-            await self.notify_admin("Bot started successfully!")
             
         except Exception as e:
-            error_msg = f"Failed to setup bot: {str(e)}"
-            logger.critical(error_msg)
-            await self.notify_admin(error_msg, "CRITICAL")
-            # Don't raise here, let the bot continue
-
-    async def on_ready(self):
-        """Called when the bot is ready"""
-        try:
-            logger.info(f"Logged in as {self.user.name} ({self.user.id})")
-            logger.info(f"Using command prefix: !")
-            logger.info(f"Monitoring status: {'PAUSED' if self.monitoring_paused else 'ACTIVE'}")
-            
-            # Log configuration
-            logger.debug("Current configuration:")
-            logger.debug(f"- Database: wallets.db")
-            logger.debug(f"- YUMMI Policy ID: {YUMMI_POLICY_ID}")
-            logger.debug(f"- Required YUMMI: {REQUIRED_YUMMI_TOKENS}")
-            logger.debug(f"- Blockfrost initialized: {self.blockfrost_client is not None}")
-            
-        except Exception as e:
-            logger.error(f"Error in on_ready: {str(e)}")
-            
-    async def on_error(self, event_method: str, *args, **kwargs):
-        """Global error handler for events"""
-        logger.error(f'Error in {event_method}:', exc_info=True)
-
-    async def rate_limited_request(self, func, *args, **kwargs):
-        """Execute a rate-limited API request with exponential backoff"""
-        max_retries = API_RETRY_ATTEMPTS
-        base_delay = API_RETRY_DELAY
-        
-        for attempt in range(max_retries):
-            try:
-                # Wait for rate limit
-                async with self.rate_limit:
-                    # Execute the API call
-                    result = await func(*args, **kwargs)
-                    return result
-                    
-            except Exception as e:
-                # Check if this is the last attempt
-                if attempt == max_retries - 1:
-                    logger.error(f"API request failed after {max_retries} attempts: {str(e)}")
-                    raise
-                
-                # Calculate delay with exponential backoff
-                delay = base_delay * (2 ** attempt)
-                logger.warning(f"API request failed (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {str(e)}")
-                await asyncio.sleep(delay)
-        
-        raise Exception(f"API request failed after {max_retries} attempts")
+            logger.error(f"Failed to complete setup: {str(e)}")
+            raise
 
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
@@ -359,24 +305,29 @@ class WalletBud(commands.Bot):
                 return False
                 
             # Initialize client based on network
-            if network.lower() == 'mainnet':
-                self.blockfrost_client = BlockFrostApi(
-                    api_key=api_key,
-                    base_url="https://cardano-mainnet.blockfrost.io/api/v0"
-                )
-            else:
-                self.blockfrost_client = BlockFrostApi(
-                    api_key=api_key,
-                    base_url="https://cardano-testnet.blockfrost.io/api/v0"
-                )
-                
-            # Test connection
             try:
-                await self.rate_limited_request(self.blockfrost_client.health)
-                logger.info(f"Blockfrost API initialized successfully on {network}")
-                return True
+                if network.lower() == 'mainnet':
+                    self.blockfrost_client = BlockFrostApi(
+                        project_id=api_key
+                    )
+                else:
+                    self.blockfrost_client = BlockFrostApi(
+                        project_id=api_key,
+                        base_url="https://cardano-testnet.blockfrost.io/api/v0"
+                    )
+                
+                # Test connection
+                health = await self.blockfrost_client.health()
+                if health:
+                    logger.info(f"Blockfrost API initialized successfully on {network}")
+                    return True
+                else:
+                    logger.error("Failed to verify Blockfrost API health")
+                    self.blockfrost_client = None
+                    return False
+                    
             except Exception as e:
-                logger.error(f"Failed to verify Blockfrost API connection: {str(e)}")
+                logger.error(f"Failed to initialize Blockfrost client: {str(e)}")
                 self.blockfrost_client = None
                 return False
                 
@@ -410,27 +361,42 @@ class WalletBud(commands.Bot):
                 return
                 
             # Check wallet balance
-            success, balance = await self.check_wallet_balance(address)
-            if not success:
+            try:
+                balance = await self.blockfrost_client.addresses(address=address)
+                if not balance:
+                    await interaction.followup.send(
+                        "Error: Could not fetch wallet balance.",
+                        ephemeral=True
+                    )
+                    return
+            except Exception as e:
+                logger.error(f"Error checking wallet balance: {str(e)}")
                 await interaction.followup.send(
-                    f"Error checking wallet: {balance}",
+                    "Error checking wallet balance. Please try again later.",
                     ephemeral=True
                 )
                 return
                 
             # Check YUMMI balance
-            success, yummi_balance = await self.check_yummi_balance(address)
-            if not success:
+            try:
+                assets = await self.blockfrost_client.addresses_assets(address=address)
+                yummi_balance = 0
+                for asset in assets:
+                    if asset.unit == YUMMI_POLICY_ID:
+                        yummi_balance = int(asset.quantity)
+                        break
+                        
+                if yummi_balance < REQUIRED_YUMMI_TOKENS:
+                    await interaction.followup.send(
+                        f"Insufficient YUMMI tokens. Required: {REQUIRED_YUMMI_TOKENS:,}, Current: {yummi_balance:,}",
+                        ephemeral=True
+                    )
+                    return
+                    
+            except Exception as e:
+                logger.error(f"Error checking YUMMI balance: {str(e)}")
                 await interaction.followup.send(
-                    f"Error checking YUMMI balance: {yummi_balance}",
-                    ephemeral=True
-                )
-                return
-                
-            # Check minimum YUMMI requirement
-            if yummi_balance < REQUIRED_YUMMI_TOKENS:
-                await interaction.followup.send(
-                    f"Insufficient YUMMI tokens. Required: {REQUIRED_YUMMI_TOKENS:,}, Current: {yummi_balance:,}",
+                    "Error checking YUMMI balance. Please try again later.",
                     ephemeral=True
                 )
                 return
@@ -463,7 +429,7 @@ class WalletBud(commands.Bot):
                     timestamp=datetime.utcnow()
                 )
                 embed.add_field(name="Address", value=f"`{address}`", inline=False)
-                embed.add_field(name="ADA Balance", value=f"{balance/1000000:.6f} ₳", inline=True)
+                embed.add_field(name="ADA Balance", value=f"{int(balance.amount[0].quantity)/1000000:.6f} ₳", inline=True)
                 embed.add_field(name="YUMMI Balance", value=f"{yummi_balance:,}", inline=True)
                 
                 await interaction.followup.send(embed=embed)
@@ -636,50 +602,68 @@ class WalletBud(commands.Bot):
     async def help_command(self, interaction: discord.Interaction):
         """Handle the help command"""
         try:
-            logger.info(f"Help command received from {interaction.user.id}")
-            
-            # Send initial response immediately
+            # Defer response since embed creation might take a moment
             await interaction.response.defer(ephemeral=True)
             
+            # Create help embed
             embed = discord.Embed(
-                title="🤖 WalletBud Commands",
-                description="All commands must be used in DMs for security.",
+                title="🤖 Wallet Bud Help",
+                description="Here are all available commands:",
                 color=discord.Color.blue(),
                 timestamp=datetime.utcnow()
             )
             
-            commands = [
-                ("/addwallet", "Add a Cardano wallet to monitor (DM only)"),
-                ("/removewallet", "Remove a wallet from monitoring (DM only)"),
-                ("/listwallets", "List all your monitored wallets (DM only)"),
-                ("/help", "Show this help message"),
-                ("/health", "Check bot and API status")
-            ]
-            
-            for cmd, desc in commands:
-                embed.add_field(name=cmd, value=desc, inline=False)
-            
+            # Add command descriptions
             embed.add_field(
-                name="ℹ️ Note",
-                value="All commands must be used in DMs for security.",
+                name="/addwallet <address>",
+                value="Add a Cardano wallet to monitor. Requires YUMMI tokens.",
                 inline=False
             )
             
-            await interaction.followup.send(embed=embed)
-            logger.info(f"Help message sent to user {interaction.user.id}")
+            embed.add_field(
+                name="/removewallet <address>",
+                value="Remove a wallet from monitoring.",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="/listwallets",
+                value="List all your monitored wallets.",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="/help",
+                value="Show this help message.",
+                inline=False
+            )
+            
+            embed.add_field(
+                name="/health",
+                value="Check bot and API status.",
+                inline=False
+            )
+            
+            # Add footer with version
+            embed.set_footer(text="Wallet Bud v1.0.0")
+            
+            # Send the help embed
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            logger.info(f"Help command used by {interaction.user.id}")
             
         except Exception as e:
             logger.error(f"Error in help command: {str(e)}")
-            embed = discord.Embed(
-                title="❌ Error",
-                description="An error occurred while processing your request.",
-                color=discord.Color.red()
-            )
             try:
-                await interaction.followup.send(embed=embed)
+                await interaction.followup.send(
+                    "An error occurred while showing help. Please try again later.",
+                    ephemeral=True
+                )
             except:
                 if not interaction.response.is_done():
-                    await interaction.response.send_message(embed=embed)
+                    await interaction.response.send_message(
+                        "An error occurred while showing help. Please try again later.",
+                        ephemeral=True
+                    )
 
     async def health_command(self, interaction: discord.Interaction):
         """Handle the health command"""
@@ -696,7 +680,7 @@ class WalletBud(commands.Bot):
             blockfrost_status = "❌ Not Connected"
             if self.blockfrost_client:
                 try:
-                    health = await self.rate_limited_request(self.blockfrost_client.health)
+                    health = await self.blockfrost_client.health()
                     if health:
                         blockfrost_status = "✅ Connected"
                 except Exception as e:
@@ -812,6 +796,32 @@ class WalletBud(commands.Bot):
             except:
                 pass  # Ignore notification errors
                 
+    async def rate_limited_request(self, func, *args, **kwargs):
+        """Execute a rate-limited API request with exponential backoff"""
+        max_retries = API_RETRY_ATTEMPTS
+        base_delay = API_RETRY_DELAY
+        
+        for attempt in range(max_retries):
+            try:
+                # Wait for rate limit
+                async with self.rate_limit:
+                    # Execute the API call
+                    result = await func(*args, **kwargs)
+                    return result
+                    
+            except Exception as e:
+                # Check if this is the last attempt
+                if attempt == max_retries - 1:
+                    logger.error(f"API request failed after {max_retries} attempts: {str(e)}")
+                    raise
+                
+                # Calculate delay with exponential backoff
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"API request failed (attempt {attempt + 1}/{max_retries}), retrying in {delay}s: {str(e)}")
+                await asyncio.sleep(delay)
+        
+        raise Exception(f"API request failed after {max_retries} attempts")
+
     async def verify_environment(self):
         """Verify all required environment variables and configurations"""
         missing_vars = []
