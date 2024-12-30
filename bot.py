@@ -100,6 +100,10 @@ class RateLimiter:
             
             # Add current request
             self.requests.append(now)
+            
+    async def release(self):
+        """Release a rate limit token (no-op since we use time-based windowing)"""
+        pass
 
 class WalletBud(commands.Bot):
     def __init__(self):
@@ -275,7 +279,8 @@ class WalletBud(commands.Bot):
                     logger.info(f"Listing wallets for user {interaction.user.id}")
                     
                     # Get wallets
-                    wallets = await get_all_wallets(str(interaction.user.id))
+                    all_wallets = await get_all_wallets()
+                    wallets = [w['address'] for w in all_wallets if w['user_id'] == str(interaction.user.id)]
                     
                     if not wallets:
                         await interaction.followup.send(
@@ -558,7 +563,7 @@ class WalletBud(commands.Bot):
                 wallets = await get_all_wallets()
                 if not wallets:
                     logger.debug("No wallets to check")
-                    await asyncio.sleep(CHECK_INTERVAL)
+                    await asyncio.sleep(WALLET_CHECK_INTERVAL)
                     continue
                 
                 logger.info(f"Checking {len(wallets)} wallets...")
@@ -567,13 +572,13 @@ class WalletBud(commands.Bot):
                 async with asyncio.TaskGroup() as tg:
                     for wallet in wallets:
                         tg.create_task(self.check_wallet(wallet['address']))
-                
+            
             except Exception as e:
                 logger.error(f"Error in check_wallets task: {str(e)}")
                 
             finally:
                 # Always sleep between checks
-                await asyncio.sleep(CHECK_INTERVAL)
+                await asyncio.sleep(WALLET_CHECK_INTERVAL)
 
     async def check_wallet(self, address: str):
         """Check a single wallet's balance and transactions"""
