@@ -27,7 +27,7 @@ if not BLOCKFROST_API_KEY:
     raise ValueError("No Blockfrost API key found! Make sure BLOCKFROST_API_KEY is set in .env")
 
 # Use direct URL instead of ApiUrls enum to avoid await issues
-BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v1')
+BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0')
 
 # Database Configuration
 DATABASE_NAME = os.getenv('DATABASE_NAME', 'wallets.db')

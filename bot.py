@@ -37,7 +37,7 @@ def dm_only():
 
 def cooldown_5s():
     """5 second cooldown between commands"""
-    return app_commands.cooldown(1, 5.0)
+    return commands.cooldown(1, 5.0)
 
 def has_blockfrost():
     """Ensure Blockfrost API is available"""
@@ -571,43 +571,20 @@ class WalletBud(commands.Bot):
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
         try:
-            if self.blockfrost_client:
-                return
-                
+            # Create Blockfrost client
             self.blockfrost_client = BlockFrostApi(
                 project_id=BLOCKFROST_API_KEY,
                 base_url=BLOCKFROST_BASE_URL
             )
             
-            # Test connection with retry
-            max_retries = 3
-            retry_delay = 2
-            
-            for attempt in range(max_retries):
-                try:
-                    await self.blockfrost_client.health()
-                    logger.info("Connected to Blockfrost API")
-                    
-                    # Start background task only after successful connection
-                    if not self.check_wallets.is_running():
-                        self.bg_task = self.loop.create_task(self.check_wallets())
-                        logger.info("Started wallet monitoring task")
-                    return
-                    
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Blockfrost connection attempt {attempt + 1} failed: {e}")
-                        await asyncio.sleep(retry_delay * (attempt + 1))
-                    else:
-                        raise
+            # Test connection
+            await self.blockfrost_client.health()
+            logger.info("Blockfrost API initialized successfully")
             
         except Exception as e:
             logger.error(f"Blockfrost initialization failed: {e}")
             self.blockfrost_client = None
-            
-            # Don't start background task if initialization fails
-            if hasattr(self, 'bg_task') and self.bg_task.is_running():
-                self.bg_task.cancel()
+            raise
 
 if __name__ == "__main__":
     try:
