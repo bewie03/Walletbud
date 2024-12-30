@@ -89,7 +89,7 @@ class WalletBud(commands.Bot):
     async def check_wallet_transactions(self, wallet_address, discord_id):
         """Check transactions for a single wallet"""
         try:
-            # Check YUMMI balance
+            # First verify wallet is still valid
             has_balance, message = check_yummi_balance(wallet_address)
             if not has_balance:
                 logger.info(f"Deactivating wallet {wallet_address}: {message}")
@@ -107,89 +107,175 @@ class WalletBud(commands.Bot):
                     logger.error(f"Error notifying user {discord_id}: {str(e)}")
                 return
 
-            # Check transactions
+            # Get last checked time
+            last_checked = self.db.get_last_checked(wallet_address)
+            if not last_checked:
+                last_checked = datetime.utcnow() - timedelta(minutes=TRANSACTION_CHECK_INTERVAL)
+
             try:
-                txs = blockfrost_client.address_transactions(
+                # Get transactions since last check
+                # According to docs: /addresses/{address}/transactions
+                transactions = blockfrost_client.address_transactions(
                     wallet_address,
-                    count=MAX_TX_HISTORY
+                    from_block=None,  # Get all recent transactions
+                    gather_pages=True  # Get all pages
                 )
                 
-                for tx in txs:
-                    try:
-                        tx_details = blockfrost_client.transaction(tx.tx_hash)
-                        embed = discord.Embed(
-                            title="🔔 New Transaction",
-                            color=discord.Color.blue()
-                        )
-                        embed.add_field(
-                            name="Transaction Hash",
-                            value=f"[View on Cardanoscan](https://cardanoscan.io/transaction/{tx.tx_hash})",
-                            inline=False
-                        )
+                logger.info(f"Found {len(transactions)} transactions for wallet {wallet_address}")
+                
+                # Process each transaction
+                for tx in transactions:
+                    # Get detailed transaction info
+                    tx_details = blockfrost_client.transaction(tx.tx_hash)
+                    tx_time = datetime.fromtimestamp(tx_details.block_time)
+                    
+                    # Only process transactions after last check
+                    if tx_time <= last_checked:
+                        continue
                         
+                    logger.info(f"Processing transaction {tx.tx_hash} from {tx_time}")
+                    
+                    # Get transaction details including metadata
+                    tx_utxos = blockfrost_client.transaction_utxos(tx.tx_hash)
+                    
+                    # Process inputs and outputs
+                    amount_in = 0
+                    amount_out = 0
+                    assets_in = []
+                    assets_out = []
+                    
+                    # Check inputs
+                    for input in tx_utxos.inputs:
+                        if input.address == wallet_address:
+                            amount_in += int(input.amount[0].quantity)
+                            if len(input.amount) > 1:  # Has tokens
+                                for asset in input.amount[1:]:
+                                    assets_in.append(f"{int(asset.quantity)} {asset.unit}")
+                    
+                    # Check outputs
+                    for output in tx_utxos.outputs:
+                        if output.address == wallet_address:
+                            amount_out += int(output.amount[0].quantity)
+                            if len(output.amount) > 1:  # Has tokens
+                                for asset in output.amount[1:]:
+                                    assets_out.append(f"{int(asset.quantity)} {asset.unit}")
+                    
+                    # Create notification embed
+                    try:
                         user = await self.fetch_user(int(discord_id))
                         if user:
+                            embed = discord.Embed(
+                                title="🔔 New Transaction Detected",
+                                description=f"Transaction: [{tx.tx_hash}](https://cardanoscan.io/transaction/{tx.tx_hash})",
+                                color=discord.Color.blue(),
+                                timestamp=tx_time
+                            )
+                            
+                            # Add ADA amounts
+                            if amount_in > 0:
+                                embed.add_field(
+                                    name="ADA Sent",
+                                    value=f"{amount_in / 1000000:.6f} ADA",
+                                    inline=True
+                                )
+                            if amount_out > 0:
+                                embed.add_field(
+                                    name="ADA Received",
+                                    value=f"{amount_out / 1000000:.6f} ADA",
+                                    inline=True
+                                )
+                                
+                            # Add asset transfers
+                            if assets_in:
+                                embed.add_field(
+                                    name="Assets Sent",
+                                    value="\n".join(assets_in),
+                                    inline=False
+                                )
+                            if assets_out:
+                                embed.add_field(
+                                    name="Assets Received",
+                                    value="\n".join(assets_out),
+                                    inline=False
+                                )
+                                
                             await user.send(embed=embed)
                             
                     except Exception as e:
-                        logger.error(f"Error processing transaction {tx.tx_hash}: {str(e)}")
-                        
-            except Exception as e:
-                logger.error(f"Error checking transactions for {wallet_address}: {str(e)}")
+                        logger.error(f"Error sending transaction notification: {str(e)}")
+                
+                # Update last checked time
+                self.db.update_last_checked(wallet_address)
+                
+            except blockfrost.ApiError as e:
+                logger.error(f"Error fetching transactions: {str(e)}")
+                if e.status_code == 429:  # Rate limit
+                    return  # Skip this check, will try again next interval
                 
         except Exception as e:
-            logger.error(f"Error processing wallet {wallet_address}: {str(e)}")
+            logger.error(f"Error in check_wallet_transactions: {str(e)}")
 
 # Constants
 YUMMI_POLICY_ID = YUMMI_POLICY_ID
 MIN_YUMMI_REQUIRED = REQUIRED_BUD_TOKENS
 
-# Blockfrost setup
-project_id = os.getenv('BLOCKFROST_API_KEY')
-logger.info("Initializing Blockfrost client...")
-
-if not project_id:
-    logger.error("No Blockfrost API key found in environment variables")
-    raise ValueError("BLOCKFROST_API_KEY environment variable is not set")
-
+# Initialize Blockfrost client
 try:
-    # Remove any whitespace from API key
-    project_id = project_id.strip()
-    
-    # Initialize client
+    blockfrost_project_id = os.getenv('BLOCKFROST_API_KEY')
+    if not blockfrost_project_id:
+        logger.error("No Blockfrost API key found! Make sure BLOCKFROST_API_KEY is set in .env")
+        exit(1)
     blockfrost_client = blockfrost.BlockFrostApi(
-        project_id=project_id
+        project_id=blockfrost_project_id
     )
-    
-    # Test the connection
-    info = blockfrost_client.health()
-    logger.info("Blockfrost connection successful")
-        
-except blockfrost.ApiError as e:
-    logger.error(f"Blockfrost API Error: {str(e)}")
-    if e.status_code == 403:
-        logger.error("Invalid Blockfrost API key")
-    elif e.status_code == 429:
-        logger.error("Rate limit exceeded")
-    raise
+    # Test connection with a simple query
+    test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
+    blockfrost_client.address(test_address)
+    logger.info("Successfully connected to Blockfrost API")
 except Exception as e:
-    logger.error(f"Failed to initialize Blockfrost client: {str(e)}")
-    raise
+    logger.error(f"Failed to initialize Blockfrost client: {e}")
+    exit(1)
 
 def check_yummi_balance(wallet_address):
     """Check if wallet has required amount of YUMMI tokens"""
     try:
         logger.info(f"Checking wallet {wallet_address} for YUMMI tokens")
         
-        # Check if we have Blockfrost API key
-        if not project_id:
-            logger.error("No Blockfrost API key found")
-            return False, "Configuration error: No Blockfrost API key"
-
         # First verify the wallet exists
         try:
+            # Get specific address
             wallet = blockfrost_client.address(wallet_address)
             logger.info(f"Wallet verified: {wallet_address}")
+            
+            # Get address details with tokens
+            # According to docs: /addresses/{address}/total
+            wallet_details = blockfrost_client.address_total(wallet_address)
+            logger.info(f"Wallet details: {wallet_details}")
+            
+            # Get specific asset details
+            # According to docs: /addresses/{address}/assets
+            assets = blockfrost_client.address_assets(wallet_address)
+            yummi_amount = 0
+            
+            # Log all assets for debugging
+            for asset in assets:
+                logger.info(f"Found asset: {asset.unit} with quantity {asset.quantity}")
+                
+                # Policy ID should be first 56 characters of the hex
+                asset_policy_id = asset.unit[:56]
+                logger.info(f"Asset policy ID: {asset_policy_id}")
+                logger.info(f"Expected policy ID: {YUMMI_POLICY_ID}")
+                
+                if asset_policy_id == YUMMI_POLICY_ID:
+                    yummi_amount = int(asset.quantity)
+                    logger.info(f"Found {yummi_amount} YUMMI tokens in wallet {wallet_address}")
+                    break
+            
+            if yummi_amount >= REQUIRED_BUD_TOKENS:
+                return True, f"Wallet has {yummi_amount} YUMMI tokens"
+            else:
+                return False, f"Insufficient YUMMI tokens: {yummi_amount}/{REQUIRED_BUD_TOKENS} required"
+                
         except blockfrost.ApiError as e:
             if e.status_code == 400:
                 logger.error(f"Invalid wallet address format: {wallet_address}")
@@ -202,32 +288,11 @@ def check_yummi_balance(wallet_address):
                 return False, "Service temporarily unavailable (rate limit)"
             else:
                 logger.error(f"Blockfrost API error: {str(e)}")
-                return False, "Error verifying wallet"
-
-        # Get all assets in the wallet
-        try:
-            assets = blockfrost_client.address_assets(wallet_address)
-            
-            # Look for YUMMI token
-            for asset in assets:
-                if asset.unit.startswith(YUMMI_POLICY_ID):
-                    yummi_amount = int(asset.quantity)
-                    logger.info(f"Found {yummi_amount} YUMMI tokens")
-                    if yummi_amount >= MIN_YUMMI_REQUIRED:
-                        return True, "Sufficient YUMMI balance"
-                    return False, f"Insufficient YUMMI balance (has {yummi_amount:,}, needs {MIN_YUMMI_REQUIRED:,})"
-            
-            return False, "No YUMMI tokens found in wallet"
-            
-        except blockfrost.ApiError as e:
-            logger.error(f"Error checking assets: {str(e)}")
-            if e.status_code == 429:
-                return False, "Service temporarily unavailable (rate limit)"
-            return False, "Could not check wallet assets"
-            
+                return False, f"API Error: {str(e)}"
+                
     except Exception as e:
         logger.error(f"Error checking YUMMI balance: {str(e)}")
-        return False, "An unexpected error occurred"
+        return False, f"Error checking wallet: {str(e)}"
 
 class WalletModal(discord.ui.Modal, title='Add Wallet'):
     wallet = discord.ui.TextInput(
