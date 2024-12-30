@@ -303,16 +303,17 @@ class WalletBud(commands.Bot):
                         ephemeral=True
                     )
 
-            @self.tree.command(name='help', description='Show bot help and commands')
+            @self.tree.command(name="help", description="Show help information")
             async def help(interaction: discord.Interaction):
                 try:
+                    await self.process_interaction(interaction, ephemeral=True)
+                    
                     embed = discord.Embed(
-                        title="📚 Wallet Bud Help",
-                        description="Monitor your Cardano wallets for YUMMI token transactions",
+                        title="📚 WalletBud Help",
+                        description="Monitor your Cardano wallets for YUMMI tokens and ADA balance",
                         color=discord.Color.blue()
                     )
                     
-                    # Add command descriptions
                     embed.add_field(
                         name="/addwallet <address>",
                         value="Add a wallet to monitor (DM only)",
@@ -329,20 +330,71 @@ class WalletBud(commands.Bot):
                         inline=False
                     )
                     embed.add_field(
+                        name="/balance <address>",
+                        value="Check total ADA balance in a wallet",
+                        inline=False
+                    )
+                    embed.add_field(
                         name="/health",
                         value="Check bot and API status",
                         inline=False
                     )
                     
-                    # Add footer
                     embed.set_footer(text="For support, please contact the bot owner")
                     
-                    await interaction.response.send_message(embed=embed)
+                    await interaction.followup.send(embed=embed)
                     
                 except Exception as e:
                     logger.error(f"Error in help command: {str(e)}")
-                    await interaction.response.send_message(
+                    await interaction.followup.send(
                         "❌ Failed to show help. Please try again later.",
+                        ephemeral=True
+                    )
+
+            @self.tree.command(name="balance", description="Check total ADA balance in a wallet")
+            @has_blockfrost
+            async def balance(interaction: discord.Interaction, address: str):
+                try:
+                    await self.process_interaction(interaction, ephemeral=True)
+                    
+                    # Get total balance using address/total endpoint
+                    balance_info = await self.rate_limited_request(
+                        self.blockfrost_client.address_total,
+                        address=address
+                    )
+                    
+                    if not balance_info or not balance_info.received_sum:
+                        await interaction.followup.send("❌ Could not fetch wallet balance.")
+                        return
+                    
+                    # Find lovelace amount (native ADA)
+                    lovelace_amount = 0
+                    for token in balance_info.received_sum:
+                        if token.unit == "lovelace":
+                            lovelace_amount = int(token.quantity)
+                            break
+                    
+                    # Convert lovelace to ADA (1 ADA = 1,000,000 lovelace)
+                    total_ada = lovelace_amount / 1_000_000
+                    
+                    embed = discord.Embed(
+                        title="💰 Wallet Balance",
+                        description=f"Address: `{address}`",
+                        color=discord.Color.green()
+                    )
+                    
+                    embed.add_field(
+                        name="Total ADA",
+                        value=f"₳ {total_ada:,.2f}",
+                        inline=False
+                    )
+                    
+                    await interaction.followup.send(embed=embed)
+                    
+                except Exception as e:
+                    logger.error(f"Error checking balance for {address}: {str(e)}")
+                    await interaction.followup.send(
+                        "❌ An error occurred while checking the wallet balance.",
                         ephemeral=True
                     )
             
@@ -425,9 +477,10 @@ class WalletBud(commands.Bot):
             # Test connection
             try:
                 logger.info("Testing Blockfrost connection...")
-                # Test using health endpoint which is simpler
+                # Test with base address endpoint
+                test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self.blockfrost_client.health)
+                await loop.run_in_executor(None, self.blockfrost_client.address, test_address)
                 
                 logger.info("Blockfrost connection test passed")
                 return True
@@ -520,34 +573,20 @@ class WalletBud(commands.Bot):
             tuple[bool, int]: (has_enough_tokens, current_balance)
         """
         try:
-            # Get assets with retries
+            # Get YUMMI token UTXOs directly using the asset endpoint
             assets = await self.rate_limited_request(
-                self.blockfrost_client.address_utxos,  # Fixed method name
-                address=address
+                self.blockfrost_client.address_utxos_asset,  # Use specific asset endpoint
+                address=address,
+                asset=f"{YUMMI_POLICY_ID}"  # Query only YUMMI token UTXOs
             )
             
             if not assets:
-                logger.info(f"No assets found for {address}")
+                logger.info(f"No YUMMI tokens found for {address}")
                 return False, 0
                 
-            # Debug log all assets
-            logger.info(f"Found {len(assets)} assets for {address}:")
-            for asset in assets:
-                logger.info(f"Asset: policy_id={asset.policy_id}, quantity={asset.quantity}")
-            
-            # Find YUMMI token
-            yummi_balance = 0
-            for asset in assets:
-                try:
-                    # Check policy ID match
-                    if asset.policy_id == YUMMI_POLICY_ID:
-                        # Convert quantity to integer
-                        yummi_balance = int(asset.quantity)
-                        logger.info(f"Found YUMMI balance for {address}: {yummi_balance:,} tokens")
-                        break
-                except (ValueError, TypeError, AttributeError) as e:
-                    logger.error(f"Error parsing asset {asset}: {str(e)}")
-                    continue
+            # Sum up all YUMMI token quantities
+            yummi_balance = sum(int(asset.amount) for asset in assets)
+            logger.info(f"Found YUMMI balance for {address}: {yummi_balance:,} tokens")
             
             has_enough = yummi_balance >= REQUIRED_YUMMI_TOKENS
             if not has_enough:
