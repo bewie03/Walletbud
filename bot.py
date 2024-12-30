@@ -150,58 +150,62 @@ class WalletBud(commands.Bot):
         self.blockfrost_client = None
         self.processing_wallets = False
         self.monitoring_paused = False
-        self._command_tree_synced = False
         
-        # Remove default help command
-        self.remove_command('help')
+        # Initialize database on startup
+        init_db()
 
     async def setup_hook(self):
         """Initialize the bot's command tree and sync commands"""
         try:
-            # Initialize database
-            if not init_db():
-                raise RuntimeError("Failed to initialize database")
-
             # Initialize Blockfrost API (non-blocking)
             try:
                 await self.init_blockfrost()
             except Exception as e:
-                logger.error(f"Blockfrost initialization failed: {e}")
+                logger.warning(f"Failed to initialize Blockfrost: {e}")
                 logger.warning("Bot will start without Blockfrost...")
             
             # Register commands
+            self.tree = app_commands.CommandTree(self)
             self.register_commands()
             
-            # Only sync commands once and globally
-            if not self._command_tree_synced:
-                try:
-                    logger.info("Syncing commands...")
-                    await self.tree.sync()
-                    self._command_tree_synced = True
-                    logger.info("Commands synced successfully")
-                except Exception as e:
-                    logger.error(f"Failed to sync commands: {e}")
+            # Don't sync commands here - we'll do it in on_ready
+            logger.info("Setup complete")
             
         except Exception as e:
             logger.error(f"Setup failed: {e}")
             raise
 
+    async def on_ready(self):
+        """Called when the bot is ready"""
+        logger.info(f'Logged in as {self.user.name} ({self.user.id})')
+        
+        # Sync commands globally since this is a DM-only bot
+        try:
+            await self.tree.sync()
+            logger.info("Commands synced globally")
+        except Exception as e:
+            logger.error(f"Failed to sync commands: {e}")
+        
+        # Start background tasks
+        if not self.check_wallets.is_running():
+            self.check_wallets.start()
+
     def register_commands(self):
         """Register all commands with the command tree"""
         
-        @app_commands.command(name="addwallet", description="Add a Cardano wallet for tracking")
+        @self.tree.command(name="addwallet", description="Add a Cardano wallet for tracking")
         @dm_only()
         @has_blockfrost()
         @not_monitoring_paused()
         @cooldown_10s()
-        async def add_wallet_command(self, interaction: discord.Interaction):
+        async def add_wallet_command(interaction: discord.Interaction):
             modal = WalletModal(self)
             await interaction.response.send_modal(modal)
 
-        @app_commands.command(name="removewallet", description="Remove a wallet from monitoring")
+        @self.tree.command(name="removewallet", description="Remove a wallet from monitoring")
         @dm_only()
         @cooldown_5s()
-        async def remove_wallet(self, interaction: discord.Interaction, wallet_address: str):
+        async def remove_wallet(interaction: discord.Interaction, wallet_address: str):
             with sqlite3.connect(DATABASE_NAME) as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT discord_id FROM wallets WHERE address = ?', (wallet_address,))
@@ -235,10 +239,10 @@ class WalletBud(commands.Bot):
                 )
                 await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        @app_commands.command(name="listwallets", description="List all monitored wallets")
+        @self.tree.command(name="listwallets", description="List all monitored wallets")
         @dm_only()
         @cooldown_5s()
-        async def list_wallets(self, interaction: discord.Interaction):
+        async def list_wallets(interaction: discord.Interaction):
             with sqlite3.connect(DATABASE_NAME) as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT address, is_active FROM wallets WHERE discord_id = ?', (str(interaction.user.id),))
@@ -266,9 +270,9 @@ class WalletBud(commands.Bot):
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        @app_commands.command(name="help", description="Show available commands")
+        @self.tree.command(name="help", description="Show available commands")
         @cooldown_5s()
-        async def help_command(self, interaction: discord.Interaction):
+        async def help_command(interaction: discord.Interaction):
             embed = discord.Embed(
                 title="WalletBud Commands",
                 description="Here are all available commands:",
@@ -298,9 +302,9 @@ class WalletBud(commands.Bot):
         
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        @app_commands.command(name="health", description="Check bot health status")
+        @self.tree.command(name="health", description="Check bot health status")
         @cooldown_5s()
-        async def health_check(self, interaction: discord.Interaction):
+        async def health_check(interaction: discord.Interaction):
             embed = discord.Embed(
                 title="Bot Health Status",
                 color=discord.Color.blue()
@@ -338,145 +342,106 @@ class WalletBud(commands.Bot):
         
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    async def on_ready(self):
-        """Called when the bot is ready"""
-        logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
-        logger.info('------')
-        
-        # Set bot status
-        await self.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name="Cardano wallets | /help"
-            )
-        )
-
-    async def on_command_error(self, ctx, error):
-        """Global error handler for commands"""
-        try:
-            if isinstance(error, commands.NoPrivateMessage):
-                await ctx.send(ERROR_MESSAGES['dm_only'])
-            elif isinstance(error, commands.MissingPermissions):
-                await ctx.send("You don't have permission to use this command.")
-            elif isinstance(error, commands.CommandOnCooldown):
-                await ctx.send(f"Please wait {error.retry_after:.1f}s before using this command again.")
-            else:
-                logger.error(f"Command error: {error}")
-                await ctx.send("An error occurred. Please try again later.")
-        except Exception as e:
-            logger.error(f"Error in error handler: {e}")
-
-    async def on_error(self, event, *args, **kwargs):
+    async def on_error(self, event_method: str, *args, **kwargs):
         """Global error handler for events"""
-        try:
-            logger.error(f"Event error in {event}: {args} {kwargs}")
-        except Exception as e:
-            logger.error(f"Error in error handler: {e}")
+        logger.error(f'Error in {event_method}:', exc_info=True)
 
+    @tasks.loop(minutes=WALLET_CHECK_INTERVAL)
     async def check_wallets(self):
         """Check all active wallets for new transactions"""
-        while True:
-            if not self.is_ready() or not self.blockfrost_client:
-                await asyncio.sleep(WALLET_CHECK_DELAY)
-                continue
+        if self.monitoring_paused:
+            logger.info("Wallet monitoring is paused")
+            return
 
-            if self.monitoring_paused:
-                logger.info("Monitoring is paused")
-                await asyncio.sleep(WALLET_CHECK_DELAY)
-                continue
+        if self.processing_wallets:
+            logger.info("Already processing wallets, skipping this iteration")
+            return
 
-            if self.processing_wallets:
-                logger.info("Already processing wallets")
-                await asyncio.sleep(WALLET_CHECK_DELAY)
-                continue
+        try:
+            self.processing_wallets = True
+            logger.info("Starting wallet check cycle...")
+            
+            # Get all active wallets in one connection
+            with sqlite3.connect(DATABASE_NAME) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT w.address, w.discord_id, w.last_yummi_check 
+                    FROM wallets w 
+                    WHERE w.is_active = TRUE
+                    ORDER BY w.last_yummi_check ASC
+                ''')
+                wallets = cursor.fetchall()
 
-            try:
-                self.processing_wallets = True
-                logger.info("Starting wallet check cycle")
-                
-                # Get all active wallets in one connection
-                with sqlite3.connect(DATABASE_NAME) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        SELECT w.address, w.discord_id, w.last_yummi_check 
-                        FROM wallets w 
-                        WHERE w.is_active = TRUE
-                        ORDER BY w.last_yummi_check ASC
-                    ''')
-                    wallets = cursor.fetchall()
+            if not wallets:
+                logger.info("No active wallets to check")
+                return
 
-                if not wallets:
-                    logger.info("No active wallets to check")
-                    await asyncio.sleep(WALLET_CHECK_DELAY)
-                    continue
-
-                logger.info(f"Checking {len(wallets)} wallets")
-                
-                for wallet_address, discord_id, last_yummi_check in wallets:
-                    try:
-                        # Rate limit between wallet checks
-                        await asyncio.sleep(1)  # 1 second between wallets to avoid rate limits
-                        
-                        # Check YUMMI balance if needed
-                        if not last_yummi_check or \
-                           datetime.utcnow() - datetime.fromisoformat(last_yummi_check) > timedelta(hours=YUMMI_CHECK_INTERVAL):
-                            
-                            logger.info(f"Checking YUMMI balance for wallet {wallet_address}")
-                            has_tokens, message = await self.check_yummi_balance(wallet_address)
-                            
-                            # Update in a single transaction
-                            with sqlite3.connect(DATABASE_NAME) as conn:
-                                cursor = conn.cursor()
-                                cursor.execute('BEGIN TRANSACTION')
-                                try:
-                                    # Update last check time
-                                    cursor.execute(
-                                        'UPDATE wallets SET last_yummi_check = ? WHERE address = ? AND discord_id = ?',
-                                        (datetime.utcnow().isoformat(), wallet_address, discord_id)
-                                    )
-                                    
-                                    # Deactivate if needed
-                                    if not has_tokens:
-                                        cursor.execute(
-                                            'UPDATE wallets SET is_active = FALSE WHERE address = ? AND discord_id = ?',
-                                            (wallet_address, discord_id)
-                                        )
-                                        conn.commit()
-                                        
-                                        # Notify user about deactivation
-                                        try:
-                                            user = await self.fetch_user(int(discord_id))
-                                            if user:
-                                                embed = discord.Embed(
-                                                    title="❌ Wallet Deactivated",
-                                                    description=f"Wallet `{wallet_address}` has been deactivated: {message}",
-                                                    color=discord.Color.red()
-                                                )
-                                                await user.send(embed=embed)
-                                        except Exception as e:
-                                            logger.error(f"Error notifying user {discord_id} about deactivation: {e}")
-                                        continue
-                                    
-                                    conn.commit()
-                                except Exception as e:
-                                    conn.rollback()
-                                    logger.error(f"Error updating wallet status: {e}")
-                                    continue
-
-                        # Check transactions if wallet is still active
-                        await self.check_wallet_transactions(wallet_address, discord_id)
-                        
-                    except Exception as e:
-                        logger.error(f"Error processing wallet {wallet_address}: {e}")
+            logger.info(f"Checking {len(wallets)} wallets")
+            
+            for wallet_address, discord_id, last_yummi_check in wallets:
+                try:
+                    # Rate limit between wallet checks
+                    await asyncio.sleep(1)  # 1 second between wallets to avoid rate limits
                     
-                    # Rate limit between wallets
-                    await asyncio.sleep(1)
+                    # Check YUMMI balance if needed
+                    if not last_yummi_check or \
+                       datetime.utcnow() - datetime.fromisoformat(last_yummi_check) > timedelta(hours=YUMMI_CHECK_INTERVAL):
+                        
+                        logger.info(f"Checking YUMMI balance for wallet {wallet_address}")
+                        has_tokens, message = await self.check_yummi_balance(wallet_address)
+                        
+                        # Update in a single transaction
+                        with sqlite3.connect(DATABASE_NAME) as conn:
+                            cursor = conn.cursor()
+                            cursor.execute('BEGIN TRANSACTION')
+                            try:
+                                # Update last check time
+                                cursor.execute(
+                                    'UPDATE wallets SET last_yummi_check = ? WHERE address = ? AND discord_id = ?',
+                                    (datetime.utcnow().isoformat(), wallet_address, discord_id)
+                                )
+                                
+                                # Deactivate if needed
+                                if not has_tokens:
+                                    cursor.execute(
+                                        'UPDATE wallets SET is_active = FALSE WHERE address = ? AND discord_id = ?',
+                                        (wallet_address, discord_id)
+                                    )
+                                    conn.commit()
+                                    
+                                    # Notify user about deactivation
+                                    try:
+                                        user = await self.fetch_user(int(discord_id))
+                                        if user:
+                                            embed = discord.Embed(
+                                                title="❌ Wallet Deactivated",
+                                                description=f"Wallet `{wallet_address}` has been deactivated: {message}",
+                                                color=discord.Color.red()
+                                            )
+                                            await user.send(embed=embed)
+                                    except Exception as e:
+                                        logger.error(f"Error notifying user {discord_id} about deactivation: {e}")
+                                    continue
+                                    
+                                conn.commit()
+                            except Exception as e:
+                                conn.rollback()
+                                logger.error(f"Error updating wallet status: {e}")
+                                continue
 
-            except Exception as e:
-                logger.error(f"Error in wallet check task: {e}")
-            finally:
-                self.processing_wallets = False
-                await asyncio.sleep(WALLET_CHECK_DELAY)
+                    # Check transactions if wallet is still active
+                    await self.check_wallet_transactions(wallet_address, discord_id)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing wallet {wallet_address}: {e}")
+                    
+                # Rate limit between wallets
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Error in wallet check task: {e}")
+        finally:
+            self.processing_wallets = False
 
     async def check_wallet_transactions(self, wallet_address, discord_id):
         """Check transactions for a wallet"""
