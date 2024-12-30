@@ -419,10 +419,7 @@ class WalletBud(commands.Bot):
                 callback=self.status_slash
             ))
             
-            # Sync commands with Discord
-            await self.tree.sync()
-            
-            logger.info("Commands registered and synced successfully")
+            logger.info("Commands registered successfully")
             
         except Exception as e:
             logger.error(f"Failed to register commands: {str(e)}")
@@ -713,12 +710,10 @@ class WalletBud(commands.Bot):
         try:
             logger.info("Initializing Blockfrost API client...")
             if not BLOCKFROST_API_KEY:
-                logger.error("BLOCKFROST_API_KEY not found in environment")
                 raise ValueError("BLOCKFROST_API_KEY not found in environment")
-            
-            # Log API key prefix for debugging (safely)
-            api_key_prefix = BLOCKFROST_API_KEY[:8] if len(BLOCKFROST_API_KEY) > 8 else "***"
-            logger.debug(f"Using API key prefix: {api_key_prefix}...")
+                
+            # Log the first few characters of the API key for debugging
+            logger.debug(f"Using API key: {BLOCKFROST_API_KEY[:8]}...")
             
             # Determine network from API key
             network = "mainnet"
@@ -731,188 +726,52 @@ class WalletBud(commands.Bot):
             # Initialize client
             try:
                 self.blockfrost_client = BlockFrostApi(
-                    project_id=BLOCKFROST_API_KEY
+                    project_id=BLOCKFROST_API_KEY,
+                    base_url=f"https://cardano-{network}.blockfrost.io/api/v0"
                 )
                 logger.debug("BlockFrostApi instance created")
             except Exception as e:
                 logger.error(f"Failed to create BlockFrostApi instance: {str(e)}")
-                raise ValueError(f"Failed to initialize Blockfrost client: {str(e)}")
+                raise ValueError("Failed to initialize Blockfrost client")
             
-            # Test the connection with retries
-            max_retries = 3
-            retry_delay = 1  # seconds
-            
-            for attempt in range(max_retries):
-                try:
-                    logger.debug(f"Testing Blockfrost connection (attempt {attempt + 1}/{max_retries})...")
-                    health = await self.rate_limited_request(
-                        self.blockfrost_client.health
+            # Test the connection
+            try:
+                logger.debug("Testing Blockfrost connection...")
+                health = await self.rate_limited_request(
+                    self.blockfrost_client.health
+                )
+                logger.debug(f"Health check response: {health}")
+                
+                # Also test a simple API call
+                logger.debug("Testing API call...")
+                network = await self.rate_limited_request(
+                    self.blockfrost_client.network
+                )
+                logger.debug(f"Network info: {network}")
+                
+                logger.info("Successfully connected to Blockfrost API")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to connect to Blockfrost API: {str(e)}")
+                if "Invalid project token" in str(e):
+                    raise ValueError(
+                        "Invalid Blockfrost API key. Please check your BLOCKFROST_API_KEY in .env"
                     )
-                    logger.debug(f"Health check response: {health}")
-                    
-                    # Test network info
-                    network_info = await self.rate_limited_request(
-                        self.blockfrost_client.network
+                elif "Forbidden" in str(e):
+                    raise ValueError(
+                        "Access denied by Blockfrost. Your API key might be expired or invalid"
                     )
-                    logger.debug(f"Network info: {network_info}")
-                    
-                    logger.info("Successfully connected to Blockfrost API")
-                    return True
-                    
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Connection attempt {attempt + 1} failed: {str(e)}")
-                        await asyncio.sleep(retry_delay)
-                        continue
-                    
-                    logger.error(f"All connection attempts failed. Last error: {str(e)}")
-                    if "Invalid project token" in str(e):
-                        raise ValueError(
-                            "Invalid Blockfrost API key. Please check your BLOCKFROST_API_KEY in .env"
-                        )
-                    elif "Forbidden" in str(e):
-                        raise ValueError(
-                            "Access denied by Blockfrost. Your API key might be expired or invalid"
-                        )
-                    elif "404" in str(e):
-                        raise ValueError(
-                            "API endpoint not found. Make sure you're using the correct network (mainnet/testnet)"
-                        )
-                    raise
-            
+                elif "404" in str(e):
+                    raise ValueError(
+                        "API endpoint not found. Make sure you're using the correct network (mainnet/testnet)"
+                    )
+                raise
+                
         except Exception as e:
             logger.error(f"Failed to initialize Blockfrost API: {str(e)}")
             self.blockfrost_client = None
             return False
-
-    async def add_wallet_slash(self, interaction: discord.Interaction):
-        """Slash command handler for adding a wallet"""
-        try:
-            # Defer the response since we'll need more than 3 seconds
-            await interaction.response.defer(ephemeral=True)
-            
-            # Create and send the modal
-            modal = WalletModal(self)
-            await interaction.followup.send_modal(modal)
-            
-        except Exception as e:
-            logger.error(f"Error in add_wallet_slash: {str(e)}")
-            await interaction.followup.send(
-                "An error occurred while processing your request. Please try again.",
-                ephemeral=True
-            )
-
-    async def remove_wallet_slash(self, interaction: discord.Interaction):
-        """Slash command handler for removing a wallet"""
-        try:
-            # Defer the response since we'll need more than 3 seconds
-            await interaction.response.defer(ephemeral=True)
-            
-            # Get user's wallets from database
-            user_id = str(interaction.user.id)
-            self.cursor.execute(
-                "SELECT wallet_address FROM wallets WHERE discord_id = ?",
-                (user_id,)
-            )
-            wallets = self.cursor.fetchall()
-            
-            if not wallets:
-                await interaction.followup.send(
-                    "You don't have any wallets registered.",
-                    ephemeral=True
-                )
-                return
-                
-            # Create a select menu with the wallets
-            select = discord.ui.Select(
-                placeholder="Choose a wallet to remove",
-                options=[
-                    discord.SelectOption(
-                        label=f"Wallet {i+1}",
-                        description=wallet[0][:20] + "..." if len(wallet[0]) > 20 else wallet[0],
-                        value=wallet[0]
-                    )
-                    for i, wallet in enumerate(wallets)
-                ]
-            )
-            
-            async def select_callback(interaction: discord.Interaction):
-                wallet_address = select.values[0]
-                try:
-                    self.cursor.execute(
-                        "DELETE FROM wallets WHERE discord_id = ? AND wallet_address = ?",
-                        (user_id, wallet_address)
-                    )
-                    self.conn.commit()
-                    await interaction.response.send_message(
-                        f"Wallet {wallet_address} has been removed from monitoring.",
-                        ephemeral=True
-                    )
-                except Exception as e:
-                    logger.error(f"Error removing wallet: {str(e)}")
-                    await interaction.response.send_message(
-                        "An error occurred while removing the wallet. Please try again.",
-                        ephemeral=True
-                    )
-            
-            select.callback = select_callback
-            view = discord.ui.View()
-            view.add_item(select)
-            
-            await interaction.followup.send(
-                "Select a wallet to remove:",
-                view=view,
-                ephemeral=True
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in remove_wallet_slash: {str(e)}")
-            await interaction.followup.send(
-                "An error occurred while processing your request. Please try again.",
-                ephemeral=True
-            )
-
-    async def status_slash(self, interaction: discord.Interaction):
-        """Slash command handler for checking bot status"""
-        try:
-            await interaction.response.defer(ephemeral=True)
-            
-            # Check Blockfrost status
-            blockfrost_status = "✅ Connected" if self.blockfrost_client else "❌ Not connected"
-            
-            # Get monitored wallet count
-            self.cursor.execute("SELECT COUNT(*) FROM wallets")
-            wallet_count = self.cursor.fetchone()[0]
-            
-            # Create status embed
-            embed = discord.Embed(
-                title="Bot Status",
-                color=discord.Color.blue()
-            )
-            embed.add_field(
-                name="Blockfrost API",
-                value=blockfrost_status,
-                inline=False
-            )
-            embed.add_field(
-                name="Monitoring Status",
-                value="✅ Active" if not self.monitoring_paused else "⏸️ Paused",
-                inline=False
-            )
-            embed.add_field(
-                name="Monitored Wallets",
-                value=str(wallet_count),
-                inline=False
-            )
-            
-            await interaction.followup.send(embed=embed, ephemeral=True)
-            
-        except Exception as e:
-            logger.error(f"Error in status_slash: {str(e)}")
-            await interaction.followup.send(
-                "An error occurred while checking status. Please try again.",
-                ephemeral=True
-            )
 
 if __name__ == "__main__":
     try:
