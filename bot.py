@@ -3,6 +3,7 @@ import logging
 import sqlite3
 import asyncio
 from datetime import datetime, timedelta
+from functools import wraps
 
 import discord
 from discord import app_commands
@@ -23,6 +24,37 @@ ERROR_MESSAGES = {
     'api_unavailable': "Wallet monitoring is currently unavailable. Please try again later.",
     'monitoring_paused': "Wallet monitoring is currently paused."
 }
+
+def dm_only():
+    """Decorator to ensure command is only used in DMs"""
+    async def predicate(interaction: discord.Interaction):
+        if not isinstance(interaction.channel, discord.DMChannel):
+            await interaction.response.send_message(ERROR_MESSAGES['dm_only'], ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
+
+def cooldown_5s():
+    """5 second cooldown between commands"""
+    return app_commands.cooldown(1, 5.0)
+
+def has_blockfrost():
+    """Ensure Blockfrost API is available"""
+    async def predicate(interaction: discord.Interaction):
+        if not interaction.client.blockfrost_client:
+            await interaction.response.send_message(ERROR_MESSAGES['api_unavailable'], ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
+
+def not_monitoring_paused():
+    """Ensure wallet monitoring is not paused"""
+    async def predicate(interaction: discord.Interaction):
+        if interaction.client.monitoring_paused:
+            await interaction.response.send_message(ERROR_MESSAGES['monitoring_paused'], ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
 
 def init_db():
     """Initialize SQLite database"""
@@ -197,7 +229,7 @@ class WalletBud(commands.Bot):
         @dm_only()
         @has_blockfrost()
         @not_monitoring_paused()
-        @cooldown_10s()
+        @cooldown_5s()
         async def add_wallet_command(interaction: discord.Interaction):
             modal = WalletModal(self)
             await interaction.response.send_modal(modal)

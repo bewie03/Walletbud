@@ -50,9 +50,15 @@ TRANSACTION_CHECK_INTERVAL = validate_positive_int(
     'TRANSACTION_CHECK_INTERVAL'
 )
 
+WALLET_CHECK_INTERVAL = validate_positive_int(
+    os.getenv('WALLET_CHECK_INTERVAL', '5'),
+    5,
+    'WALLET_CHECK_INTERVAL'
+)
+
 YUMMI_CHECK_INTERVAL = validate_positive_int(
-    os.getenv('YUMMI_CHECK_INTERVAL', '6'),
-    6,
+    os.getenv('YUMMI_CHECK_INTERVAL', '24'),
+    24,
     'YUMMI_CHECK_INTERVAL'
 )
 
