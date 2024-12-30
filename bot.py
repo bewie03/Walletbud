@@ -130,42 +130,28 @@ class WalletBud(commands.Bot):
         self.processing_wallets = False
 
     async def setup_hook(self):
-        """Called when the bot starts up"""
+        """Setup hook called before the bot starts"""
         try:
-            logger.info("Initializing bot...")
-            
             # Initialize database
-            logger.info("Initializing database...")
-            try:
-                await init_db()
-                logger.info("Database initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize database: {str(e)}")
-                raise
+            await init_db()
+            logger.info("Database initialized")
             
             # Initialize Blockfrost client
-            logger.info("Initializing Blockfrost client...")
-            try:
-                if not await self.init_blockfrost():
-                    raise Exception("Failed to initialize Blockfrost client")
-                logger.info("Blockfrost client initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize Blockfrost client: {str(e)}")
-                raise
+            await self.init_blockfrost()
+            logger.info("Blockfrost client initialized")
             
             # Setup commands
-            logger.info("Setting up commands...")
-            try:
-                await self.setup_commands()
-                logger.info("Commands set up successfully")
-            except Exception as e:
-                logger.error(f"Failed to set up commands: {str(e)}")
-                raise
+            await self.setup_commands()
+            logger.info("Commands setup complete")
+            
+            # Start wallet monitoring task
+            self.bg_task = self.loop.create_task(self.check_wallets())
+            logger.info("Started wallet monitoring task")
             
             logger.info("Bot initialization complete!")
             
         except Exception as e:
-            logger.error(f"Error in setup_hook: {str(e)}")
+            logger.error(f"Error in setup: {str(e)}")
             raise
 
     async def setup_commands(self):
@@ -551,7 +537,7 @@ class WalletBud(commands.Bot):
                 # If both, combine them
                 return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
         finally:
-            self.rate_limiter.release()
+            await self.rate_limiter.release()
 
     async def check_wallets(self):
         """Background task to check all wallets periodically"""
@@ -628,19 +614,17 @@ class WalletBud(commands.Bot):
             tuple[bool, int]: (has_enough_tokens, current_balance)
         """
         try:
-            # Get YUMMI token UTXOs directly using the asset endpoint
+            # Get all assets for the address
             assets = await self.rate_limited_request(
-                self.blockfrost_client.address_utxos_asset,
-                address,
-                asset=f"{YUMMI_POLICY_ID}"
+                self.blockfrost_client.address_assets,
+                address
             )
             
-            # Calculate total YUMMI tokens
+            # Find YUMMI token balance
             total_tokens = 0
-            for utxo in assets:
-                for amount in utxo.amount:
-                    if amount.unit == f"{YUMMI_POLICY_ID}":
-                        total_tokens += int(amount.quantity)
+            for asset in assets:
+                if asset.unit.startswith(YUMMI_POLICY_ID):
+                    total_tokens += int(asset.quantity)
             
             logger.info(f"Found {total_tokens} YUMMI tokens for address {address}")
             return total_tokens >= REQUIRED_YUMMI_TOKENS, total_tokens
@@ -706,6 +690,10 @@ class WalletBud(commands.Bot):
 if __name__ == "__main__":
     try:
         logger.info("Starting WalletBud bot...")
+        
+        # Constants
+        REQUIRED_YUMMI_TOKENS = 25000
+        WALLET_CHECK_INTERVAL = 60  # seconds
         
         # Create bot instance
         bot = WalletBud()
