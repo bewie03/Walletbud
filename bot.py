@@ -77,7 +77,10 @@ class WalletBud(commands.Bot):
         # Initialize database
         if not init_db():
             raise RuntimeError("Failed to initialize database")
-            
+
+        # Setup the check_wallets task
+        self.check_wallets = tasks.loop(minutes=self.transaction_check_interval)(self.check_wallets)
+
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
         try:
@@ -331,8 +334,6 @@ class WalletBud(commands.Bot):
 
         finally:
             self.processing_wallets = False
-
-    check_wallets = tasks.loop(minutes=self.transaction_check_interval)(check_wallets)
 
     @check_wallets.before_loop
     async def before_check_wallets(self):
