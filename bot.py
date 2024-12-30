@@ -9,6 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from blockfrost import BlockFrostApi
+import aiohttp
 
 from config import *
 
@@ -401,10 +402,10 @@ class WalletBud(commands.Bot):
         """Check transactions for a wallet"""
         try:
             # Get wallet transactions (latest first)
-            transactions = await self.blockfrost_client.address_transactions(
-                address=wallet_address,
-                count=10,
-                order='desc'  # API default is 'asc', we want newest first
+            url = f"addresses/{wallet_address}/transactions"
+            transactions = await self.blockfrost_client.client.get(
+                url,
+                params={"order": "desc", "count": 10}
             )
             
             if not transactions:
@@ -423,7 +424,7 @@ class WalletBud(commands.Bot):
             # Process new transactions
             new_txs = []
             for tx in transactions:
-                if not last_tx or tx.tx_hash != last_tx:
+                if not last_tx or tx.hash != last_tx:
                     new_txs.append(tx)
                 else:
                     break
@@ -432,7 +433,9 @@ class WalletBud(commands.Bot):
             for tx in reversed(new_txs):
                 try:
                     # Get transaction details
-                    tx_details = await self.blockfrost_client.transaction_utxos(tx.hash)
+                    tx_details = await self.blockfrost_client.client.get(
+                        f"txs/{tx.hash}/utxos"
+                    )
                     
                     # Calculate total ADA and assets received
                     received_ada = 0
@@ -494,8 +497,8 @@ class WalletBud(commands.Bot):
         """Check YUMMI token balance"""
         try:
             # Get wallet's specific asset balance
-            address_info = await self.blockfrost_client.address_total(
-                address=wallet_address
+            address_info = await self.blockfrost_client.client.get(
+                f"addresses/{wallet_address}/total"
             )
             
             if not address_info or not hasattr(address_info, 'received_sum'):
@@ -527,37 +530,47 @@ class WalletBud(commands.Bot):
         
         for attempt in range(max_retries):
             try:
-                # Create Blockfrost client
-                self.blockfrost_client = BlockFrostApi(
-                    project_id=BLOCKFROST_API_KEY,
-                    base_url=BLOCKFROST_BASE_URL
-                )
+                # Create Blockfrost client with correct base URL
+                base_url = "https://cardano-mainnet.blockfrost.io/api/v0"
+                headers = {
+                    "Authorization": f"Bearer {BLOCKFROST_API_KEY}",
+                    "Content-Type": "application/json"
+                }
+                
+                # Create aiohttp session with default headers
+                session = aiohttp.ClientSession(headers=headers)
                 
                 # Test connection with health check endpoint
                 try:
-                    health = await self.blockfrost_client.health()
-                    logger.info(f"Blockfrost health response: {health}")
-                    if hasattr(health, 'is_healthy') and health.is_healthy:
-                        logger.info("Blockfrost API initialized successfully")
-                        return
-                    else:
-                        logger.warning(f"Unexpected health response format: {health}")
-                        raise Exception("Blockfrost API health check returned unexpected format")
+                    url = f"{base_url}/health"
+                    logger.info(f"Making health check request to: {url}")
+                    
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            health_data = await response.json()
+                            logger.info(f"Blockfrost health response: {health_data}")
+                            if health_data.get('is_healthy', False):
+                                # Initialize BlockFrostApi with working session
+                                self.blockfrost_client = BlockFrostApi(
+                                    project_id=BLOCKFROST_API_KEY,
+                                    base_url=base_url,
+                                    session=session
+                                )
+                                logger.info("Blockfrost API initialized successfully")
+                                return
+                        else:
+                            error_data = await response.text()
+                            logger.error(f"Health check failed with status {response.status}: {error_data}")
+                            raise Exception(f"Health check failed: {error_data}")
                 except Exception as health_error:
                     logger.error(f"Health check error details: {str(health_error)}")
+                    if session and not session.closed:
+                        await session.close()
                     raise
                 
             except Exception as e:
                 logger.warning(f"Blockfrost initialization attempt {attempt + 1} failed: {str(e)}")
                 self.blockfrost_client = None
-                
-                # Try to get more error details
-                if hasattr(e, 'response'):
-                    try:
-                        error_details = await e.response.text()
-                        logger.error(f"Error response details: {error_details}")
-                    except:
-                        pass
                 
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay * (attempt + 1))
