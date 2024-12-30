@@ -241,17 +241,23 @@ def check_yummi_balance(wallet_address):
         logger.info(f"Checking wallet {wallet_address} for YUMMI tokens")
         
         try:
-            # Get wallet assets using /addresses/{address}/assets endpoint
-            assets = blockfrost_client.address_assets(wallet_address)
-            logger.info(f"Retrieved assets for wallet: {wallet_address}")
+            # Get wallet assets using /addresses/{address}/total endpoint
+            address_info = blockfrost_client.address(wallet_address)
+            logger.info(f"Retrieved address info for wallet: {wallet_address}")
+            
+            # Get specific asset details using /addresses/{address}/utxos
+            utxos = blockfrost_client.address_utxos(wallet_address)
+            logger.info(f"Retrieved UTXOs for wallet: {wallet_address}")
             
             yummi_amount = 0
-            for asset in assets:
-                # Policy ID is the first 56 characters of the asset unit
-                if asset.unit.startswith(YUMMI_POLICY_ID):
-                    yummi_amount = int(asset.quantity)
-                    logger.info(f"Found {yummi_amount} YUMMI tokens in wallet {wallet_address}")
-                    break
+            for utxo in utxos:
+                for amount in utxo.amount:
+                    # Policy ID is the first 56 characters of the asset unit
+                    if hasattr(amount, 'unit') and amount.unit.startswith(YUMMI_POLICY_ID):
+                        yummi_amount += int(amount.quantity)
+                        logger.info(f"Found {amount.quantity} YUMMI tokens in UTXO")
+            
+            logger.info(f"Total YUMMI tokens found: {yummi_amount}")
             
             if yummi_amount >= REQUIRED_BUD_TOKENS:
                 return True, f"Wallet has {yummi_amount} YUMMI tokens"
