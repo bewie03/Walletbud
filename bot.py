@@ -249,7 +249,6 @@ class WalletBud(commands.Bot):
             logger.error(f"Error removing wallet: {e}")
             return False
 
-    @tasks.loop(minutes=TRANSACTION_CHECK_INTERVAL)
     async def check_wallets(self):
         """Check all active wallets for new transactions"""
         if self.processing_wallets:
@@ -318,6 +317,14 @@ class WalletBud(commands.Bot):
 
         finally:
             self.processing_wallets = False
+
+    check_wallets = tasks.loop(minutes=TRANSACTION_CHECK_INTERVAL)(check_wallets)
+
+    @check_wallets.before_loop
+    async def before_check_wallets(self):
+        """Wait until the bot is ready before starting the task"""
+        await self.wait_until_ready()
+        logger.info("Bot is ready, wallet check task can start")
 
     async def check_wallet_transactions(self, wallet_address, discord_id):
         """Check transactions for a single wallet"""
@@ -436,12 +443,6 @@ class WalletBud(commands.Bot):
 
         except Exception as e:
             logger.error(f"Error in check_wallet_transactions: {str(e)}")
-
-    @check_wallets.before_loop
-    async def before_check_wallets(self):
-        """Wait until the bot is ready before starting the task"""
-        await self.wait_until_ready()
-        logger.info("Bot is ready, wallet check task can start")
 
     @app_commands.command(name="addwallet", description="Add a Cardano wallet for tracking (requires 20,000 YUMMI tokens)")
     async def add_wallet(self, interaction: discord.Interaction, wallet_address: str):
@@ -679,12 +680,6 @@ class WalletBud(commands.Bot):
                 "Failed to toggle monitoring. Please try again later.",
                 ephemeral=True
             )
-
-    @check_wallets.before_loop
-    async def before_check_wallets(self):
-        """Wait until the bot is ready before starting the task"""
-        await self.wait_until_ready()
-        logger.info("Bot is ready, wallet check task can start")
 
     @app_commands.command(name="help", description="Show available commands")
     async def help_command(self, interaction: discord.Interaction):
