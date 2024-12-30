@@ -13,6 +13,8 @@ load_dotenv()
 intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
+intents.guilds = True
+intents.messages = True
 
 bot = discord.Bot(intents=intents)
 db = Database()
@@ -32,12 +34,26 @@ blockfrost_client = blockfrost.BlockFrostApi(
 async def on_ready():
     print(f'{bot.user} is ready and online!')
     try:
+        # Set bot presence
+        await bot.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="YUMMI wallets 👀"
+            ),
+            status=discord.Status.online
+        )
+        print("Bot presence set")
+        
+        # Sync commands
         print("Starting to sync commands...")
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} commands")
+        
+        # Start wallet checking
         check_wallets.start()
+        print("Wallet checking started")
     except Exception as e:
-        print(f"Error syncing commands: {e}")
+        print(f"Error during startup: {e}")
 
 @bot.event
 async def on_application_command_error(ctx, error):
