@@ -476,10 +476,7 @@ class WalletBud(commands.Bot):
             
             try:
                 # Get wallet's total balance and assets using correct method
-                address_info = await self.rate_limited_request(
-                    self.blockfrost_client.address_total,  # Correct method name
-                    address=wallet_address
-                )
+                address_info = self.blockfrost_client.address_total(address=wallet_address)
                 logger.info(f"Received address info: {address_info}")
                 
                 if not address_info:
@@ -516,8 +513,7 @@ class WalletBud(commands.Bot):
         """Check for new transactions in wallet"""
         try:
             # Get wallet transactions with proper filters
-            transactions = await self.rate_limited_request(
-                self.blockfrost_client.address_transactions,
+            transactions = self.blockfrost_client.address_transactions(
                 address=wallet_address,
                 order='desc',  # Most recent first
                 count=10  # Limit to 10 transactions
@@ -540,10 +536,7 @@ class WalletBud(commands.Bot):
                     
                 try:
                     # Get transaction details using correct endpoint
-                    tx_details = await self.rate_limited_request(
-                        self.blockfrost_client.transaction_utxos,  # Correct method for tx details
-                        hash=tx.hash
-                    )
+                    tx_details = self.blockfrost_client.transaction_utxos(hash=tx.hash)
                     
                     # Calculate total ADA and assets received
                     received_ada = 0
