@@ -39,8 +39,8 @@ def get_request_id():
     return str(uuid4())[:8]
 
 def dm_only():
-    """Check if command is used in DM"""
-    async def predicate(interaction: discord.Interaction):
+    """Check if command is being used in DMs"""
+    async def predicate(interaction: discord.Interaction) -> bool:
         if not isinstance(interaction.channel, discord.DMChannel):
             await interaction.response.send_message(
                 "❌ This command can only be used in DMs.",
@@ -51,10 +51,9 @@ def dm_only():
     return app_commands.check(predicate)
 
 def has_blockfrost():
-    """Check if Blockfrost client is initialized"""
-    async def predicate(interaction: discord.Interaction):
-        bot = interaction.client
-        if not bot.blockfrost_client:
+    """Check if Blockfrost client is available"""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not interaction.client.blockfrost_client:
             await interaction.response.send_message(
                 "❌ Blockfrost API is not available. Please try again later.",
                 ephemeral=True
@@ -62,33 +61,6 @@ def has_blockfrost():
             return False
         return True
     return app_commands.check(predicate)
-
-class RateLimiter:
-    """Rate limiter for API requests"""
-    def __init__(self, requests_per_second, burst_limit):
-        self.requests_per_second = requests_per_second
-        self.burst_limit = burst_limit
-        self.tokens = burst_limit
-        self.last_update = time.monotonic()
-        self.lock = asyncio.Lock()
-
-    async def acquire(self):
-        """Acquire a rate limit token"""
-        async with self.lock:
-            now = time.monotonic()
-            time_passed = now - self.last_update
-            self.tokens = min(
-                self.burst_limit,
-                self.tokens + time_passed * self.requests_per_second
-            )
-            
-            if self.tokens < 1:
-                wait_time = (1 - self.tokens) / self.requests_per_second
-                await asyncio.sleep(wait_time)
-                self.tokens = 1
-            
-            self.tokens -= 1
-            self.last_update = now
 
 class WalletBud(commands.Bot):
     def __init__(self):
@@ -159,11 +131,11 @@ class WalletBud(commands.Bot):
             
             # Add commands using app_commands.CommandTree
             @self.tree.command(name='addwallet', description='Add a wallet to monitor')
-            @app_commands.check(dm_only())
-            @app_commands.check(has_blockfrost())
+            @dm_only()
+            @has_blockfrost()
             async def addwallet(interaction: discord.Interaction, address: str):
                 try:
-                    # Defer response
+                    # Defer response FIRST before any processing
                     await interaction.response.defer(ephemeral=True)
                     logger.info(f"Adding wallet {address} for user {interaction.user.id}")
                     
@@ -174,9 +146,26 @@ class WalletBud(commands.Bot):
                             ephemeral=True
                         )
                         return
+
+                    # Verify address with Blockfrost
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self.blockfrost_client.address, 
+                                address
+                            ),
+                            timeout=5.0
+                        )
+                    except Exception as e:
+                        logger.error(f"Blockfrost validation failed for {address}: {str(e)}")
+                        await interaction.followup.send(
+                            "❌ Invalid Cardano address. Please check and try again.",
+                            ephemeral=True
+                        )
+                        return
                     
                     # Add to database
-                    success = await add_wallet(interaction.user.id, address)
+                    success = await add_wallet(str(interaction.user.id), address)
                     if success:
                         await interaction.followup.send(
                             f"✅ Successfully added wallet `{address}` to monitoring.",
@@ -196,15 +185,15 @@ class WalletBud(commands.Bot):
                     )
             
             @self.tree.command(name='removewallet', description='Remove a wallet from monitoring')
-            @app_commands.check(dm_only())
+            @dm_only()
             async def removewallet(interaction: discord.Interaction, address: str):
                 try:
-                    # Defer response
+                    # Defer response FIRST before any processing
                     await interaction.response.defer(ephemeral=True)
                     logger.info(f"Removing wallet {address} for user {interaction.user.id}")
                     
                     # Remove from database
-                    success = await remove_wallet(interaction.user.id, address)
+                    success = await remove_wallet(str(interaction.user.id), address)
                     if success:
                         await interaction.followup.send(
                             f"✅ Successfully removed wallet `{address}` from monitoring.",
@@ -224,15 +213,15 @@ class WalletBud(commands.Bot):
                     )
             
             @self.tree.command(name='listwallets', description='List your monitored wallets')
-            @app_commands.check(dm_only())
+            @dm_only()
             async def listwallets(interaction: discord.Interaction):
                 try:
-                    # Defer response
+                    # Defer response FIRST before any processing
                     await interaction.response.defer(ephemeral=True)
                     logger.info(f"Listing wallets for user {interaction.user.id}")
                     
                     # Get wallets
-                    wallets = await get_all_wallets(interaction.user.id)
+                    wallets = await get_all_wallets(str(interaction.user.id))
                     
                     if not wallets:
                         await interaction.followup.send(
@@ -266,7 +255,6 @@ class WalletBud(commands.Bot):
             @self.tree.command(name='help', description='Show bot help and commands')
             async def help(interaction: discord.Interaction):
                 try:
-                    # Create embed
                     embed = discord.Embed(
                         title="📚 Wallet Bud Help",
                         description="Monitor your Cardano wallets for YUMMI token transactions",
@@ -431,7 +419,7 @@ class WalletBud(commands.Bot):
             # Add wallet to database
             try:
                 logger.debug(f"Adding wallet {address} to database")
-                success = await add_wallet(interaction.user.id, address)
+                success = await add_wallet(str(interaction.user.id), address)
                 
                 if success:
                     logger.info(f"Successfully added wallet {address}")
@@ -476,7 +464,7 @@ class WalletBud(commands.Bot):
             # Remove wallet from database
             try:
                 logger.debug(f"Removing wallet {address} from database")
-                success = await remove_wallet(interaction.user.id, address)
+                success = await remove_wallet(str(interaction.user.id), address)
                 
                 if success:
                     logger.info(f"Successfully removed wallet {address}")
@@ -521,7 +509,7 @@ class WalletBud(commands.Bot):
             # Get wallets from database
             try:
                 logger.debug("Querying database for wallets...")
-                wallets = await get_all_wallets(interaction.user.id)
+                wallets = await get_all_wallets(str(interaction.user.id))
                 logger.debug(f"Found {len(wallets) if wallets else 0} wallets")
                 
                 if not wallets:
