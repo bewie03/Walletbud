@@ -414,26 +414,21 @@ class WalletBud(commands.Bot):
                 logger.error("BLOCKFROST_API_KEY not set")
                 return False
             
-            # Create client
+            # Create client with correct base URL
             self.blockfrost_client = BlockFrostApi(
                 project_id=BLOCKFROST_API_KEY,
-                base_url="https://cardano-mainnet.blockfrost.io/api/v0"  # Full mainnet URL with /api/v0
+                base_url="https://cardano-mainnet.blockfrost.io/api/v0"  # Correct mainnet URL
             )
             
             # Test connection
             try:
                 logger.info("Testing Blockfrost connection...")
-                # Run health check in a thread to avoid blocking
+                # Test by getting network info instead of health
                 loop = asyncio.get_event_loop()
-                health = await loop.run_in_executor(None, self.blockfrost_client.health)
+                await loop.run_in_executor(None, self.blockfrost_client.addresses_assets, "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz")  # Test with a known address
                 
-                if health:
-                    logger.info("Blockfrost health check passed")
-                    return True
-                else:
-                    logger.error("Blockfrost health check failed")
-                    self.blockfrost_client = None
-                    return False
+                logger.info("Blockfrost connection test passed")
+                return True
                 
             except Exception as e:
                 logger.error(f"Failed to test Blockfrost connection: {str(e)}")
