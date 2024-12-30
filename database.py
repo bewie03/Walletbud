@@ -149,41 +149,77 @@ async def remove_wallet(address: str, discord_id: str) -> bool:
             logger.error(f"Error removing wallet: {str(e)}")
             return False
 
-async def get_all_wallets():
-    """
-    Retrieve all wallets from the database.
-    :return: List of all wallets.
-    """
-    try:
-        result = await execute_query(
-            """
-            SELECT * FROM wallets
-            """,
-            fetch_all=True
-        )
-        return result
-    except Exception as e:
-        logger.error(f"Failed to retrieve wallets: {e}")
-        return []
+async def get_wallet(address: str, user_id: str) -> dict:
+    """Get a wallet by address and user ID"""
+    async with DatabaseConnection() as db:
+        try:
+            db.cursor.execute(
+                """
+                SELECT * FROM wallets 
+                WHERE address = ? AND user_id = ? AND is_active = TRUE
+                """,
+                (address, user_id)
+            )
+            result = db.cursor.fetchone()
+            return dict(result) if result else None
+            
+        except Exception as e:
+            logger.error(f"Error getting wallet: {str(e)}")
+            return None
 
-async def update_last_checked(wallet_id):
-    """
-    Update the last checked timestamp for a wallet.
-    :param wallet_id: Wallet ID.
-    """
-    try:
-        await execute_query(
-            """
-            UPDATE wallets
-            SET last_checked = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (wallet_id,)
-        )
-        logger.info(f"Updated last checked for wallet ID: {wallet_id}")
-    except Exception as e:
-        logger.error(f"Failed to update last checked: {e}")
+async def get_all_wallets() -> list:
+    """Get all active wallets"""
+    async with DatabaseConnection() as db:
+        try:
+            db.cursor.execute(
+                """
+                SELECT * FROM wallets 
+                WHERE is_active = TRUE
+                ORDER BY last_checked ASC
+                """
+            )
+            results = db.cursor.fetchall()
+            return [dict(row) for row in results] if results else []
+            
+        except Exception as e:
+            logger.error(f"Error getting wallets: {str(e)}")
+            return []
 
+async def update_last_checked(wallet_id: int) -> bool:
+    """Update last checked timestamp"""
+    async with DatabaseConnection() as db:
+        try:
+            db.cursor.execute(
+                """
+                UPDATE wallets 
+                SET last_checked = CURRENT_TIMESTAMP 
+                WHERE id = ?
+                """,
+                (wallet_id,)
+            )
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating last checked: {str(e)}")
+            return False
+
+async def add_transaction(wallet_id: int, tx_hash: str, amount: str, block_height: int, timestamp: int) -> bool:
+    """Add a new transaction"""
+    async with DatabaseConnection() as db:
+        try:
+            db.cursor.execute(
+                """
+                INSERT INTO transactions (wallet_id, tx_hash, amount, block_height, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (wallet_id, tx_hash) DO NOTHING
+                """,
+                (wallet_id, tx_hash, amount, block_height, timestamp)
+            )
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error adding transaction: {str(e)}")
+            return False
 
 async def main():
     # Example usage

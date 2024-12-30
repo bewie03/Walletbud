@@ -25,23 +25,11 @@ def get_request_id():
 # Set up logging
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 
-# Create logs directory if it doesn't exist
-if not os.path.exists('logs'):
-    os.makedirs('logs')
-
-# Set up file handler
-log_file = os.path.join('logs', 'bot.log')
-file_handler = logging.FileHandler(log_file, encoding='utf-8')
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-
-# Set up console handler
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-
-# Configure root logger
+# Configure root logger for Heroku (stream only, no file)
 logging.basicConfig(
     level=getattr(logging, log_level, logging.INFO),
-    handlers=[file_handler, console_handler]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
 )
 
 logger = logging.getLogger(__name__)
@@ -60,12 +48,22 @@ ERROR_MESSAGES = {
 
 def dm_only():
     """Check if command is used in DM"""
-    async def predicate(ctx):
-        if not isinstance(ctx.channel, discord.DMChannel):
-            await ctx.send("This command can only be used in DMs for security.")
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild_id is not None:
+            try:
+                await interaction.response.send_message(
+                    "❌ This command can only be used in DMs for security.",
+                    ephemeral=True
+                )
+            except:
+                if not interaction.response.is_done():
+                    await interaction.followup.send(
+                        "❌ This command can only be used in DMs for security.",
+                        ephemeral=True
+                    )
             return False
         return True
-    return commands.check(predicate)
+    return app_commands.check(predicate)
 
 def has_blockfrost():
     """Check if Blockfrost client is initialized"""
@@ -249,107 +247,112 @@ class WalletBud(commands.Bot):
 
     def setup_commands(self):
         """Set up bot commands using app_commands"""
-        
-        # Check if command is used in DM
-        def dm_only():
-            async def predicate(interaction: discord.Interaction) -> bool:
-                if interaction.guild_id is not None:
-                    try:
-                        await interaction.response.send_message(
-                            "❌ This command can only be used in DMs for security.",
-                            ephemeral=True
-                        )
-                    except:
-                        if not interaction.response.is_done():
-                            await interaction.followup.send(
-                                "❌ This command can only be used in DMs for security.",
-                                ephemeral=True
-                            )
-                    return False
-                return True
-            return app_commands.check(predicate)
-        
-        # Add cooldowns to prevent rate limiting
-        @app_commands.checks.cooldown(rate=1, per=30.0)
-        @dm_only()
-        @self.tree.command(name="addwallet", description="Add a wallet to monitor")
-        @app_commands.describe(address="The Cardano wallet address to monitor")
-        async def addwallet(interaction: discord.Interaction, address: str):
-            await self.add_wallet_command(interaction, address)
-        
-        @app_commands.checks.cooldown(rate=1, per=30.0)
-        @dm_only()
-        @self.tree.command(name="removewallet", description="Remove a wallet from monitoring")
-        @app_commands.describe(address="The Cardano wallet address to stop monitoring")
-        async def removewallet(interaction: discord.Interaction, address: str):
-            await self.remove_wallet_command(interaction, address)
-        
-        @app_commands.checks.cooldown(rate=1, per=30.0)
-        @dm_only()
-        @self.tree.command(name="listwallets", description="List all your monitored wallets")
-        async def listwallets(interaction: discord.Interaction):
-            await self.list_wallets_command(interaction)
-
-        @app_commands.checks.cooldown(rate=1, per=30.0)
-        @self.tree.command(name="help", description="Show help message with available commands")
-        async def help(interaction: discord.Interaction):
-            await self.help_command(interaction)
-
-        @app_commands.checks.cooldown(rate=1, per=30.0)
-        @self.tree.command(name="health", description="Check bot and API status")
-        async def health(interaction: discord.Interaction):
-            await self.health_command(interaction)
-
-        # Add global error handler
-        @self.tree.error
-        async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-            error_msg = None
+        try:
+            logger.info("Setting up commands...")
             
-            if isinstance(error, app_commands.CommandOnCooldown):
-                error_msg = f"This command is on cooldown. Try again in {error.retry_after:.2f} seconds."
-            elif isinstance(error, app_commands.CheckFailure):
-                # Already handled by dm_only check
-                return
-            elif isinstance(error, app_commands.CommandInvokeError):
-                logger.error(f"Command error: {str(error.original)}")
-                error_msg = "An error occurred while processing your command. Please try again later."
-            else:
-                logger.error(f"Unhandled command error: {str(error)}")
-                error_msg = "An unexpected error occurred. Please try again later."
+            # Add command checks
+            addwallet = app_commands.command(
+                name='addwallet',
+                description='Add a wallet to monitor'
+            )(self.addwallet)
+            addwallet.add_check(dm_only())
             
-            if error_msg:
-                try:
-                    await interaction.response.send_message(error_msg, ephemeral=True)
-                except:
-                    if not interaction.response.is_done():
-                        await interaction.followup.send(error_msg, ephemeral=True)
+            removewallet = app_commands.command(
+                name='removewallet',
+                description='Remove a wallet from monitoring'
+            )(self.removewallet)
+            removewallet.add_check(dm_only())
+            
+            listwallets = app_commands.command(
+                name='listwallets',
+                description='List your monitored wallets'
+            )(self.listwallets)
+            listwallets.add_check(dm_only())
+            
+            help_cmd = app_commands.command(
+                name='help',
+                description='Show bot help and commands'
+            )(self.help)
+            
+            health = app_commands.command(
+                name='health',
+                description='Check bot health status'
+            )(self.health)
+            
+            # Add commands to tree
+            self.tree.add_command(addwallet)
+            self.tree.add_command(removewallet)
+            self.tree.add_command(listwallets)
+            self.tree.add_command(help_cmd)
+            self.tree.add_command(health)
+            
+            logger.info("Commands set up successfully")
+            
+        except Exception as e:
+            logger.error(f"Error setting up commands: {str(e)}")
+            raise
 
     async def setup_hook(self):
         """Called when the bot starts up"""
         try:
-            # Initialize database first
-            if not await self.init_database():
-                raise Exception("Failed to initialize database")
+            logger.info("Initializing bot...")
             
-            # Initialize Blockfrost API
-            if not await self.init_blockfrost():
-                logger.warning("Bot will run with limited functionality - Blockfrost API unavailable")
+            # Initialize database
+            logger.info("Initializing database...")
+            await init_db()
             
-            # Sync commands with Discord
-            try:
-                await self.tree.sync()
-                logger.info("Commands synced with Discord")
-            except discord.HTTPException as e:
-                logger.error(f"Failed to sync commands: {str(e)}")
-                raise
+            # Initialize Blockfrost client
+            logger.info("Initializing Blockfrost client...")
+            await self.init_blockfrost()
             
             # Start background tasks
+            logger.info("Starting background tasks...")
             self.check_wallets.start()
-            logger.info("Bot setup completed successfully")
+            
+            logger.info("Bot initialization complete!")
             
         except Exception as e:
-            logger.error(f"Failed to complete setup: {str(e)}")
+            logger.error(f"Error in setup_hook: {str(e)}")
             raise
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Called when the bot is ready"""
+        try:
+            logger.info(f"Logged in as {self.user.name} ({self.user.id})")
+            logger.info(f"Discord API version: {discord.__version__}")
+            logger.info(f"Connected to {len(self.guilds)} guilds")
+            
+            # Log guild information
+            for guild in self.guilds:
+                logger.info(f"Connected to guild: {guild.name} ({guild.id})")
+                
+        except Exception as e:
+            logger.error(f"Error in on_ready: {str(e)}")
+
+    @commands.Cog.listener()
+    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """Handle command errors"""
+        error_msg = None
+        
+        if isinstance(error, app_commands.CommandOnCooldown):
+            error_msg = f"This command is on cooldown. Try again in {error.retry_after:.2f} seconds."
+        elif isinstance(error, app_commands.CheckFailure):
+            # Already handled by dm_only check
+            return
+        elif isinstance(error, app_commands.CommandInvokeError):
+            logger.error(f"Command error: {str(error.original)}")
+            error_msg = "An error occurred while processing your command. Please try again later."
+        else:
+            logger.error(f"Unhandled command error: {str(error)}")
+            error_msg = "An unexpected error occurred. Please try again later."
+        
+        if error_msg:
+            try:
+                await interaction.response.send_message(error_msg, ephemeral=True)
+            except:
+                if not interaction.response.is_done():
+                    await interaction.followup.send(error_msg, ephemeral=True)
 
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
@@ -394,7 +397,7 @@ class WalletBud(commands.Bot):
             self.blockfrost_client = None
             return False
 
-    async def add_wallet_command(self, interaction: discord.Interaction, address: str):
+    async def addwallet(self, interaction: discord.Interaction, address: str):
         """Handle the addwallet command"""
         try:
             if not await self.process_interaction(interaction):
@@ -447,7 +450,7 @@ class WalletBud(commands.Bot):
                 ephemeral=True
             )
 
-    async def list_wallets_command(self, interaction: discord.Interaction):
+    async def listwallets(self, interaction: discord.Interaction):
         """Handle the listwallets command"""
         try:
             if not await self.process_interaction(interaction):
@@ -500,7 +503,7 @@ class WalletBud(commands.Bot):
                 ephemeral=True
             )
 
-    async def help_command(self, interaction: discord.Interaction):
+    async def help(self, interaction: discord.Interaction):
         """Handle the help command"""
         try:
             if not await self.process_interaction(interaction, ephemeral=True):
@@ -560,7 +563,7 @@ class WalletBud(commands.Bot):
                 ephemeral=True
             )
 
-    async def health_command(self, interaction: discord.Interaction):
+    async def health(self, interaction: discord.Interaction):
         """Handle the health command"""
         try:
             if not await self.process_interaction(interaction, ephemeral=True):
