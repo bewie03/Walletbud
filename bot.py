@@ -746,7 +746,7 @@ class WalletBud(commands.Bot):
             
             # Get YUMMI token balance
             assets = await self.rate_limited_request(
-                self.blockfrost_client.get_address_assets,
+                self.blockfrost_client.addresses_assets,  # Correct method name from SDK
                 address=address
             )
             
@@ -813,7 +813,7 @@ class WalletBud(commands.Bot):
         try:
             # Get assets with retries
             assets = await self.rate_limited_request(
-                self.blockfrost_client.get_address_assets,
+                self.blockfrost_client.addresses_assets,  # Correct method name from SDK
                 address=address
             )
             
