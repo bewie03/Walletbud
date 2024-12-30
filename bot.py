@@ -491,13 +491,13 @@ class WalletBud(commands.Bot):
                     for asset in address_info.amount:
                         # Log each asset for debugging
                         logger.info(f"Checking asset: {asset.unit} with quantity {asset.quantity}")
-                        # Check if asset unit starts with YUMMI policy ID
-                        if asset.unit.startswith(YUMMI_POLICY_ID):
+                        # Check if asset unit starts with YUMMI policy ID and contains YUMMI
+                        if asset.unit.startswith(YUMMI_POLICY_ID) and "59554d4d49" in asset.unit.lower():  # "YUMMI" in hex
                             yummi_balance = int(asset.quantity)
                             logger.info(f"Found YUMMI balance: {yummi_balance}")
                             break
                         else:
-                            logger.debug(f"Asset {asset.unit} does not match YUMMI policy ID")
+                            logger.debug(f"Asset {asset.unit} does not match YUMMI token")
                 
                 logger.info(f"Final YUMMI balance: {yummi_balance}")
                 
