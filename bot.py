@@ -487,10 +487,15 @@ class WalletBud(commands.Bot):
                 yummi_balance = 0
                 if hasattr(address_info, 'amount'):
                     for asset in address_info.amount:
-                        if asset.unit == YUMMI_POLICY_ID:
+                        # Log each asset for debugging
+                        logger.debug(f"Found asset: {asset.unit} with quantity {asset.quantity}")
+                        # Check if asset unit starts with YUMMI policy ID
+                        if asset.unit.startswith(YUMMI_POLICY_ID):
                             yummi_balance = int(asset.quantity)
                             logger.info(f"Found YUMMI balance: {yummi_balance}")
                             break
+                
+                logger.info(f"Final YUMMI balance: {yummi_balance}")
                 
                 # Check if balance meets requirement
                 if yummi_balance < REQUIRED_YUMMI_TOKENS:
