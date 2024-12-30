@@ -62,6 +62,33 @@ def has_blockfrost():
         return True
     return app_commands.check(predicate)
 
+class RateLimiter:
+    """Rate limiter for API requests"""
+    def __init__(self, requests_per_second, burst_limit):
+        self.requests_per_second = requests_per_second
+        self.burst_limit = burst_limit
+        self.tokens = burst_limit
+        self.last_update = time.monotonic()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        """Acquire a rate limit token"""
+        async with self.lock:
+            now = time.monotonic()
+            time_passed = now - self.last_update
+            self.tokens = min(
+                self.burst_limit,
+                self.tokens + time_passed * self.requests_per_second
+            )
+            
+            if self.tokens < 1:
+                wait_time = (1 - self.tokens) / self.requests_per_second
+                await asyncio.sleep(wait_time)
+                self.tokens = 1
+            
+            self.tokens -= 1
+            self.last_update = now
+
 class WalletBud(commands.Bot):
     def __init__(self):
         """Initialize the bot"""
@@ -251,7 +278,7 @@ class WalletBud(commands.Bot):
                         "❌ An error occurred. Please try again later.",
                         ephemeral=True
                     )
-            
+
             @self.tree.command(name='help', description='Show bot help and commands')
             async def help(interaction: discord.Interaction):
                 try:
@@ -345,18 +372,14 @@ class WalletBud(commands.Bot):
                         "❌ Failed to get bot status. Please try again later.",
                         ephemeral=True
                     )
-            
-            # Sync with Discord
+
+            # Sync commands with Discord
             logger.info("Syncing commands with Discord...")
-            try:
-                await self.tree.sync()
-                logger.info("Commands synced with Discord successfully")
-            except Exception as e:
-                logger.error(f"Failed to sync commands with Discord: {str(e)}")
-                raise
-            
+            await self.tree.sync()
+            logger.info("Commands synced successfully")
+
         except Exception as e:
-            logger.error(f"Error setting up commands: {str(e)}")
+            logger.error(f"Failed to set up commands: {str(e)}")
             raise
 
     async def init_blockfrost(self):
