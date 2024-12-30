@@ -27,40 +27,70 @@ blockfrost_client = blockfrost.BlockFrostApi(
 async def on_ready():
     print(f'{bot.user} is ready and online!')
     try:
+        print("Starting to sync commands...")
         synced = await bot.sync_commands()
         print(f"Synced {len(synced)} commands")
     except Exception as e:
         print(f"Error syncing commands: {e}")
     check_wallets.start()
 
-@bot.slash_command(name="addwallet", description="Add a Cardano wallet for tracking")
-async def add_wallet(ctx, wallet_address: str):
-    # Allow command only in DMs
-    if not isinstance(ctx.channel, discord.DMChannel):
-        await ctx.respond("This command can only be used in DMs!", ephemeral=True)
+@bot.event
+async def on_message(message):
+    # Ignore messages from the bot itself
+    if message.author == bot.user:
         return
-
-    # Validate wallet address format
-    if not wallet_address.startswith(('addr1', 'addr_test1')):
-        await ctx.respond("Invalid wallet address format. Please provide a valid Cardano address.")
+        
+    # Only respond to DMs
+    if not isinstance(message.channel, discord.DMChannel):
         return
+        
+    # Process commands if in DM
+    await bot.process_commands(message)
 
-    try:
-        # Verify the wallet exists by trying to fetch its details
-        try:
-            blockfrost_client.address(wallet_address)
-        except Exception as e:
-            await ctx.respond("Invalid wallet address or unable to verify wallet. Please check the address and try again.")
-            return
+@bot.slash_command(
+    name="addwallet",
+    description="Add a Cardano wallet for tracking",
+    dm_permission=True
+)
+async def add_wallet(ctx):
+    # Create Modal for wallet input
+    class WalletModal(discord.ui.Modal):
+        def __init__(self):
+            super().__init__(title="Add Wallet")
+            self.wallet = discord.ui.InputText(
+                label="Wallet Address",
+                placeholder="Enter your Cardano wallet address",
+                style=discord.InputTextStyle.short
+            )
+            self.add_item(self.wallet)
 
-        db.add_user(str(ctx.author.id))
-        if db.add_wallet(str(ctx.author.id), wallet_address):
-            db.update_wallet_status(wallet_address, True)
-            await ctx.respond(f"Wallet {wallet_address} added successfully! You will receive DM notifications for transactions.")
-        else:
-            await ctx.respond("Error adding wallet. This wallet might already be registered.")
-    except Exception as e:
-        await ctx.respond(f"An error occurred while adding the wallet: {str(e)}")
+        async def callback(self, interaction: discord.Interaction):
+            wallet_address = self.wallet.value
+            
+            # Validate wallet address format
+            if not wallet_address.startswith(('addr1', 'addr_test1')):
+                await interaction.response.send_message("Invalid wallet address format. Please provide a valid Cardano address.")
+                return
+
+            try:
+                # Verify wallet exists
+                try:
+                    blockfrost_client.address(wallet_address)
+                except Exception as e:
+                    await interaction.response.send_message("Invalid wallet address or unable to verify wallet. Please check the address and try again.")
+                    return
+
+                db.add_user(str(interaction.user.id))
+                if db.add_wallet(str(interaction.user.id), wallet_address):
+                    db.update_wallet_status(wallet_address, True)
+                    await interaction.response.send_message(f"Wallet {wallet_address} added successfully! You will receive DM notifications for transactions.")
+                else:
+                    await interaction.response.send_message("Error adding wallet. This wallet might already be registered.")
+            except Exception as e:
+                await interaction.response.send_message(f"An error occurred while adding the wallet: {str(e)}")
+
+    modal = WalletModal()
+    await ctx.send_modal(modal)
 
 @tasks.loop(minutes=5)
 async def check_wallets():
@@ -84,12 +114,28 @@ async def check_wallets():
                         try:
                             # Get transaction details
                             tx_details = blockfrost_client.transaction(tx.tx_hash)
-                            message = (
-                                f" New transaction in wallet {wallet_address[:8]}...{wallet_address[-8:]}\n"
-                                f"Transaction ID: {tx.tx_hash}\n"
-                                f"Amount: {tx_details.output_amount[0].quantity / 1000000:.6f} ADA"
+                            embed = discord.Embed(
+                                title="New Transaction Detected! 🔔",
+                                color=discord.Color.blue()
                             )
-                            await user.send(message)
+                            embed.add_field(
+                                name="Wallet",
+                                value=f"`{wallet_address[:8]}...{wallet_address[-8:]}`",
+                                inline=False
+                            )
+                            embed.add_field(
+                                name="Transaction ID",
+                                value=f"`{tx.tx_hash}`",
+                                inline=False
+                            )
+                            embed.add_field(
+                                name="Amount",
+                                value=f"`{tx_details.output_amount[0].quantity / 1000000:.6f} ADA`",
+                                inline=False
+                            )
+                            embed.set_footer(text="WalletBud Notification")
+                            
+                            await user.send(embed=embed)
                         except discord.Forbidden:
                             print(f"Cannot send DM to user {discord_id}")
                         except Exception as e:
