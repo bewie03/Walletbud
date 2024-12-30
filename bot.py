@@ -614,17 +614,17 @@ class WalletBud(commands.Bot):
             tuple[bool, int]: (has_enough_tokens, current_balance)
         """
         try:
-            # Get all assets for the address
             assets = await self.rate_limited_request(
-                self.blockfrost_client.address_assets,
-                address
+                self.blockfrost_client.address_utxos_asset,
+                address=address,
+                asset=f"{YUMMI_POLICY_ID}"
             )
             
-            # Find YUMMI token balance
             total_tokens = 0
-            for asset in assets:
-                if asset.unit.startswith(YUMMI_POLICY_ID):
-                    total_tokens += int(asset.quantity)
+            for utxo in assets:
+                for amount in utxo.amount:
+                    if amount.unit == f"{YUMMI_POLICY_ID}":
+                        total_tokens += int(amount.quantity)
             
             logger.info(f"Found {total_tokens} YUMMI tokens for address {address}")
             return total_tokens >= REQUIRED_YUMMI_TOKENS, total_tokens

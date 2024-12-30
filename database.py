@@ -139,13 +139,8 @@ async def get_all_wallets():
     """
     try:
         pool = await get_pool()
-        async with pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT user_id, address FROM wallets"
-                )
-                rows = await cur.fetchall()
-                return [{'user_id': row[0], 'address': row[1]} for row in rows]
+        async with pool.acquire() as connection:
+            return await connection.fetch("SELECT * FROM wallets")
     except Exception as e:
         logger.error(f"Error getting all wallets: {str(e)}")
         return []
