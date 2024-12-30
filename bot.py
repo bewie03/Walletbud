@@ -238,6 +238,11 @@ class WalletBud(commands.Bot):
         self.wallet_task_lock = asyncio.Lock()
         self.processing_wallets = False
         
+        # Initialize rate limiting
+        self.request_count = 0
+        self.last_request_time = datetime.utcnow()
+        self.rate_limit_lock = asyncio.Lock()
+        
         # Initialize core components
         self.blockfrost_client = None
         self.monitoring_paused = False
@@ -357,21 +362,59 @@ class WalletBud(commands.Bot):
 
     async def rate_limited_request(self, method, **kwargs):
         """Handle rate limiting for Blockfrost API requests"""
+        request_id = get_request_id()
         max_retries = 3
-        base_delay = 1.0
-
+        
+        async with self.rate_limit_lock:
+            current_time = datetime.utcnow()
+            time_diff = (current_time - self.last_request_time).total_seconds()
+            
+            # Reset counter if more than 50 seconds have passed
+            if time_diff > 50:
+                logger.debug(f"[{request_id}] Resetting rate limit counter after {time_diff} seconds")
+                self.request_count = 0
+            
+            # If we've hit the burst limit, wait
+            if self.request_count >= 500:
+                wait_time = 50 - time_diff
+                if wait_time > 0:
+                    logger.warning(f"[{request_id}] Rate limit burst reached, waiting {wait_time} seconds")
+                    await asyncio.sleep(wait_time)
+                    self.request_count = 0
+            
+            # If we're making requests too fast, wait
+            if time_diff < 0.1:  # Ensure at least 100ms between requests
+                wait_time = 0.1 - time_diff
+                logger.debug(f"[{request_id}] Request too fast, waiting {wait_time} seconds")
+                await asyncio.sleep(wait_time)
+            
+            # Update counters
+            self.request_count += 1
+            self.last_request_time = current_time
+        
         for attempt in range(max_retries):
             try:
+                logger.debug(f"[{request_id}] Making API request to {method.__name__} with args: {kwargs}")
                 response = await method(**kwargs)
+                logger.debug(f"[{request_id}] API response received")
                 return response
+                
             except Exception as e:
+                logger.error(f"[{request_id}] API request failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                
                 if "rate limit" in str(e).lower():
-                    delay = base_delay * (2 ** attempt)
-                    logger.info(f"Rate limit hit, retrying in {delay:.1f}s...")
+                    # If we hit the rate limit, wait longer
+                    wait_time = 60 if attempt == 0 else 120
+                    logger.warning(f"[{request_id}] Rate limit hit, waiting {wait_time} seconds")
+                    await asyncio.sleep(wait_time)
+                    continue
+                    
+                if attempt < max_retries - 1:
+                    delay = 1 * (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                    logger.info(f"[{request_id}] Retrying in {delay} seconds...")
                     await asyncio.sleep(delay)
-                elif attempt < max_retries - 1:
-                    await asyncio.sleep(base_delay)
                 else:
+                    logger.error(f"[{request_id}] Max retries reached. Giving up.")
                     raise
 
     async def check_yummi_balance(self, wallet_address):
@@ -381,13 +424,18 @@ class WalletBud(commands.Bot):
             logger.info(f"[{request_id}] Checking YUMMI balance for wallet: {wallet_address}")
             logger.info(f"[{request_id}] Looking for YUMMI policy ID: {YUMMI_POLICY_ID}")
             
+            if not self.blockfrost_client:
+                logger.error(f"[{request_id}] Blockfrost client is not initialized")
+                return False, "Bot API is not ready. Please try again in a few minutes."
+            
             try:
                 # Get wallet's total balance and assets using rate-limited request
+                logger.debug(f"[{request_id}] Requesting address info from Blockfrost...")
                 address_info = await self.rate_limited_request(
                     self.blockfrost_client.address_total,
                     address=wallet_address
                 )
-                logger.info(f"[{request_id}] Received address info: {address_info}")
+                logger.debug(f"[{request_id}] Raw address info response: {address_info}")
                 
                 if not address_info:
                     logger.warning(f"[{request_id}] No address info found for {wallet_address}")
@@ -399,12 +447,12 @@ class WalletBud(commands.Bot):
                     logger.info(f"[{request_id}] Found {len(address_info.amount)} assets in wallet")
                     for asset in address_info.amount:
                         # Log each asset for debugging
-                        logger.info(f"[{request_id}] Checking asset: {asset.unit} with quantity {asset.quantity}")
+                        logger.debug(f"[{request_id}] Checking asset: {asset.unit} with quantity {asset.quantity}")
                         
                         # Extract policy ID and asset name from unit
                         policy_id = asset.unit[:56]  # First 56 chars are policy ID
                         asset_name_hex = asset.unit[56:]  # Rest is asset name in hex
-                        logger.info(f"[{request_id}] Policy ID: {policy_id}, Asset Name Hex: {asset_name_hex}")
+                        logger.debug(f"[{request_id}] Policy ID: {policy_id}, Asset Name Hex: {asset_name_hex}")
                         
                         # Check if asset unit starts with YUMMI policy ID and contains "yummi" in hex
                         if policy_id == YUMMI_POLICY_ID:
@@ -415,7 +463,7 @@ class WalletBud(commands.Bot):
                                 logger.info(f"[{request_id}] Found YUMMI balance: {yummi_balance}")
                                 break
                             else:
-                                logger.info(f"[{request_id}] Policy ID matches but asset name does not: {asset_name_hex}")
+                                logger.debug(f"[{request_id}] Policy ID matches but asset name does not: {asset_name_hex}")
                         else:
                             logger.debug(f"[{request_id}] Policy ID does not match: {policy_id}")
                 
@@ -451,7 +499,7 @@ class WalletBud(commands.Bot):
                 "2. Check if the Cardano network is experiencing issues\n"
                 "3. If the problem persists, contact support"
             )
-            logger.error(f"[{request_id}] {str(e)}")
+            logger.error(f"[{request_id}] Error checking YUMMI balance: {str(e)}")
             return False, error_msg
 
     @tasks.loop(minutes=WALLET_CHECK_INTERVAL)
@@ -592,39 +640,68 @@ class WalletBud(commands.Bot):
         """Initialize Blockfrost API client"""
         try:
             logger.info("Initializing Blockfrost API client...")
-            
-            # Get API key and verify it exists
-            api_key = os.getenv('BLOCKFROST_API_KEY')
-            if not api_key:
-                logger.error("Blockfrost API key is not set!")
-                return False
+            if not BLOCKFROST_API_KEY:
+                raise ValueError("BLOCKFROST_API_KEY not found in environment")
                 
-            # Log first few characters of key (safely)
-            logger.info(f"Using Blockfrost API key: {api_key[:4]}...")
+            # Log the first few characters of the API key for debugging
+            logger.debug(f"Using API key: {BLOCKFROST_API_KEY[:8]}...")
             
-            # Initialize client with project_id (API key)
-            self.blockfrost_client = BlockFrostApi(
-                project_id=api_key
-            )
+            # Determine network from API key
+            network = "mainnet"
+            if BLOCKFROST_API_KEY.startswith("preprod"):
+                network = "preprod"
+            elif BLOCKFROST_API_KEY.startswith("preview"):
+                network = "preview"
+            logger.info(f"Using Blockfrost {network} network")
             
-            # Test connection with health check
+            # Initialize client
             try:
-                health = self.blockfrost_client.health()
-                logger.info(f"Blockfrost health check: {health}")
+                self.blockfrost_client = BlockFrostApi(
+                    project_id=BLOCKFROST_API_KEY,
+                    base_url=f"https://cardano-{network}.blockfrost.io/api/v0"
+                )
+                logger.debug("BlockFrostApi instance created")
+            except Exception as e:
+                logger.error(f"Failed to create BlockFrostApi instance: {str(e)}")
+                raise ValueError("Failed to initialize Blockfrost client")
+            
+            # Test the connection
+            try:
+                logger.debug("Testing Blockfrost connection...")
+                health = await self.rate_limited_request(
+                    self.blockfrost_client.health
+                )
+                logger.debug(f"Health check response: {health}")
                 
-                if not health.is_healthy:
-                    logger.error("Blockfrost API health check failed")
-                    return False
-                    
-                logger.info("Blockfrost API initialized successfully")
+                # Also test a simple API call
+                logger.debug("Testing API call...")
+                network = await self.rate_limited_request(
+                    self.blockfrost_client.network
+                )
+                logger.debug(f"Network info: {network}")
+                
+                logger.info("Successfully connected to Blockfrost API")
                 return True
                 
             except Exception as e:
-                logger.error(f"Blockfrost health check failed: {str(e)}")
-                return False
+                logger.error(f"Failed to connect to Blockfrost API: {str(e)}")
+                if "Invalid project token" in str(e):
+                    raise ValueError(
+                        "Invalid Blockfrost API key. Please check your BLOCKFROST_API_KEY in .env"
+                    )
+                elif "Forbidden" in str(e):
+                    raise ValueError(
+                        "Access denied by Blockfrost. Your API key might be expired or invalid"
+                    )
+                elif "404" in str(e):
+                    raise ValueError(
+                        "API endpoint not found. Make sure you're using the correct network (mainnet/testnet)"
+                    )
+                raise
                 
         except Exception as e:
             logger.error(f"Failed to initialize Blockfrost API: {str(e)}")
+            self.blockfrost_client = None
             return False
 
     @commands.command(name='addwallet')
