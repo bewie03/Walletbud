@@ -144,6 +144,9 @@ class WalletBud(commands.Bot):
         self.monitoring_paused = False
         self.wallet_task_lock = asyncio.Lock()
         self.processing_wallets = False
+        
+        # Initialize command tree
+        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
         """Called when the bot starts up"""
@@ -175,43 +178,35 @@ class WalletBud(commands.Bot):
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
         try:
-            # Get API key and network from environment
-            api_key = os.getenv('BLOCKFROST_API_KEY')
-            network = os.getenv('CARDANO_NETWORK', 'mainnet')
+            logger.info("Initializing Blockfrost client...")
             
-            if not api_key:
-                logger.error("BLOCKFROST_API_KEY environment variable not set")
-                return False
-                
-            # Initialize client based on network
+            # Create client
+            self.blockfrost_client = BlockFrostApi(
+                project_id=BLOCKFROST_API_KEY,
+                base_url="https://cardano-mainnet.blockfrost.io/api"
+            )
+            
+            # Test connection
             try:
-                if network.lower() == 'mainnet':
-                    self.blockfrost_client = BlockFrostApi(
-                        project_id=api_key
-                    )
-                else:
-                    self.blockfrost_client = BlockFrostApi(
-                        project_id=api_key,
-                        base_url="https://cardano-testnet.blockfrost.io/api/v0"
-                    )
+                await asyncio.wait_for(
+                    asyncio.to_thread(self.blockfrost_client.health),
+                    timeout=5.0
+                )
+                logger.info("Blockfrost client initialized successfully")
+                return True
                 
-                # Test connection
-                health = await self.blockfrost_client.health()
-                if health:
-                    logger.info(f"Blockfrost API initialized successfully on {network}")
-                    return True
-                else:
-                    logger.error("Failed to verify Blockfrost API health")
-                    self.blockfrost_client = None
-                    return False
-                    
-            except Exception as e:
-                logger.error(f"Failed to initialize Blockfrost client: {str(e)}")
+            except asyncio.TimeoutError:
+                logger.error("Blockfrost client initialization timed out")
                 self.blockfrost_client = None
                 return False
                 
+            except Exception as e:
+                logger.error(f"Failed to test Blockfrost connection: {str(e)}")
+                self.blockfrost_client = None
+                return False
+            
         except Exception as e:
-            logger.error(f"Failed to initialize Blockfrost API: {str(e)}")
+            logger.error(f"Failed to initialize Blockfrost client: {str(e)}")
             self.blockfrost_client = None
             return False
 
@@ -219,9 +214,6 @@ class WalletBud(commands.Bot):
         """Set up bot commands using app_commands"""
         try:
             logger.info("Setting up commands...")
-            
-            # Create command tree
-            self.tree = app_commands.CommandTree(self)
             
             # Add commands
             @self.tree.command(name='addwallet', description='Add a wallet to monitor')

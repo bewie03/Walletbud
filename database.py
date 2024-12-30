@@ -1,13 +1,9 @@
 import os
 import logging
-import asyncio
 import asyncpg
+from datetime import datetime
 
 # Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 # Get database URL from environment
@@ -15,135 +11,146 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable not set")
 
-# Pool for database connections
-pool = None
+# Create tables SQL
+CREATE_TABLES_SQL = """
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Wallets table
+CREATE TABLE IF NOT EXISTS wallets (
+    wallet_id SERIAL PRIMARY KEY,
+    user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
+    address TEXT NOT NULL,
+    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, address)
+);
+
+-- Transactions table
+CREATE TABLE IF NOT EXISTS transactions (
+    tx_id SERIAL PRIMARY KEY,
+    wallet_id INTEGER REFERENCES wallets(wallet_id) ON DELETE CASCADE,
+    tx_hash TEXT NOT NULL,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(wallet_id, tx_hash)
+);
+"""
 
 async def init_db():
-    """Initialize database connection pool and schema"""
-    global pool
+    """Initialize database and create tables"""
     try:
         # Create connection pool
         pool = await asyncpg.create_pool(DATABASE_URL)
         
-        # Create tables if they don't exist
+        # Create tables
         async with pool.acquire() as conn:
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS wallets (
-                    id SERIAL PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    address TEXT NOT NULL,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, address)
-                )
-            ''')
-            
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS transactions (
-                    id SERIAL PRIMARY KEY,
-                    wallet_id INTEGER REFERENCES wallets(id),
-                    tx_hash TEXT NOT NULL,
-                    amount TEXT NOT NULL,
-                    block_height INTEGER NOT NULL,
-                    timestamp INTEGER NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(wallet_id, tx_hash)
-                )
-            ''')
+            await conn.execute(CREATE_TABLES_SQL)
             
         logger.info("Database initialized successfully")
-        return True
+        return pool
         
     except Exception as e:
         logger.error(f"Failed to initialize database: {str(e)}")
-        return False
+        raise
 
 async def add_wallet(user_id: str, address: str) -> bool:
-    """Add a new wallet"""
+    """Add a wallet to monitor"""
     try:
+        pool = await init_db()
         async with pool.acquire() as conn:
-            await conn.execute('''
+            # First ensure user exists
+            await conn.execute(
+                'INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING',
+                user_id
+            )
+            
+            # Then add wallet
+            await conn.execute(
+                '''
                 INSERT INTO wallets (user_id, address)
                 VALUES ($1, $2)
-                ON CONFLICT (user_id, address) 
-                DO UPDATE SET is_active = TRUE
-            ''', user_id, address)
-        return True
-        
+                ON CONFLICT (user_id, address) DO NOTHING
+                ''',
+                user_id, address
+            )
+            return True
+            
     except Exception as e:
         logger.error(f"Error adding wallet: {str(e)}")
         return False
 
 async def remove_wallet(user_id: str, address: str) -> bool:
-    """Remove a wallet (soft delete)"""
+    """Remove a wallet from monitoring"""
     try:
+        pool = await init_db()
         async with pool.acquire() as conn:
-            await conn.execute('''
-                UPDATE wallets 
-                SET is_active = FALSE 
-                WHERE user_id = $1 AND address = $2
-            ''', user_id, address)
-        return True
-        
+            result = await conn.execute(
+                'DELETE FROM wallets WHERE user_id = $1 AND address = $2',
+                user_id, address
+            )
+            return 'DELETE' in result
+            
     except Exception as e:
         logger.error(f"Error removing wallet: {str(e)}")
         return False
 
-async def get_wallet(address: str, user_id: str) -> dict:
-    """Get a wallet by address and user ID"""
+async def get_wallet(user_id: str, address: str):
+    """Get a specific wallet"""
     try:
+        pool = await init_db()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow('''
-                SELECT * FROM wallets 
-                WHERE address = $1 AND user_id = $2 AND is_active = TRUE
-            ''', address, user_id)
-            return dict(row) if row else None
+            return await conn.fetchrow(
+                'SELECT * FROM wallets WHERE user_id = $1 AND address = $2',
+                user_id, address
+            )
             
     except Exception as e:
         logger.error(f"Error getting wallet: {str(e)}")
         return None
 
-async def get_all_wallets() -> list:
-    """Get all active wallets"""
+async def get_all_wallets():
+    """Get all wallets"""
     try:
+        pool = await init_db()
         async with pool.acquire() as conn:
-            rows = await conn.fetch('''
-                SELECT * FROM wallets 
-                WHERE is_active = TRUE
-                ORDER BY last_checked ASC
-            ''')
-            return [dict(row) for row in rows]
+            return await conn.fetch('SELECT * FROM wallets')
             
     except Exception as e:
-        logger.error(f"Error getting wallets: {str(e)}")
+        logger.error(f"Error getting all wallets: {str(e)}")
         return []
 
-async def update_last_checked(wallet_id: int) -> bool:
-    """Update last checked timestamp"""
+async def update_last_checked(wallet_id: int, timestamp: datetime = None):
+    """Update last checked timestamp for a wallet"""
     try:
+        pool = await init_db()
         async with pool.acquire() as conn:
-            await conn.execute('''
-                UPDATE wallets 
-                SET last_checked = CURRENT_TIMESTAMP 
-                WHERE id = $1
-            ''', wallet_id)
-        return True
+            await conn.execute(
+                'UPDATE wallets SET last_checked = $1 WHERE wallet_id = $2',
+                timestamp or datetime.utcnow(), wallet_id
+            )
+            return True
             
     except Exception as e:
         logger.error(f"Error updating last checked: {str(e)}")
         return False
 
-async def add_transaction(wallet_id: int, tx_hash: str, amount: str, block_height: int, timestamp: int) -> bool:
-    """Add a new transaction"""
+async def add_transaction(wallet_id: int, tx_hash: str, timestamp: datetime = None):
+    """Add a transaction"""
     try:
+        pool = await init_db()
         async with pool.acquire() as conn:
-            await conn.execute('''
-                INSERT INTO transactions (wallet_id, tx_hash, amount, block_height, timestamp)
-                VALUES ($1, $2, $3, $4, $5)
+            await conn.execute(
+                '''
+                INSERT INTO transactions (wallet_id, tx_hash, timestamp)
+                VALUES ($1, $2, $3)
                 ON CONFLICT (wallet_id, tx_hash) DO NOTHING
-            ''', wallet_id, tx_hash, amount, block_height, timestamp)
-        return True
+                ''',
+                wallet_id, tx_hash, timestamp or datetime.utcnow()
+            )
+            return True
             
     except Exception as e:
         logger.error(f"Error adding transaction: {str(e)}")
