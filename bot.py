@@ -4,6 +4,7 @@ import sqlite3
 import asyncio
 from datetime import datetime, timedelta
 from functools import wraps
+import uuid
 
 import discord
 from discord import app_commands
@@ -58,27 +59,64 @@ def cooldown_5s():
     """5 second cooldown between commands"""
     return commands.cooldown(1, 5.0)
 
-def init_db():
+def init_db(conn):
     """Initialize SQLite database"""
     try:
-        with sqlite3.connect(DATABASE_NAME) as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS wallets (
-                    address TEXT PRIMARY KEY,
-                    discord_id TEXT NOT NULL,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    last_tx_hash TEXT,
-                    last_yummi_check TIMESTAMP,
-                    UNIQUE(address, discord_id)
-                )
-            ''')
-            conn.commit()
-            logger.info("Database initialized successfully")
-            return True
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS wallets (
+                address TEXT PRIMARY KEY,
+                discord_id TEXT NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                last_tx_hash TEXT,
+                last_yummi_check TIMESTAMP,
+                UNIQUE(address, discord_id)
+            )
+        ''')
+        conn.commit()
+        logger.info("Database initialized successfully")
+        return True
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
         return False
+
+def sanitize_wallet_address(address):
+    """Sanitize and validate wallet address"""
+    # Remove any whitespace
+    address = address.strip()
+    
+    # Check if it's a valid Cardano address format
+    if not address.startswith('addr1'):
+        raise ValueError("Invalid Cardano address format")
+        
+    # Check length (Cardano addresses are ~100 chars)
+    if len(address) < 90 or len(address) > 110:
+        raise ValueError("Invalid Cardano address length")
+        
+    # Only allow alphanumeric characters
+    if not address.isalnum():
+        raise ValueError("Address contains invalid characters")
+        
+    return address
+
+def get_request_id():
+    """Generate a unique request ID"""
+    return str(uuid.uuid4())[:8]
+
+def register_command():
+    """Decorator for registering slash commands"""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(self, ctx, *args, **kwargs):
+            request_id = get_request_id()
+            logger.info(f"[{request_id}] Command {func.__name__} called by {ctx.author}")
+            try:
+                return await func(self, ctx, *args, **kwargs)
+            except Exception as e:
+                logger.error(f"[{request_id}] Error in command {func.__name__}: {e}")
+                await ctx.send("❌ An error occurred. Please try again later.")
+        return wrapper
+    return decorator
 
 class WalletModal(discord.ui.Modal, title='Add Wallet'):
     def __init__(self, bot):
@@ -99,6 +137,17 @@ class WalletModal(discord.ui.Modal, title='Add Wallet'):
             return
 
         wallet_address = self.wallet.value.strip()
+        try:
+            wallet_address = sanitize_wallet_address(wallet_address)
+        except ValueError as e:
+            embed = discord.Embed(
+                title="❌ Error",
+                description=f"Invalid wallet address: {str(e)}",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed)
+            return
+
         try:
             with sqlite3.connect(DATABASE_NAME) as conn:
                 cursor = conn.cursor()
@@ -180,14 +229,19 @@ class WalletBud(commands.Bot):
             intents=intents
         )
         
+        # Initialize database connection
+        self.conn = sqlite3.connect(DATABASE_NAME)
+        self.cursor = self.conn.cursor()
+        init_db(self.conn)
+        
+        # Initialize locks for task management
+        self.wallet_task_lock = asyncio.Lock()
+        self.processing_wallets = False
+        
         # Initialize core components
         self.blockfrost_client = None
-        self.processing_wallets = False
         self.monitoring_paused = False
         
-        # Initialize database on startup
-        init_db()
-
     async def setup_hook(self):
         """Initialize the bot's command tree and sync commands"""
         try:
@@ -301,134 +355,238 @@ class WalletBud(commands.Bot):
         """Global error handler for events"""
         logger.error(f'Error in {event_method}:', exc_info=True)
 
-    @tasks.loop(minutes=WALLET_CHECK_INTERVAL)
-    async def check_wallets(self):
-        """Check all active wallets for new transactions"""
-        if self.monitoring_paused:
-            logger.info("Wallet monitoring is paused")
-            return
-
-        if self.processing_wallets:
-            logger.info("Already processing wallets, skipping this iteration")
-            return
-
-        try:
-            self.processing_wallets = True
-            logger.info("Starting wallet check cycle...")
-            
-            # Get all active wallets in one connection
-            with sqlite3.connect(DATABASE_NAME) as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT w.address, w.discord_id, w.last_yummi_check 
-                    FROM wallets w 
-                    WHERE w.is_active = TRUE
-                    ORDER BY w.last_yummi_check ASC
-                ''')
-                wallets = cursor.fetchall()
-
-            if not wallets:
-                logger.info("No active wallets to check")
-                return
-
-            logger.info(f"Checking {len(wallets)} wallets")
-            
-            for wallet_address, discord_id, last_yummi_check in wallets:
-                try:
-                    # Rate limit between wallet checks
-                    await asyncio.sleep(1)  # 1 second between wallets to avoid rate limits
-                    
-                    # Check YUMMI balance if needed
-                    if not last_yummi_check or \
-                       datetime.utcnow() - datetime.fromisoformat(last_yummi_check) > timedelta(hours=YUMMI_CHECK_INTERVAL):
-                        
-                        logger.info(f"Checking YUMMI balance for wallet {wallet_address}")
-                        has_tokens, message = await self.check_yummi_balance(wallet_address)
-                        
-                        # Update in a single transaction
-                        with sqlite3.connect(DATABASE_NAME) as conn:
-                            cursor = conn.cursor()
-                            cursor.execute('BEGIN TRANSACTION')
-                            try:
-                                # Update last check time
-                                cursor.execute(
-                                    'UPDATE wallets SET last_yummi_check = ? WHERE address = ? AND discord_id = ?',
-                                    (datetime.utcnow().isoformat(), wallet_address, discord_id)
-                                )
-                                
-                                # Deactivate if needed
-                                if not has_tokens:
-                                    cursor.execute(
-                                        'UPDATE wallets SET is_active = FALSE WHERE address = ? AND discord_id = ?',
-                                        (wallet_address, discord_id)
-                                    )
-                                    conn.commit()
-                                    
-                                    # Notify user about deactivation
-                                    try:
-                                        user = await self.fetch_user(int(discord_id))
-                                        if user:
-                                            embed = discord.Embed(
-                                                title="❌ Wallet Deactivated",
-                                                description=f"Wallet `{wallet_address}` has been deactivated: {message}",
-                                                color=discord.Color.red()
-                                            )
-                                            await user.send(embed=embed)
-                                    except Exception as e:
-                                        logger.error(f"Error notifying user {discord_id} about deactivation: {e}")
-                                    continue
-                                    
-                                conn.commit()
-                            except Exception as e:
-                                conn.rollback()
-                                logger.error(f"Error updating wallet status: {e}")
-                                continue
-
-                    # Check transactions if wallet is still active
-                    await self.check_wallet_transactions(wallet_address, discord_id)
-                    
-                except Exception as e:
-                    logger.error(f"Error processing wallet {wallet_address}: {e}")
-                    
-                # Rate limit between wallets
-                await asyncio.sleep(1)
-
-        except Exception as e:
-            logger.error(f"Error in wallet check task: {e}")
-        finally:
-            self.processing_wallets = False
-
     async def rate_limited_request(self, method, **kwargs):
-        """Make a rate-limited request to Blockfrost API"""
+        """Handle rate limiting for Blockfrost API requests"""
         max_retries = 3
-        base_delay = 1.0  # seconds
-        
+        base_delay = 1.0
+
         for attempt in range(max_retries):
             try:
-                # Add proper headers for manual requests
-                if 'headers' not in kwargs:
-                    kwargs['headers'] = {
-                        'project_id': os.getenv('BLOCKFROST_API_KEY'),
-                        'Content-Type': 'application/json'
-                    }
-                
                 response = await method(**kwargs)
                 return response
-                
             except Exception as e:
-                logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
-                
                 if "rate limit" in str(e).lower():
-                    # Use exponential backoff for rate limits
                     delay = base_delay * (2 ** attempt)
-                    logger.info(f"Rate limit hit, waiting {delay}s before retry")
+                    logger.info(f"Rate limit hit, retrying in {delay:.1f}s...")
                     await asyncio.sleep(delay)
                 elif attempt < max_retries - 1:
                     await asyncio.sleep(base_delay)
                 else:
                     raise
-        
-        raise Exception(f"Failed after {max_retries} retries")
+
+    async def check_yummi_balance(self, wallet_address):
+        """Check YUMMI token balance"""
+        request_id = get_request_id()
+        try:
+            logger.info(f"[{request_id}] Checking YUMMI balance for wallet: {wallet_address}")
+            logger.info(f"[{request_id}] Looking for YUMMI policy ID: {YUMMI_POLICY_ID}")
+            
+            try:
+                # Get wallet's total balance and assets using rate-limited request
+                address_info = await self.rate_limited_request(
+                    self.blockfrost_client.address_total,
+                    address=wallet_address
+                )
+                logger.info(f"[{request_id}] Received address info: {address_info}")
+                
+                if not address_info:
+                    logger.warning(f"[{request_id}] No address info found for {wallet_address}")
+                    return False, "Wallet not found on the blockchain. Please check:\n1. The wallet address is correct\n2. The wallet has been used at least once\n3. The Cardano network is not experiencing issues"
+                
+                # Find YUMMI token balance
+                yummi_balance = 0
+                if hasattr(address_info, 'amount'):
+                    logger.info(f"[{request_id}] Found {len(address_info.amount)} assets in wallet")
+                    for asset in address_info.amount:
+                        # Log each asset for debugging
+                        logger.info(f"[{request_id}] Checking asset: {asset.unit} with quantity {asset.quantity}")
+                        
+                        # Extract policy ID and asset name from unit
+                        policy_id = asset.unit[:56]  # First 56 chars are policy ID
+                        asset_name_hex = asset.unit[56:]  # Rest is asset name in hex
+                        logger.info(f"[{request_id}] Policy ID: {policy_id}, Asset Name Hex: {asset_name_hex}")
+                        
+                        # Check if asset unit starts with YUMMI policy ID and contains "yummi" in hex
+                        if policy_id == YUMMI_POLICY_ID:
+                            logger.info(f"[{request_id}] Found matching policy ID!")
+                            if "79756d6d69" in asset_name_hex.lower():  # "yummi" in hex
+                                logger.info(f"[{request_id}] Found matching asset name!")
+                                yummi_balance = int(asset.quantity)
+                                logger.info(f"[{request_id}] Found YUMMI balance: {yummi_balance}")
+                                break
+                            else:
+                                logger.info(f"[{request_id}] Policy ID matches but asset name does not: {asset_name_hex}")
+                        else:
+                            logger.debug(f"[{request_id}] Policy ID does not match: {policy_id}")
+                
+                logger.info(f"[{request_id}] Final YUMMI balance: {yummi_balance}")
+                
+                # Check if balance meets requirement
+                if yummi_balance < REQUIRED_YUMMI_TOKENS:
+                    return False, (
+                        f"Insufficient YUMMI balance. Required: {REQUIRED_YUMMI_TOKENS:,}, Current: {yummi_balance:,}\n"
+                        "To get more YUMMI tokens:\n"
+                        "1. Visit the YUMMI token swap page: https://app.minswap.org\n"
+                        "2. Search for YUMMI token using policy ID\n"
+                        f"3. Swap ADA for at least {REQUIRED_YUMMI_TOKENS:,} YUMMI tokens"
+                    )
+                
+                return True, yummi_balance
+                
+            except Exception as e:
+                logger.error(f"[{request_id}] Error fetching address info: {str(e)}")
+                if "not found" in str(e).lower():
+                    return False, (
+                        "Wallet not found on the blockchain. Please check:\n"
+                        "1. The wallet address is correct\n"
+                        "2. The wallet has been used at least once\n"
+                        "3. The Cardano network is not experiencing issues"
+                    )
+                raise
+            
+        except Exception as e:
+            error_msg = (
+                "Failed to check YUMMI balance. Please try:\n"
+                "1. Wait a few minutes and try again\n"
+                "2. Check if the Cardano network is experiencing issues\n"
+                "3. If the problem persists, contact support"
+            )
+            logger.error(f"[{request_id}] {str(e)}")
+            return False, error_msg
+
+    @tasks.loop(minutes=WALLET_CHECK_INTERVAL)
+    async def check_wallets(self):
+        """Check all active wallets for new transactions"""
+        if self.processing_wallets:
+            logger.info("Previous wallet check still running, skipping...")
+            return
+            
+        try:
+            async with self.wallet_task_lock:
+                self.processing_wallets = True
+                
+                # Get all active wallets
+                self.cursor.execute("SELECT address, discord_id FROM wallets")
+                wallets = self.cursor.fetchall()
+                
+                if not wallets:
+                    logger.info("No wallets to check")
+                    return
+                    
+                logger.info(f"Checking {len(wallets)} wallets for new transactions...")
+                
+                # Process wallets in batches of 10
+                BATCH_SIZE = 10
+                for i in range(0, len(wallets), BATCH_SIZE):
+                    batch = wallets[i:i + BATCH_SIZE]
+                    tasks = []
+                    
+                    # Create tasks for each wallet in batch
+                    for wallet_address, discord_id in batch:
+                        task = asyncio.create_task(
+                            self.check_wallet_transactions(wallet_address, discord_id)
+                        )
+                        tasks.append(task)
+                    
+                    # Wait for all tasks in batch to complete
+                    try:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    except Exception as e:
+                        logger.error(f"Error processing batch: {str(e)}")
+                    
+                    # Add small delay between batches to avoid rate limits
+                    await asyncio.sleep(1)
+                    
+        except Exception as e:
+            logger.error(f"Error in check_wallets task: {str(e)}")
+        finally:
+            self.processing_wallets = False
+
+    async def check_wallet_transactions(self, wallet_address, discord_id):
+        """Check for new transactions in wallet"""
+        request_id = get_request_id()
+        try:
+            # Get transactions using rate-limited request
+            transactions = await self.rate_limited_request(
+                self.blockfrost_client.address_transactions,
+                address=wallet_address
+            )
+            
+            if not transactions:
+                logger.info(f"[{request_id}] No transactions found for {wallet_address}")
+                return
+                
+            # Process new transactions
+            new_transactions = []
+            for tx in transactions:
+                # Skip if we've already seen this transaction
+                self.cursor.execute(
+                    'SELECT last_tx_hash FROM wallets WHERE address = ? AND discord_id = ?', 
+                    (wallet_address, discord_id)
+                )
+                result = self.cursor.fetchone()
+                if result and tx.hash == result[0]:
+                    break
+                    
+                try:
+                    # Get transaction details using rate-limited request
+                    tx_details = await self.rate_limited_request(
+                        self.blockfrost_client.transaction,
+                        hash=tx.hash
+                    )
+                    
+                    if not tx_details:
+                        logger.warning(f"[{request_id}] No details found for transaction {tx.hash}")
+                        continue
+                        
+                    new_transactions.append({
+                        'hash': tx.hash,
+                        'amount': tx_details.output_amount[0].quantity if tx_details.output_amount else 0,
+                        'block': tx.block_height,
+                        'time': tx.block_time,
+                        'explorer_url': f"https://cardanoscan.io/transaction/{tx.hash}"
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"[{request_id}] Error getting transaction details for {tx.hash}: {e}")
+                    continue
+                    
+            # Notify about new transactions
+            if new_transactions:
+                try:
+                    user = await self.fetch_user(int(discord_id))
+                    if user:
+                        for tx in new_transactions:
+                            embed = discord.Embed(
+                                title="🔔 New Transaction",
+                                description=f"New transaction in wallet `{wallet_address}`",
+                                color=discord.Color.blue(),
+                                url=tx['explorer_url']  # Make title clickable
+                            )
+                            embed.add_field(name="Hash", value=f"[{tx['hash'][:8]}...{tx['hash'][-8:]}]({tx['explorer_url']})", inline=False)
+                            embed.add_field(name="Amount", value=f"{tx['amount']:,} lovelace", inline=True)
+                            embed.add_field(name="Block", value=f"[{tx['block']}](https://cardanoscan.io/block/{tx['block']})", inline=True)
+                            embed.add_field(name="Time", value=datetime.fromtimestamp(tx['time']).strftime('%Y-%m-%d %H:%M:%S'), inline=True)
+                            embed.add_field(
+                                name="View Transaction", 
+                                value=f"[View on CardanoScan]({tx['explorer_url']})\n[View on Pool.pm](https://pool.pm/tx/{tx['hash']})", 
+                                inline=False
+                            )
+                            
+                            await user.send(embed=embed)
+                except Exception as e:
+                    logger.error(f"[{request_id}] Error notifying user {discord_id} about transaction: {e}")
+                    
+            # Update last checked transaction
+            if new_transactions:
+                self.cursor.execute(
+                    'UPDATE wallets SET last_tx_hash = ? WHERE address = ? AND discord_id = ?',
+                    (new_transactions[0]['hash'], wallet_address, discord_id)
+                )
+                self.conn.commit()
+                
+        except Exception as e:
+            logger.error(f"[{request_id}] Error checking transactions for wallet {wallet_address}: {e}")
 
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
@@ -469,148 +627,81 @@ class WalletBud(commands.Bot):
             logger.error(f"Failed to initialize Blockfrost API: {str(e)}")
             return False
 
-    async def check_yummi_balance(self, wallet_address):
-        """Check YUMMI token balance"""
+    @commands.command(name='addwallet')
+    @register_command()
+    @commands.cooldown(1, 5.0)
+    async def add_wallet(self, ctx, wallet_address: str):
+        """Add a wallet to monitor"""
         try:
-            logger.info(f"Checking YUMMI balance for wallet: {wallet_address}")
-            logger.info(f"Looking for YUMMI policy ID: {YUMMI_POLICY_ID}")
-            
+            # Sanitize and validate the wallet address
             try:
-                # Get wallet's total balance and assets using correct method
-                address_info = self.blockfrost_client.address_total(address=wallet_address)
-                logger.info(f"Received address info: {address_info}")
+                wallet_address = sanitize_wallet_address(wallet_address)
+            except ValueError as e:
+                await ctx.send(f"❌ Invalid wallet address: {str(e)}")
+                return
                 
-                if not address_info:
-                    logger.warning(f"No address info found for {wallet_address}")
-                    return True, 0
-                
-                # Find YUMMI token balance
-                yummi_balance = 0
-                if hasattr(address_info, 'amount'):
-                    logger.info(f"Found {len(address_info.amount)} assets in wallet")
-                    for asset in address_info.amount:
-                        # Log each asset for debugging
-                        logger.info(f"Checking asset: {asset.unit} with quantity {asset.quantity}")
-                        # Check if asset unit starts with YUMMI policy ID and contains YUMMI
-                        if asset.unit.startswith(YUMMI_POLICY_ID) and "59554d4d49" in asset.unit.lower():  # "YUMMI" in hex
-                            yummi_balance = int(asset.quantity)
-                            logger.info(f"Found YUMMI balance: {yummi_balance}")
-                            break
-                        else:
-                            logger.debug(f"Asset {asset.unit} does not match YUMMI token")
-                
-                logger.info(f"Final YUMMI balance: {yummi_balance}")
-                
-                # Check if balance meets requirement
-                if yummi_balance < REQUIRED_YUMMI_TOKENS:
-                    return False, f"Insufficient YUMMI balance. Required: {REQUIRED_YUMMI_TOKENS:,}, Current: {yummi_balance:,}"
-                
-                return True, yummi_balance
-                
-            except Exception as e:
-                logger.error(f"Error fetching address info: {str(e)}")
-                if "not found" in str(e).lower():
-                    return False, "Wallet not found on the blockchain. Please check the address and try again."
-                raise
+            discord_id = str(ctx.author.id)
             
-        except Exception as e:
-            error_msg = f"Failed to check YUMMI balance: {str(e)}"
-            logger.error(error_msg)
-            return False, "Failed to check YUMMI balance. Please try again later."
-
-    async def check_wallet_transactions(self, wallet_address, discord_id):
-        """Check for new transactions in wallet"""
-        try:
-            # Get wallet transactions with proper filters
-            transactions = self.blockfrost_client.address_transactions(
-                address=wallet_address,
-                order='desc',  # Most recent first
-                count=10  # Limit to 10 transactions
+            # Check YUMMI balance first
+            has_tokens, message = await self.check_yummi_balance(wallet_address)
+            if not has_tokens:
+                await ctx.send(f"❌ {message}")
+                return
+                
+            # Use parameterized query to prevent SQL injection
+            self.cursor.execute(
+                'INSERT OR REPLACE INTO wallets (address, discord_id, is_active, last_yummi_check) VALUES (?, ?, TRUE, ?)',
+                (wallet_address, discord_id, datetime.utcnow().isoformat())
             )
+            self.conn.commit()
             
-            if not transactions:
-                logger.info(f"No transactions found for wallet {wallet_address}")
-                return []
-                
-            new_transactions = []
-            for tx in transactions:
-                # Skip if we've already seen this transaction
-                with sqlite3.connect(DATABASE_NAME) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('SELECT last_tx_hash FROM wallets WHERE address = ? AND discord_id = ?', 
-                                 (wallet_address, discord_id))
-                    result = cursor.fetchone()
-                    if result and tx.hash == result[0]:
-                        break
-                    
-                try:
-                    # Get transaction details using correct endpoint
-                    tx_details = self.blockfrost_client.transaction_utxos(hash=tx.hash)
-                    
-                    # Calculate total ADA and assets received
-                    received_ada = 0
-                    received_assets = {}
-                    
-                    for output in tx_details:
-                        if output.address == wallet_address:
-                            # Add ADA amount (in lovelace)
-                            received_ada += int(output.amount[0].quantity) / 1_000_000
-                            
-                            # Add other assets
-                            if len(output.amount) > 1:  # If there are additional assets
-                                for asset in output.amount[1:]:
-                                    asset_name = asset.unit
-                                    quantity = int(asset.quantity)
-                                    if asset_name in received_assets:
-                                        received_assets[asset_name] += quantity
-                                    else:
-                                        received_assets[asset_name] = quantity
-                    
-                    # Only notify if wallet received something
-                    if received_ada > 0 or received_assets:
-                        # Create notification message
-                        message = [f"💰 New transaction for wallet `{wallet_address[:8]}...`!"]
-                        
-                        if received_ada > 0:
-                            message.append(f"• Received: {received_ada:.6f} ADA")
-                        
-                        for asset_id, quantity in received_assets.items():
-                            if asset_id == YUMMI_POLICY_ID:
-                                message.append(f"• Received: {quantity:,} YUMMI")
-                            else:
-                                message.append(f"• Received: {quantity:,} of asset {asset_id}")
-                        
-                        message.append(f"\nTransaction: `{tx.hash}`")
-                        
-                        # Send notification
-                        user = await self.fetch_user(int(discord_id))
-                        if user:
-                            await user.send("\n".join(message))
-                    
-                except Exception as e:
-                    logger.error(f"Error processing transaction {tx.hash}: {e}")
-                    continue
-                
-                # Update last checked transaction
-                with sqlite3.connect(DATABASE_NAME) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        'UPDATE wallets SET last_tx_hash = ? WHERE address = ? AND discord_id = ?',
-                        (tx.hash, wallet_address, discord_id)
-                    )
-                    conn.commit()
-                    
+            await ctx.send(f"✅ Wallet `{wallet_address}` added successfully! YUMMI balance: {message:,}")
+            
         except Exception as e:
-            logger.error(f"Error checking transactions for wallet {wallet_address}: {e}")
+            logger.error(f"Error adding wallet: {e}")
+            await ctx.send("❌ Failed to add wallet. Please try again later.")
+
+    @commands.command(name='removewallet')
+    @register_command()
+    @commands.cooldown(1, 5.0)
+    async def remove_wallet(self, ctx, wallet_address: str):
+        """Remove a wallet from monitoring"""
+        try:
+            # Sanitize and validate the wallet address
+            try:
+                wallet_address = sanitize_wallet_address(wallet_address)
+            except ValueError as e:
+                await ctx.send(f"❌ Invalid wallet address: {str(e)}")
+                return
+                
+            discord_id = str(ctx.author.id)
+            
+            # Use parameterized query to prevent SQL injection
+            self.cursor.execute(
+                'DELETE FROM wallets WHERE address = ? AND discord_id = ?',
+                (wallet_address, discord_id)
+            )
+            self.conn.commit()
+            
+            if self.cursor.rowcount > 0:
+                await ctx.send(f"✅ Wallet `{wallet_address}` removed successfully!")
+            else:
+                await ctx.send(f"❌ Wallet `{wallet_address}` not found or not owned by you.")
+            
+        except Exception as e:
+            logger.error(f"Error removing wallet: {e}")
+            await ctx.send("❌ Failed to remove wallet. Please try again later.")
 
 if __name__ == "__main__":
     try:
         logger.info("Starting WalletBud bot...")
         bot = WalletBud()
-        bot.run(DISCORD_TOKEN, log_handler=None)
-    except KeyboardInterrupt:
-        logger.info("Bot shutdown requested...")
+        bot.run(DISCORD_TOKEN)
     except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
+        logger.error(f"Bot crashed: {e}")
     finally:
+        # Cleanup resources
+        if hasattr(bot, 'conn'):
+            bot.conn.close()
+            logger.info("Database connection closed")
         logger.info("Bot shutdown complete")
