@@ -108,8 +108,30 @@ class WalletBud(commands.Bot):
             self.conn = sqlite3.connect('wallets.db')
             self.conn.row_factory = sqlite3.Row
             self.cursor = self.conn.cursor()
+            
+            # Initialize database schema
+            self.cursor.executescript('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    discord_id TEXT UNIQUE NOT NULL
+                );
+                
+                CREATE TABLE IF NOT EXISTS wallets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    address TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_checked TIMESTAMP,
+                    is_active BOOLEAN DEFAULT 1,
+                    FOREIGN KEY (user_id) REFERENCES users(id),
+                    UNIQUE(address, user_id)
+                );
+            ''')
+            
+            # Set WAL journal mode for better concurrency
             self.cursor.execute("PRAGMA journal_mode=WAL")
             self.conn.commit()
+            
             logger.info("Database connection established")
         except Exception as e:
             logger.error(f"Failed to initialize database: {str(e)}")
@@ -124,7 +146,7 @@ class WalletBud(commands.Bot):
         
         # Register commands only once during initialization
         self.setup_commands()
-        
+
     def setup_commands(self):
         """Set up bot commands using app_commands"""
         try:
@@ -402,6 +424,175 @@ class WalletBud(commands.Bot):
             
         except Exception as e:
             logger.error(f"Failed to send admin notification: {str(e)}")
+
+    async def add_wallet_command(self, interaction: discord.Interaction, address: str):
+        """Handle the addwallet command"""
+        try:
+            if not address:
+                await interaction.response.send_message("Please provide a wallet address.", ephemeral=True)
+                return
+                
+            # Check if wallet exists and get YUMMI balance
+            success, result = await self.check_yummi_balance(address)
+            
+            if success:
+                try:
+                    # Add user if not exists
+                    self.cursor.execute(
+                        'INSERT OR IGNORE INTO users (discord_id) VALUES (?)',
+                        (str(interaction.user.id),)
+                    )
+                    
+                    # Get user id
+                    self.cursor.execute(
+                        'SELECT id FROM users WHERE discord_id = ?',
+                        (str(interaction.user.id),)
+                    )
+                    user_id = self.cursor.fetchone()['id']
+                    
+                    # Add wallet
+                    self.cursor.execute(
+                        'INSERT INTO wallets (address, user_id) VALUES (?, ?)',
+                        (address, user_id)
+                    )
+                    self.conn.commit()
+                    
+                    embed = discord.Embed(
+                        title="✅ Wallet Added Successfully!",
+                        color=discord.Color.green(),
+                        timestamp=datetime.utcnow()
+                    )
+                    embed.add_field(name="Address", value=f"`{address}`", inline=False)
+                    embed.add_field(name="YUMMI Balance", value=f"{result:,}", inline=False)
+                    await interaction.response.send_message(embed=embed)
+                    logger.info(f"Wallet {address} added for user {interaction.user.id}")
+                    
+                except sqlite3.IntegrityError:
+                    embed = discord.Embed(
+                        title="❌ Wallet Already Monitored",
+                        description="This wallet is already being monitored!",
+                        color=discord.Color.red()
+                    )
+                    await interaction.response.send_message(embed=embed)
+                    logger.warning(f"Duplicate wallet add attempt: {address}")
+            else:
+                embed = discord.Embed(
+                    title="❌ Error Adding Wallet",
+                    description=result,
+                    color=discord.Color.red()
+                )
+                await interaction.response.send_message(embed=embed)
+                logger.warning(f"Add wallet failed - {result}")
+                
+        except Exception as e:
+            logger.error(f"Error in addwallet command: {str(e)}")
+            embed = discord.Embed(
+                title="❌ Error",
+                description="An error occurred while processing your request.",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed)
+
+    async def remove_wallet_command(self, interaction: discord.Interaction, address: str):
+        """Handle the removewallet command"""
+        try:
+            if not address:
+                await interaction.response.send_message("Please provide a wallet address.", ephemeral=True)
+                return
+            
+            # Get user id
+            self.cursor.execute(
+                'SELECT id FROM users WHERE discord_id = ?',
+                (str(interaction.user.id),)
+            )
+            user = self.cursor.fetchone()
+            
+            if not user:
+                await interaction.response.send_message("You don't have any wallets registered.", ephemeral=True)
+                return
+            
+            # Remove wallet
+            self.cursor.execute(
+                'DELETE FROM wallets WHERE address = ? AND user_id = ?',
+                (address, user['id'])
+            )
+            self.conn.commit()
+            
+            if self.cursor.rowcount > 0:
+                embed = discord.Embed(
+                    title="✅ Wallet Removed",
+                    description=f"Successfully removed wallet: `{address}`",
+                    color=discord.Color.green()
+                )
+                await interaction.response.send_message(embed=embed)
+                logger.info(f"Wallet {address} removed for user {interaction.user.id}")
+            else:
+                embed = discord.Embed(
+                    title="❌ Wallet Not Found",
+                    description="This wallet is not in your monitoring list.",
+                    color=discord.Color.red()
+                )
+                await interaction.response.send_message(embed=embed)
+                
+        except Exception as e:
+            logger.error(f"Error in removewallet command: {str(e)}")
+            embed = discord.Embed(
+                title="❌ Error",
+                description="An error occurred while processing your request.",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed)
+
+    async def list_wallets_command(self, interaction: discord.Interaction):
+        """Handle the listwallets command"""
+        try:
+            # Get user's wallets
+            self.cursor.execute('''
+                SELECT w.address, w.last_checked, w.is_active
+                FROM wallets w
+                JOIN users u ON w.user_id = u.id
+                WHERE u.discord_id = ?
+                ORDER BY w.created_at DESC
+            ''', (str(interaction.user.id),))
+            
+            wallets = self.cursor.fetchall()
+            
+            if not wallets:
+                embed = discord.Embed(
+                    title="No Wallets Found",
+                    description="You don't have any wallets being monitored.",
+                    color=discord.Color.blue()
+                )
+                await interaction.response.send_message(embed=embed)
+                return
+            
+            # Format wallet list
+            embed = discord.Embed(
+                title="Your Monitored Wallets",
+                color=discord.Color.blue(),
+                timestamp=datetime.utcnow()
+            )
+            
+            for wallet in wallets:
+                status = "🟢 Active" if wallet['is_active'] else "🔴 Inactive"
+                last_checked = wallet['last_checked'] or "Never"
+                embed.add_field(
+                    name=f"Wallet: {wallet['address'][:8]}...{wallet['address'][-8:]}",
+                    value=f"Status: {status}\nLast checked: {last_checked}",
+                    inline=False
+                )
+            
+            await interaction.response.send_message(embed=embed)
+            logger.info(f"Listed {len(wallets)} wallets for user {interaction.user.id}")
+            
+        except Exception as e:
+            logger.error(f"Error in listwallets command: {str(e)}")
+            embed = discord.Embed(
+                title="❌ Error",
+                description="An error occurred while retrieving your wallets.",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed)
 
     @tasks.loop(minutes=WALLET_CHECK_INTERVAL)
     async def check_wallets(self):
