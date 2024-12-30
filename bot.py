@@ -27,17 +27,13 @@ ERROR_MESSAGES = {
 }
 
 def dm_only():
-    """Decorator to ensure command is only used in DMs"""
+    """Ensure command is only used in DMs"""
     async def predicate(interaction: discord.Interaction):
-        if not isinstance(interaction.channel, discord.DMChannel):
-            await interaction.response.send_message(ERROR_MESSAGES['dm_only'], ephemeral=True)
+        if interaction.guild is not None:
+            await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
             return False
         return True
     return app_commands.check(predicate)
-
-def cooldown_5s():
-    """5 second cooldown between commands"""
-    return commands.cooldown(1, 5.0)
 
 def has_blockfrost():
     """Ensure Blockfrost API is available"""
@@ -56,6 +52,10 @@ def not_monitoring_paused():
             return False
         return True
     return app_commands.check(predicate)
+
+def cooldown_5s():
+    """5 second cooldown between commands"""
+    return commands.cooldown(1, 5.0)
 
 def init_db():
     """Initialize SQLite database"""
@@ -93,8 +93,8 @@ class WalletModal(discord.ui.Modal, title='Add Wallet'):
 
     async def on_submit(self, interaction: discord.Interaction):
         """Handle wallet address submission"""
-        if not isinstance(interaction.channel, discord.DMChannel):
-            await interaction.response.send_message(ERROR_MESSAGES['dm_only'], ephemeral=True)
+        if interaction.guild is not None:
+            await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
             return
 
         wallet_address = self.wallet.value.strip()
@@ -217,89 +217,69 @@ class WalletBud(commands.Bot):
             name="addwallet",
             description="Add a Cardano wallet to monitor"
         )
-        @app_commands.check(dm_only())
-        @commands.cooldown(1, 5.0)
+        @dm_only()
+        @has_blockfrost()
+        @not_monitoring_paused()
         async def add_wallet_command(interaction: discord.Interaction):
-            if not interaction.guild:  # Ensure we're in DMs
-                modal = WalletModal(self)
-                await interaction.response.send_modal(modal)
-            else:
-                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+            modal = WalletModal(self)
+            await interaction.response.send_modal(modal)
 
         @self.tree.command(
             name="removewallet",
             description="Remove a wallet from monitoring"
         )
-        @app_commands.check(dm_only())
-        @commands.cooldown(1, 5.0)
+        @dm_only()
         async def remove_wallet(interaction: discord.Interaction, wallet_address: str):
-            if not interaction.guild:  # Ensure we're in DMs
-                with sqlite3.connect(DATABASE_NAME) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('DELETE FROM wallets WHERE address = ? AND discord_id = ?', 
-                                (wallet_address, interaction.user.id))
-                    if cursor.rowcount > 0:
-                        await interaction.response.send_message(f"✅ Wallet `{wallet_address}` removed from monitoring.")
-                    else:
-                        await interaction.response.send_message("❌ Wallet not found in your monitored wallets.", ephemeral=True)
-            else:
-                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+            with sqlite3.connect(DATABASE_NAME) as conn:
+                cursor = conn.cursor()
+                cursor.execute('DELETE FROM wallets WHERE address = ? AND discord_id = ?', 
+                            (wallet_address, interaction.user.id))
+                if cursor.rowcount > 0:
+                    await interaction.response.send_message(f"✅ Wallet `{wallet_address}` removed from monitoring.")
+                else:
+                    await interaction.response.send_message("❌ Wallet not found in your monitored wallets.", ephemeral=True)
 
         @self.tree.command(
             name="listwallets",
             description="List all your monitored wallets"
         )
-        @app_commands.check(dm_only())
-        @commands.cooldown(1, 5.0)
+        @dm_only()
         async def list_wallets(interaction: discord.Interaction):
-            if not interaction.guild:  # Ensure we're in DMs
-                with sqlite3.connect(DATABASE_NAME) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('SELECT address FROM wallets WHERE discord_id = ?', (interaction.user.id,))
-                    wallets = cursor.fetchall()
-                    
-                if wallets:
-                    wallet_list = "\n".join([f"• `{w[0]}`" for w in wallets])
-                    await interaction.response.send_message(f"Your monitored wallets:\n{wallet_list}")
-                else:
-                    await interaction.response.send_message("You don't have any wallets being monitored.", ephemeral=True)
+            with sqlite3.connect(DATABASE_NAME) as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT address FROM wallets WHERE discord_id = ?', (interaction.user.id,))
+                wallets = cursor.fetchall()
+                
+            if wallets:
+                wallet_list = "\n".join([f"• `{w[0]}`" for w in wallets])
+                await interaction.response.send_message(f"Your monitored wallets:\n{wallet_list}")
             else:
-                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                await interaction.response.send_message("You don't have any wallets being monitored.", ephemeral=True)
 
         @self.tree.command(
             name="help",
             description="Show bot help and commands"
         )
-        @app_commands.check(dm_only())
-        @commands.cooldown(1, 5.0)
         async def help_command(interaction: discord.Interaction):
-            if not interaction.guild:  # Ensure we're in DMs
-                help_text = (
-                    "🤖 **WalletBud Commands**\n\n"
-                    "`/addwallet` - Add a Cardano wallet to monitor\n"
-                    "`/removewallet` - Remove a wallet from monitoring\n"
-                    "`/listwallets` - List all your monitored wallets\n"
-                    "`/help` - Show this help message\n\n"
-                    "ℹ️ All commands must be used in DMs for security."
-                )
-                await interaction.response.send_message(help_text)
-            else:
-                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+            help_text = (
+                "🤖 **WalletBud Commands**\n\n"
+                "`/addwallet` - Add a Cardano wallet to monitor (DM only)\n"
+                "`/removewallet` - Remove a wallet from monitoring (DM only)\n"
+                "`/listwallets` - List all your monitored wallets (DM only)\n"
+                "`/help` - Show this help message\n\n"
+                "ℹ️ All commands must be used in DMs for security."
+            )
+            await interaction.response.send_message(help_text)
 
         @self.tree.command(
             name="health",
             description="Check bot health status"
         )
-        @app_commands.check(dm_only())
-        @commands.cooldown(1, 5.0)
         async def health_check(interaction: discord.Interaction):
-            if not interaction.guild:  # Ensure we're in DMs
-                status = "✅ Bot is running\n"
-                status += f"🔄 Blockfrost API: {'✅ Connected' if self.blockfrost_client else '❌ Not connected'}\n"
-                status += f"📊 Monitoring Status: {'⏸️ Paused' if self.monitoring_paused else '▶️ Active'}"
-                await interaction.response.send_message(status)
-            else:
-                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+            status = "✅ Bot is running\n"
+            status += f"🔄 Blockfrost API: {'✅ Connected' if self.blockfrost_client else '❌ Not connected'}\n"
+            status += f"📊 Monitoring Status: {'⏸️ Paused' if self.monitoring_paused else '▶️ Active'}"
+            await interaction.response.send_message(status)
 
     async def on_ready(self):
         """Called when the bot is ready"""
