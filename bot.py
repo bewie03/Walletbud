@@ -467,6 +467,9 @@ class WalletBud(commands.Bot):
             if not BLOCKFROST_API_KEY:
                 logger.error("BLOCKFROST_API_KEY not set")
                 return False
+                
+            # Log first few characters of API key for debugging
+            logger.info(f"Using API key starting with: {BLOCKFROST_API_KEY[:8]}...")
             
             # Create client with correct base URL
             self.blockfrost_client = BlockFrostApi(
@@ -474,24 +477,28 @@ class WalletBud(commands.Bot):
                 base_url="https://cardano-mainnet.blockfrost.io/api/v0"  # Correct mainnet URL
             )
             
-            # Test connection
+            # Test connection with health endpoint
             try:
                 logger.info("Testing Blockfrost connection...")
-                # Test with base address endpoint
-                test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self.blockfrost_client.address, test_address)
+                # Use health() endpoint which should return API health status
+                health = await loop.run_in_executor(None, self.blockfrost_client.health)
+                logger.info(f"Blockfrost health response: {health}")
                 
                 logger.info("Blockfrost connection test passed")
                 return True
                 
             except Exception as e:
                 logger.error(f"Failed to test Blockfrost connection: {str(e)}")
+                if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                    logger.error(f"Response details: {e.response.text}")
                 self.blockfrost_client = None
                 return False
             
         except Exception as e:
             logger.error(f"Failed to create Blockfrost client: {str(e)}")
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                logger.error(f"Response details: {e.response.text}")
             self.blockfrost_client = None
             return False
 
