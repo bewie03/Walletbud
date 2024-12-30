@@ -10,32 +10,27 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Get database URL from environment variable (Heroku provides this)
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///walletbud.db')
-if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
+DATABASE_URL = os.getenv('DATABASE_URL')
+if not DATABASE_URL:
+    logger.error("No DATABASE_URL found in environment variables!")
+    DATABASE_URL = 'sqlite:///walletbud.db'
+    logger.info("Falling back to SQLite database")
+
+# Convert postgres:// to postgresql:// for SQLAlchemy 1.4+
+if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-    logger.info("Converted database URL to use postgresql:// scheme")
+    logger.info("Converted postgres:// to postgresql:// in DATABASE_URL")
 
-def create_db_engine(max_retries=3, retry_delay=5):
-    """Create database engine with retry logic"""
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"Attempting to connect to database (attempt {attempt + 1}/{max_retries})")
-            engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-            # Test the connection
-            engine.connect()
-            logger.info("Database connection successful")
-            return engine
-        except OperationalError as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"Database connection failed, retrying in {retry_delay} seconds... Error: {str(e)}")
-                time.sleep(retry_delay)
-            else:
-                logger.error(f"Failed to connect to database after {max_retries} attempts. Error: {str(e)}")
-                raise
-    return None
+try:
+    # Create SQLAlchemy engine and base
+    engine = create_engine(DATABASE_URL)
+    # Test the connection
+    with engine.connect() as conn:
+        logger.info("Database connection successful")
+except Exception as e:
+    logger.error(f"Failed to connect to database: {str(e)}")
+    raise
 
-# Create SQLAlchemy engine and base
-engine = create_db_engine()
 Base = declarative_base()
 Session = sessionmaker(bind=engine)
 
@@ -55,7 +50,23 @@ class Wallet(Base):
 class Database:
     def __init__(self):
         Base.metadata.create_all(engine)
-        self.session = Session()
+        self._session = None
+
+    @property
+    def session(self):
+        if self._session is None:
+            self._session = Session()
+        return self._session
+
+    def close(self):
+        """Close the database session"""
+        if self._session:
+            self._session.close()
+            self._session = None
+
+    def __del__(self):
+        """Ensure session is closed when object is destroyed"""
+        self.close()
 
     def add_user(self, discord_id):
         """Add a new user to the database"""
@@ -149,7 +160,3 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting last checked time: {str(e)}")
             return None
-
-    def __del__(self):
-        """Close the database session"""
-        self.session.close()

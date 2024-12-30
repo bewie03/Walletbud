@@ -12,11 +12,7 @@ import logging
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bot.log')
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -27,50 +23,118 @@ token = os.getenv('DISCORD_TOKEN')
 if not token:
     logger.error("No Discord token found! Make sure DISCORD_TOKEN is set in .env")
     exit(1)
-else:
-    logger.info("Discord token loaded successfully")
 
 # Set up intents
-intents = discord.Intents.default()
+intents = discord.Intents.all()  # Enable all intents
 intents.message_content = True
 intents.dm_messages = True
+intents.guilds = True
+intents.messages = True
 
 class WalletBud(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
-        try:
-            self.db = Database()
-            logger.info("Database initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize database: {str(e)}")
-            raise
+        self.db = Database()
 
     async def setup_hook(self):
-        try:
-            self.tree = app_commands.CommandTree(self)
-            synced = await self.tree.sync()
-            logger.info(f"Synced {len(synced)} command(s)")
-        except Exception as e:
-            logger.error(f"Error in setup_hook: {str(e)}")
-            raise
+        # Sync commands
+        await self.tree.sync()
+        logger.info("Commands synced successfully")
+
+    async def close(self):
+        """Cleanup when bot is shutting down"""
+        logger.info("Bot is shutting down...")
+        if hasattr(self, 'db'):
+            self.db.close()
+            logger.info("Database connection closed")
+        await super().close()
 
     async def on_ready(self):
-        logger.info(f'Bot {self.user} is ready and online!')
-        try:
-            # Set bot presence
-            await self.change_presence(
-                activity=discord.Activity(
-                    type=discord.ActivityType.watching,
-                    name="YUMMI wallets | DM me!"
-                )
-            )
-            logger.info("Bot presence set")
-            
-            # Start the wallet checking task
-            check_wallets.start()
+        logger.info(f'{self.user} has connected to Discord!')
+        # Start background tasks
+        if not self.check_wallets.is_running():
+            self.check_wallets.start()
             logger.info("Started wallet checking task")
+        # Set presence
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="YUMMI wallets | DM me!"
+            )
+        )
+        logger.info("Bot presence updated")
+
+    @tasks.loop(minutes=TRANSACTION_CHECK_INTERVAL)
+    async def check_wallets(self):
+        """Check all active wallets for new transactions"""
+        try:
+            logger.info("Running wallet check task...")
+            active_wallets = self.db.get_all_active_wallets()
+            logger.info(f"Found {len(active_wallets)} active wallets")
+            for wallet_address, discord_id in active_wallets:
+                await self.check_wallet_transactions(wallet_address, discord_id)
         except Exception as e:
-            logger.error(f"Error during startup: {e}")
+            logger.error(f"Error in check_wallets task: {e}")
+
+    @check_wallets.before_loop
+    async def before_check_wallets(self):
+        """Wait until the bot is ready before starting the task"""
+        await self.wait_until_ready()
+        logger.info("Bot is ready, wallet check task can start")
+
+    async def check_wallet_transactions(self, wallet_address, discord_id):
+        """Check transactions for a single wallet"""
+        try:
+            # Check YUMMI balance
+            has_balance, message = check_yummi_balance(wallet_address)
+            if not has_balance:
+                logger.info(f"Deactivating wallet {wallet_address}: {message}")
+                self.db.update_wallet_status(wallet_address, False)
+                try:
+                    user = await self.fetch_user(int(discord_id))
+                    if user:
+                        embed = discord.Embed(
+                            title="❌ Wallet Deactivated",
+                            description=message,
+                            color=discord.Color.red()
+                        )
+                        await user.send(embed=embed)
+                except Exception as e:
+                    logger.error(f"Error notifying user {discord_id}: {str(e)}")
+                return
+
+            # Check transactions
+            try:
+                txs = blockfrost_client.address_transactions(
+                    wallet_address,
+                    count=MAX_TX_HISTORY
+                )
+                
+                for tx in txs:
+                    try:
+                        tx_details = blockfrost_client.transaction(tx.tx_hash)
+                        embed = discord.Embed(
+                            title="🔔 New Transaction",
+                            color=discord.Color.blue()
+                        )
+                        embed.add_field(
+                            name="Transaction Hash",
+                            value=f"[View on Cardanoscan](https://cardanoscan.io/transaction/{tx.tx_hash})",
+                            inline=False
+                        )
+                        
+                        user = await self.fetch_user(int(discord_id))
+                        if user:
+                            await user.send(embed=embed)
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing transaction {tx.tx_hash}: {str(e)}")
+                        
+            except Exception as e:
+                logger.error(f"Error checking transactions for {wallet_address}: {str(e)}")
+                
+        except Exception as e:
+            logger.error(f"Error processing wallet {wallet_address}: {str(e)}")
 
 # Constants
 YUMMI_POLICY_ID = YUMMI_POLICY_ID
@@ -265,64 +329,6 @@ async def remove_wallet(interaction: discord.Interaction):
     except Exception as e:
         logger.error(f"Error showing wallet list: {str(e)}")
         await interaction.response.send_message("An error occurred. Please try again.")
-
-@tasks.loop(minutes=TRANSACTION_CHECK_INTERVAL)
-async def check_wallets():
-    """Check all active wallets for new transactions"""
-    active_wallets = bot.db.get_all_active_wallets()
-    
-    for wallet_address, discord_id in active_wallets:
-        try:
-            # Check YUMMI balance
-            has_balance, message = check_yummi_balance(wallet_address)
-            if not has_balance:
-                logger.info(f"Deactivating wallet {wallet_address}: {message}")
-                bot.db.update_wallet_status(wallet_address, False)
-                try:
-                    user = await bot.fetch_user(int(discord_id))
-                    if user:
-                        embed = discord.Embed(
-                            title="❌ Wallet Deactivated",
-                            description=message,
-                            color=discord.Color.red()
-                        )
-                        await user.send(embed=embed)
-                except Exception as e:
-                    logger.error(f"Error notifying user {discord_id}: {str(e)}")
-                continue
-
-            # Check transactions
-            try:
-                txs = blockfrost_client.address_transactions(
-                    wallet_address,
-                    count=MAX_TX_HISTORY
-                )
-                
-                for tx in txs:
-                    try:
-                        tx_details = blockfrost_client.transaction(tx.tx_hash)
-                        embed = discord.Embed(
-                            title="🔔 New Transaction",
-                            color=discord.Color.blue()
-                        )
-                        embed.add_field(
-                            name="Transaction Hash",
-                            value=f"[View on Cardanoscan](https://cardanoscan.io/transaction/{tx.tx_hash})",
-                            inline=False
-                        )
-                        
-                        user = await bot.fetch_user(int(discord_id))
-                        if user:
-                            await user.send(embed=embed)
-                            
-                    except Exception as e:
-                        logger.error(f"Error processing transaction {tx.tx_hash}: {str(e)}")
-                        
-            except Exception as e:
-                logger.error(f"Error checking transactions for {wallet_address}: {str(e)}")
-                
-        except Exception as e:
-            logger.error(f"Error processing wallet {wallet_address}: {str(e)}")
 
 if __name__ == "__main__":
     bot.run(token)
