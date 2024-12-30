@@ -247,29 +247,33 @@ def check_yummi_balance(wallet_address):
             wallet = blockfrost_client.address(wallet_address)
             logger.info(f"Wallet verified: {wallet_address}")
             
-            # Get address details with tokens
-            # According to docs: /addresses/{address}/total
-            wallet_details = blockfrost_client.address_total(wallet_address)
-            logger.info(f"Wallet details: {wallet_details}")
-            
             # Get specific asset details
             # According to docs: /addresses/{address}/assets
-            assets = blockfrost_client.address_assets(wallet_address)
+            assets = blockfrost_client.address_details(wallet_address)
             yummi_amount = 0
             
             # Log all assets for debugging
-            for asset in assets:
-                logger.info(f"Found asset: {asset.unit} with quantity {asset.quantity}")
-                
-                # Policy ID should be first 56 characters of the hex
-                asset_policy_id = asset.unit[:56]
-                logger.info(f"Asset policy ID: {asset_policy_id}")
-                logger.info(f"Expected policy ID: {YUMMI_POLICY_ID}")
-                
-                if asset_policy_id == YUMMI_POLICY_ID:
-                    yummi_amount = int(asset.quantity)
-                    logger.info(f"Found {yummi_amount} YUMMI tokens in wallet {wallet_address}")
-                    break
+            if hasattr(assets, 'amount'):
+                for asset in assets.amount:
+                    if isinstance(asset, dict):
+                        unit = asset.get('unit', '')
+                        quantity = asset.get('quantity', '0')
+                    else:
+                        unit = getattr(asset, 'unit', '')
+                        quantity = getattr(asset, 'quantity', '0')
+                        
+                    logger.info(f"Found asset: {unit} with quantity {quantity}")
+                    
+                    # Policy ID should be first 56 characters of the hex
+                    if unit and len(unit) >= 56:
+                        asset_policy_id = unit[:56]
+                        logger.info(f"Asset policy ID: {asset_policy_id}")
+                        logger.info(f"Expected policy ID: {YUMMI_POLICY_ID}")
+                        
+                        if asset_policy_id == YUMMI_POLICY_ID:
+                            yummi_amount = int(quantity)
+                            logger.info(f"Found {yummi_amount} YUMMI tokens in wallet {wallet_address}")
+                            break
             
             if yummi_amount >= REQUIRED_BUD_TOKENS:
                 return True, f"Wallet has {yummi_amount} YUMMI tokens"
