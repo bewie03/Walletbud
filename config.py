@@ -100,11 +100,15 @@ MAX_TX_HISTORY = validate_positive_int(
     'MAX_TX_HISTORY'
 )
 
+# API Configuration
+API_RETRY_ATTEMPTS = 3
+API_RETRY_DELAY = 1  # Base delay in seconds between retries
+API_RATE_LIMIT = 10  # Requests per second
+API_BURST_LIMIT = 500  # Maximum requests in burst
+
 # Rate Limiting Settings
 MAX_REQUESTS_PER_SECOND = 10
 RATE_LIMIT_DELAY = 5  # seconds to wait when rate limit is hit
-API_RETRY_ATTEMPTS = 3
-API_RETRY_DELAY = 1  # seconds between retries
 
 # Wallet Check Settings
 WALLET_BATCH_SIZE = 50  # Number of wallets to check in each batch
