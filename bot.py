@@ -59,6 +59,8 @@ except Exception as e:
     exit(1)
 
 # Initialize Blockfrost client
+blockfrost_client = None  # Global variable for Blockfrost client
+
 async def init_blockfrost():
     """Initialize Blockfrost API client"""
     try:
@@ -69,8 +71,7 @@ async def init_blockfrost():
             exit(1)
         blockfrost_client = BlockFrostApi(
             project_id=blockfrost_key,
-            base_url="https://cardano-mainnet.blockfrost.io/api/v0",
-            request_timeout=30  # Add 30 second timeout
+            base_url="https://cardano-mainnet.blockfrost.io/api/v0"
         )
         # Test connection with a simple query
         test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
@@ -85,11 +86,12 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 if not DISCORD_TOKEN:
     logger.error("No Discord token found! Make sure DISCORD_TOKEN is set in .env")
     exit(1)
+
 YUMMI_POLICY_ID = os.getenv('YUMMI_POLICY_ID')
 REQUIRED_BUD_TOKENS = int(os.getenv('REQUIRED_BUD_TOKENS', '20000'))
 TRANSACTION_CHECK_INTERVAL = int(os.getenv('TRANSACTION_CHECK_INTERVAL', '5'))  # minutes
 YUMMI_CHECK_INTERVAL = int(os.getenv('YUMMI_CHECK_INTERVAL', '6'))  # hours
-MAX_TX_HISTORY = 10  # Maximum number of transactions to check per wallet
+MAX_TX_HISTORY = int(os.getenv('MAX_TX_HISTORY', '10'))  # Maximum number of transactions to check per wallet
 
 class WalletBud(commands.Bot):
     def __init__(self):
@@ -97,17 +99,35 @@ class WalletBud(commands.Bot):
         self.processing_wallets = False
         self.monitoring_paused = False
         self.tree = app_commands.CommandTree(self)
+        self._db_conn = None
+        
+    @property
+    def db(self):
+        """Get database connection, creating it if necessary"""
+        if self._db_conn is None:
+            self._db_conn = sqlite3.connect(DB_FILE)
+        return self._db_conn
         
     async def setup_hook(self):
         """Setup the bot when it starts"""
-        await init_blockfrost()  # Initialize Blockfrost first
-        self.check_wallets.start()
+        try:
+            logger.info("Initializing bot...")
+            await init_blockfrost()  # Initialize Blockfrost first
+            self.check_wallets.start()
+            logger.info("Bot initialization complete")
+        except Exception as e:
+            logger.error(f"Failed to initialize bot: {e}")
+            await self.close()
+            exit(1)
         
     async def close(self):
         """Cleanup when bot is shutting down"""
         logger.info("Bot is shutting down...")
         if self.check_wallets.is_running():
             self.check_wallets.cancel()
+        if self._db_conn:
+            self._db_conn.close()
+            self._db_conn = None
         await super().close()
         
     async def on_ready(self):
@@ -123,8 +143,11 @@ class WalletBud(commands.Bot):
                     name="YUMMI wallets | /help"
                 )
             )
+            logger.info("Bot is fully ready")
         except Exception as e:
             logger.error(f"Failed to sync commands: {e}")
+            await self.close()
+            exit(1)
 
     async def check_wallets(self):
         """Check all active wallets for new transactions"""
@@ -464,7 +487,7 @@ class WalletBud(commands.Bot):
 
     def get_all_active_wallets(self):
         """Get all active wallets"""
-        with sqlite3.connect(DB_FILE) as conn:
+        with self.db as conn:
             cursor = conn.cursor()
             cursor.execute(
                 'SELECT address, discord_id FROM wallets WHERE is_active = TRUE'
@@ -474,7 +497,7 @@ class WalletBud(commands.Bot):
     def add_wallet(self, wallet_address, discord_id):
         """Add a new wallet to the database"""
         try:
-            with sqlite3.connect(DB_FILE) as conn:
+            with self.db as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     'INSERT INTO wallets (address, discord_id, last_checked, last_yummi_check) VALUES (?, ?, ?, ?)',
@@ -487,7 +510,7 @@ class WalletBud(commands.Bot):
 
     def update_last_checked(self, wallet_address, tx_hash=None):
         """Update the last checked time and optionally the last transaction hash"""
-        with sqlite3.connect(DB_FILE) as conn:
+        with self.db as conn:
             cursor = conn.cursor()
             if tx_hash:
                 cursor.execute(
@@ -503,7 +526,7 @@ class WalletBud(commands.Bot):
 
     def update_last_yummi_check(self, wallet_address):
         """Update the last YUMMI balance check time"""
-        with sqlite3.connect(DB_FILE) as conn:
+        with self.db as conn:
             cursor = conn.cursor()
             cursor.execute(
                 'UPDATE wallets SET last_yummi_check = ? WHERE address = ?',
@@ -513,7 +536,7 @@ class WalletBud(commands.Bot):
 
     def get_last_yummi_check(self, wallet_address):
         """Get the last YUMMI balance check time"""
-        with sqlite3.connect(DB_FILE) as conn:
+        with self.db as conn:
             cursor = conn.cursor()
             cursor.execute(
                 'SELECT last_yummi_check FROM wallets WHERE address = ?',
@@ -526,7 +549,7 @@ class WalletBud(commands.Bot):
 
     def get_last_tx_hash(self, wallet_address):
         """Get the last seen transaction hash for a wallet"""
-        with sqlite3.connect(DB_FILE) as conn:
+        with self.db as conn:
             cursor = conn.cursor()
             cursor.execute(
                 'SELECT last_tx_hash FROM wallets WHERE address = ?',
@@ -537,7 +560,7 @@ class WalletBud(commands.Bot):
 
     def update_wallet_status(self, wallet_address, is_active):
         """Update the status of a wallet"""
-        with sqlite3.connect(DB_FILE) as conn:
+        with self.db as conn:
             cursor = conn.cursor()
             cursor.execute(
                 'UPDATE wallets SET is_active = ? WHERE address = ?',
@@ -547,7 +570,7 @@ class WalletBud(commands.Bot):
 
     def is_wallet_active(self, wallet_address):
         """Check if a wallet is active"""
-        with sqlite3.connect(DB_FILE) as conn:
+        with self.db as conn:
             cursor = conn.cursor()
             cursor.execute(
                 'SELECT is_active FROM wallets WHERE address = ?',
@@ -558,7 +581,7 @@ class WalletBud(commands.Bot):
 
     def get_user_wallets(self, discord_id):
         """Get all wallets for a user"""
-        with sqlite3.connect(DB_FILE) as conn:
+        with self.db as conn:
             cursor = conn.cursor()
             cursor.execute(
                 'SELECT address FROM wallets WHERE discord_id = ?',
@@ -569,7 +592,7 @@ class WalletBud(commands.Bot):
     def remove_wallet(self, discord_id, wallet_address):
         """Remove a wallet from a user"""
         try:
-            with sqlite3.connect(DB_FILE) as conn:
+            with self.db as conn:
                 cursor = conn.cursor()
                 cursor.execute(
                     'DELETE FROM wallets WHERE discord_id = ? AND address = ?',
@@ -587,7 +610,7 @@ class WalletBud(commands.Bot):
             # Check database connection
             db_status = "✅ Connected"
             try:
-                with sqlite3.connect(DB_FILE) as conn:
+                with self.db as conn:
                     cursor = conn.cursor()
                     cursor.execute('SELECT COUNT(*) FROM wallets')
                     wallet_count = cursor.fetchone()[0]
@@ -976,28 +999,43 @@ class WalletModal(discord.ui.Modal, title='Add Wallet'):
 async def check_yummi_balance(wallet_address):
     """Check if wallet has required amount of YUMMI tokens"""
     try:
-        # Get address info
-        address_info = await blockfrost_client.address(wallet_address)
-
-        # Check for YUMMI tokens in amounts
-        for amount in address_info.amount:
-            # First item is always lovelace (ADA)
-            if amount.unit.startswith(YUMMI_POLICY_ID):
-                yummi_amount = int(amount.quantity)
-                if yummi_amount >= REQUIRED_BUD_TOKENS:
-                    return True, "Sufficient YUMMI balance"
-                else:
-                    return False, f"Insufficient YUMMI balance: {yummi_amount} (required: {REQUIRED_BUD_TOKENS})"
-
-        return False, "No YUMMI tokens found"
-
-    except blockfrost.ApiError as e:
+        logger.info(f"Checking YUMMI balance for wallet: {wallet_address}")
+        
+        # Get wallet UTXOs
+        utxos = await blockfrost_client.address_utxos(wallet_address)
+        if not utxos:
+            logger.info(f"No UTXOs found for wallet: {wallet_address}")
+            return False, "No UTXOs found in wallet"
+            
+        # Look for YUMMI tokens in UTXOs
+        yummi_amount = 0
+        for utxo in utxos:
+            for amount in utxo.amount:
+                if hasattr(amount, 'unit') and amount.unit.startswith(YUMMI_POLICY_ID):
+                    yummi_amount += int(amount.quantity)
+                    logger.info(f"Found {amount.quantity} YUMMI tokens in UTXO")
+        
+        logger.info(f"Total YUMMI balance for {wallet_address}: {yummi_amount}")
+        
+        if yummi_amount >= REQUIRED_BUD_TOKENS:
+            logger.info(f"Wallet has sufficient YUMMI balance: {yummi_amount}")
+            return True, f"Wallet has {yummi_amount:,} YUMMI tokens"
+        else:
+            logger.info(f"Insufficient YUMMI balance: {yummi_amount}/{REQUIRED_BUD_TOKENS}")
+            return False, f"Insufficient YUMMI tokens: {yummi_amount:,}/{REQUIRED_BUD_TOKENS:,} required"
+            
+    except Exception as e:
         logger.error(f"Error checking YUMMI balance: {str(e)}")
-        if e.status_code == 404:
-            return False, "Wallet not found"
-        elif e.status_code == 429:
-            return False, "Rate limit exceeded, please try again later"
-        return False, "Error checking YUMMI balance"
+        if isinstance(e, blockfrost.ApiError):
+            if e.status_code == 400:
+                return False, "Invalid wallet address format"
+            elif e.status_code == 404:
+                return False, "Wallet not found"
+            elif e.status_code == 429:
+                return False, "Rate limit exceeded, please try again later"
+            else:
+                return False, f"API Error: {str(e)}"
+        return False, f"Error checking wallet: {str(e)}"
 
 if __name__ == "__main__":
     try:
