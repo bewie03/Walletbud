@@ -320,11 +320,18 @@ class WalletBud(commands.Bot):
                 
             self.blockfrost_client = BlockFrostApi(
                 project_id=api_key,
+                base_url="https://cardano-mainnet.blockfrost.io/api/v0"
             )
+            
             # Test the connection
-            await self.blockfrost_client.health()
-            logger.info("Blockfrost API initialized successfully")
-            return True
+            health = await self.blockfrost_client.health()
+            if health:
+                logger.info("Blockfrost API initialized successfully")
+                return True
+            else:
+                logger.error("Failed to get health status from Blockfrost")
+                return False
+                
         except Exception as e:
             logger.error(f"Failed to initialize Blockfrost API: {str(e)}")
             # Don't raise, let the bot continue with warnings
