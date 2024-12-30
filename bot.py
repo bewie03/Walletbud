@@ -8,6 +8,7 @@ from functools import wraps
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from blockfrost import BlockFrostApi
 
 from config import *
 
@@ -196,11 +197,8 @@ class WalletBud(commands.Bot):
                 logger.warning(f"Failed to initialize Blockfrost: {e}")
                 logger.warning("Bot will start without Blockfrost...")
             
-            # Register commands
-            self.tree = app_commands.CommandTree(self)
+            # Register commands - using the existing command tree
             self.register_commands()
-            
-            # Don't sync commands here - we'll do it in on_ready
             logger.info("Setup complete")
             
         except Exception as e:
