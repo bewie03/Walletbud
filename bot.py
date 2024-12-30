@@ -1,10 +1,12 @@
 import os
+import sys
+import json
+import asyncio
 import logging
 import sqlite3
-import asyncio
 from datetime import datetime, timedelta
+from uuid import uuid4
 from functools import wraps
-import uuid
 
 import discord
 from discord import app_commands
@@ -13,47 +15,76 @@ from blockfrost import BlockFrostApi
 import aiohttp
 
 from config import *
+from database import init_db
+
+# Create request ID for logging
+def get_request_id():
+    return str(uuid4())[:8]
 
 # Set up logging
+log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+
+# Create logs directory if it doesn't exist
+if not os.path.exists('logs'):
+    os.makedirs('logs')
+
+# Set up file handler
+log_file = os.path.join('logs', 'bot.log')
+file_handler = logging.FileHandler(log_file, encoding='utf-8')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+# Set up console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+# Configure root logger
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=getattr(logging, log_level, logging.INFO),
+    handlers=[file_handler, console_handler]
 )
+
 logger = logging.getLogger(__name__)
+logger.info(f"Starting bot with log level: {log_level}")
 
 # Centralized error messages
 ERROR_MESSAGES = {
-    'dm_only': "This command can only be used in DMs for security.",
-    'api_unavailable': "Wallet monitoring is currently unavailable. Please try again later.",
-    'monitoring_paused': "Wallet monitoring is currently paused."
+    'api_unavailable': "Bot API is not ready. Please try again in a few minutes.",
+    'monitoring_paused': "Wallet monitoring is currently unavailable. Please try again later.",
+    'invalid_address': "Invalid wallet address. Please check the address and try again.",
+    'wallet_not_found': "Wallet not found. Please check the address and try again.",
+    'insufficient_tokens': "Insufficient YUMMI tokens. Please ensure you have enough tokens.",
+    'db_error': "Database error occurred. Please try again later.",
+    'command_error': "An error occurred while processing your command. Please try again later.",
 }
 
 def dm_only():
-    """Ensure command is only used in DMs"""
-    async def predicate(interaction: discord.Interaction):
-        if interaction.guild is not None:
-            await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+    """Check if command is used in DM"""
+    async def predicate(ctx):
+        if not isinstance(ctx.channel, discord.DMChannel):
+            await ctx.send("This command can only be used in DMs for security.")
             return False
         return True
-    return app_commands.check(predicate)
+    return commands.check(predicate)
 
 def has_blockfrost():
-    """Ensure Blockfrost API is available"""
-    async def predicate(interaction: discord.Interaction):
-        if not interaction.client.blockfrost_client:
-            await interaction.response.send_message(ERROR_MESSAGES['api_unavailable'], ephemeral=True)
+    """Check if Blockfrost client is initialized"""
+    async def predicate(ctx):
+        if not ctx.bot.blockfrost_client:
+            await ctx.send("Bot API is not ready. Please try again in a few minutes.")
+            logger.error("Command failed - Blockfrost client not initialized")
             return False
         return True
-    return app_commands.check(predicate)
+    return commands.check(predicate)
 
 def not_monitoring_paused():
-    """Ensure wallet monitoring is not paused"""
-    async def predicate(interaction: discord.Interaction):
-        if interaction.client.monitoring_paused:
-            await interaction.response.send_message(ERROR_MESSAGES['monitoring_paused'], ephemeral=True)
+    """Check if wallet monitoring is paused"""
+    async def predicate(ctx):
+        if ctx.bot.monitoring_paused:
+            await ctx.send("Wallet monitoring is currently unavailable. Please try again later.")
+            logger.warning(f"Command rejected - monitoring paused. User: {ctx.author.id}")
             return False
         return True
-    return app_commands.check(predicate)
+    return commands.check(predicate)
 
 def cooldown_5s():
     """5 second cooldown between commands"""
@@ -98,10 +129,6 @@ def sanitize_wallet_address(address):
         raise ValueError("Address contains invalid characters")
         
     return address
-
-def get_request_id():
-    """Generate a unique request ID"""
-    return str(uuid.uuid4())[:8]
 
 def register_command():
     """Decorator for registering slash commands"""
@@ -226,7 +253,8 @@ class WalletBud(commands.Bot):
         # Initialize the bot with intents
         super().__init__(
             command_prefix=COMMAND_PREFIX,
-            intents=intents
+            intents=intents,
+            help_command=None  # Disable default help command
         )
         
         # Initialize database connection
@@ -247,114 +275,155 @@ class WalletBud(commands.Bot):
         self.blockfrost_client = None
         self.monitoring_paused = False
         
-    async def setup_hook(self):
-        """Initialize the bot's command tree and sync commands"""
-        try:
-            # Register commands
-            await self.register_commands()
-            
-            # Sync commands globally
-            await self.tree.sync()
-            logger.info("Commands synced globally")
-            
-            # Initialize Blockfrost
-            try:
-                await self.init_blockfrost()
-            except Exception as e:
-                logger.warning(f"Failed to initialize Blockfrost: {e}")
-                logger.warning("Bot will start without Blockfrost...")
-            
-            logger.info("Setup complete")
-            
-        except Exception as e:
-            logger.error(f"Setup failed: {e}")
-            raise
-
-    async def register_commands(self):
-        """Register all commands with the command tree"""
+        # Register commands
+        self.setup_commands()
         
-        @self.tree.command(
-            name="addwallet",
-            description="Add a Cardano wallet to monitor"
-        )
+    def setup_commands(self):
+        """Set up bot commands"""
+        logger.info("Setting up commands...")
+        
+        # Register command error handler
+        @self.event
+        async def on_command_error(ctx, error):
+            if isinstance(error, commands.NoPrivateMessage):
+                await ctx.send("This command can only be used in DMs for security.")
+            elif isinstance(error, commands.CheckFailure):
+                # Don't send message as the check should have sent one
+                pass
+            else:
+                logger.error(f"Command error: {str(error)}")
+                await ctx.send("An error occurred while processing your command.")
+        
+        # Register commands
+        @self.tree.command(name='addwallet', description="Add a wallet to monitor")
         @dm_only()
         @has_blockfrost()
         @not_monitoring_paused()
-        async def add_wallet_command(interaction: discord.Interaction):
-            modal = WalletModal(self)
-            await interaction.response.send_modal(modal)
-
-        @self.tree.command(
-            name="removewallet",
-            description="Remove a wallet from monitoring"
-        )
-        @dm_only()
-        async def remove_wallet(interaction: discord.Interaction, wallet_address: str):
-            with sqlite3.connect(DATABASE_NAME) as conn:
-                cursor = conn.cursor()
-                cursor.execute('DELETE FROM wallets WHERE address = ? AND discord_id = ?', 
-                            (wallet_address, interaction.user.id))
-                if cursor.rowcount > 0:
-                    await interaction.response.send_message(f"✅ Wallet `{wallet_address}` removed from monitoring.")
-                else:
-                    await interaction.response.send_message("❌ Wallet not found in your monitored wallets.", ephemeral=True)
-
-        @self.tree.command(
-            name="listwallets",
-            description="List all your monitored wallets"
-        )
-        @dm_only()
-        async def list_wallets(interaction: discord.Interaction):
-            with sqlite3.connect(DATABASE_NAME) as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT address FROM wallets WHERE discord_id = ?', (interaction.user.id,))
-                wallets = cursor.fetchall()
+        @cooldown_5s()
+        async def add_wallet(ctx, wallet_address: str = None):
+            """Add a wallet to monitor"""
+            try:
+                # Basic input validation
+                if not wallet_address:
+                    await ctx.send("Please provide a wallet address. Usage: !addwallet <address>")
+                    return
+                    
+                logger.info(f"Processing add wallet request from {ctx.author.id} for address: {wallet_address}")
                 
-            if wallets:
-                wallet_list = "\n".join([f"• `{w[0]}`" for w in wallets])
-                await interaction.response.send_message(f"Your monitored wallets:\n{wallet_list}")
+                # Check if wallet exists and get YUMMI balance
+                success, result = await self.check_yummi_balance(wallet_address)
+                
+                if success:
+                    # Add wallet to database
+                    try:
+                        self.cursor.execute(
+                            "INSERT INTO wallets (address, discord_id) VALUES (?, ?)",
+                            (wallet_address, str(ctx.author.id))
+                        )
+                        self.conn.commit()
+                        await ctx.send(f"Wallet added successfully! Current YUMMI balance: {result:,}")
+                        logger.info(f"Wallet {wallet_address} added for user {ctx.author.id}")
+                    except sqlite3.IntegrityError:
+                        await ctx.send("This wallet is already being monitored!")
+                        logger.warning(f"Duplicate wallet add attempt: {wallet_address}")
+                else:
+                    await ctx.send(result)  # Result contains error message
+                    logger.warning(f"Add wallet failed - {result}")
+                    
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error in add_wallet command: {error_msg}")
+                await ctx.send(
+                    "An error occurred while processing your request. Please try again later. "
+                    "If the problem persists, contact support."
+                )
+        
+        logger.info("Commands setup complete")
+
+    async def setup_hook(self):
+        """Called when the bot starts up"""
+        try:
+            logger.info("Bot is starting up...")
+            
+            # Initialize Blockfrost
+            logger.info("Initializing Blockfrost...")
+            if not await self.init_blockfrost():
+                logger.error("Failed to initialize Blockfrost API")
+                self.monitoring_paused = True
+            
+            # Start wallet monitoring if everything is ready
+            if not self.monitoring_paused:
+                logger.info("Starting wallet monitoring task...")
+                self.check_wallets.start()
             else:
-                await interaction.response.send_message("You don't have any wallets being monitored.", ephemeral=True)
-
-        @self.tree.command(
-            name="help",
-            description="Show bot help and commands"
-        )
-        async def help_command(interaction: discord.Interaction):
-            help_text = (
-                "🤖 **WalletBud Commands**\n\n"
-                "`/addwallet` - Add a Cardano wallet to monitor (DM only)\n"
-                "`/removewallet` - Remove a wallet from monitoring (DM only)\n"
-                "`/listwallets` - List all your monitored wallets (DM only)\n"
-                "`/help` - Show this help message\n\n"
-                "ℹ️ All commands must be used in DMs for security."
-            )
-            await interaction.response.send_message(help_text)
-
-        @self.tree.command(
-            name="health",
-            description="Check bot health status"
-        )
-        async def health_check(interaction: discord.Interaction):
-            status = "✅ Bot is running\n"
-            status += f"🔄 Blockfrost API: {'✅ Connected' if self.blockfrost_client else '❌ Not connected'}\n"
-            status += f"📊 Monitoring Status: {'⏸️ Paused' if self.monitoring_paused else '▶️ Active'}"
-            await interaction.response.send_message(status)
-
+                logger.warning("Wallet monitoring is paused due to initialization errors")
+                
+            # Add commands
+            logger.info("Registering commands...")
+            await self.register_commands()
+            
+        except Exception as e:
+            logger.error(f"Error during bot setup: {str(e)}")
+            self.monitoring_paused = True
+            
     async def on_ready(self):
         """Called when the bot is ready"""
-        logger.info(f'Logged in as {self.user.name} ({self.user.id})')
-        
-        # Sync commands globally since this is a DM-only bot
         try:
-            await self.tree.sync()
-            logger.info("Commands synced globally")
+            logger.info(f"Logged in as {self.user.name} ({self.user.id})")
+            logger.info(f"Using command prefix: {COMMAND_PREFIX}")
+            logger.info(f"Monitoring status: {'PAUSED' if self.monitoring_paused else 'ACTIVE'}")
+            
+            # Log configuration
+            logger.debug("Current configuration:")
+            logger.debug(f"- Database: {DATABASE_NAME}")
+            logger.debug(f"- YUMMI Policy ID: {YUMMI_POLICY_ID}")
+            logger.debug(f"- Required YUMMI: {REQUIRED_YUMMI_TOKENS}")
+            logger.debug(f"- Blockfrost initialized: {self.blockfrost_client is not None}")
+            
+            # Sync commands
+            try:
+                await self.tree.sync()
+                logger.info("Commands synced globally")
+            except Exception as e:
+                logger.error(f"Failed to sync commands: {str(e)}")
+            
         except Exception as e:
-            logger.error(f"Failed to sync commands: {e}")
+            logger.error(f"Error in on_ready: {str(e)}")
+            
+    async def register_commands(self):
+        """Register all commands"""
+        logger.info("Registering commands...")
         
-        # Start background tasks
-        if not self.check_wallets.is_running():
-            self.check_wallets.start()
+        try:
+            # Add command groups
+            wallet_group = app_commands.Group(name="wallet", description="Wallet management commands")
+            self.tree.add_command(wallet_group)
+            
+            # Add commands to groups
+            wallet_group.add_command(app_commands.Command(
+                name="add",
+                description="Add a wallet to monitor",
+                callback=self.add_wallet_slash
+            ))
+            
+            wallet_group.add_command(app_commands.Command(
+                name="remove",
+                description="Remove a wallet from monitoring",
+                callback=self.remove_wallet_slash
+            ))
+            
+            # Add global commands
+            self.tree.add_command(app_commands.Command(
+                name="status",
+                description="Check bot status",
+                callback=self.status_slash
+            ))
+            
+            logger.info("Commands registered successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to register commands: {str(e)}")
+            raise
 
     async def on_error(self, event_method: str, *args, **kwargs):
         """Global error handler for events"""
@@ -704,81 +773,23 @@ class WalletBud(commands.Bot):
             self.blockfrost_client = None
             return False
 
-    @commands.command(name='addwallet')
-    @register_command()
-    @commands.cooldown(1, 5.0)
-    async def add_wallet(self, ctx, wallet_address: str):
-        """Add a wallet to monitor"""
-        try:
-            # Sanitize and validate the wallet address
-            try:
-                wallet_address = sanitize_wallet_address(wallet_address)
-            except ValueError as e:
-                await ctx.send(f"❌ Invalid wallet address: {str(e)}")
-                return
-                
-            discord_id = str(ctx.author.id)
-            
-            # Check YUMMI balance first
-            has_tokens, message = await self.check_yummi_balance(wallet_address)
-            if not has_tokens:
-                await ctx.send(f"❌ {message}")
-                return
-                
-            # Use parameterized query to prevent SQL injection
-            self.cursor.execute(
-                'INSERT OR REPLACE INTO wallets (address, discord_id, is_active, last_yummi_check) VALUES (?, ?, TRUE, ?)',
-                (wallet_address, discord_id, datetime.utcnow().isoformat())
-            )
-            self.conn.commit()
-            
-            await ctx.send(f"✅ Wallet `{wallet_address}` added successfully! YUMMI balance: {message:,}")
-            
-        except Exception as e:
-            logger.error(f"Error adding wallet: {e}")
-            await ctx.send("❌ Failed to add wallet. Please try again later.")
-
-    @commands.command(name='removewallet')
-    @register_command()
-    @commands.cooldown(1, 5.0)
-    async def remove_wallet(self, ctx, wallet_address: str):
-        """Remove a wallet from monitoring"""
-        try:
-            # Sanitize and validate the wallet address
-            try:
-                wallet_address = sanitize_wallet_address(wallet_address)
-            except ValueError as e:
-                await ctx.send(f"❌ Invalid wallet address: {str(e)}")
-                return
-                
-            discord_id = str(ctx.author.id)
-            
-            # Use parameterized query to prevent SQL injection
-            self.cursor.execute(
-                'DELETE FROM wallets WHERE address = ? AND discord_id = ?',
-                (wallet_address, discord_id)
-            )
-            self.conn.commit()
-            
-            if self.cursor.rowcount > 0:
-                await ctx.send(f"✅ Wallet `{wallet_address}` removed successfully!")
-            else:
-                await ctx.send(f"❌ Wallet `{wallet_address}` not found or not owned by you.")
-            
-        except Exception as e:
-            logger.error(f"Error removing wallet: {e}")
-            await ctx.send("❌ Failed to remove wallet. Please try again later.")
-
 if __name__ == "__main__":
     try:
         logger.info("Starting WalletBud bot...")
+        
+        # Create bot instance
         bot = WalletBud()
-        bot.run(DISCORD_TOKEN)
+        
+        # Get Discord token
+        token = os.getenv('DISCORD_TOKEN')
+        if not token:
+            logger.error("DISCORD_TOKEN not found in environment variables")
+            sys.exit(1)
+            
+        # Run the bot
+        logger.info("Running bot...")
+        bot.run(token, log_handler=None)  # Disable default discord.py logging
+        
     except Exception as e:
-        logger.error(f"Bot crashed: {e}")
-    finally:
-        # Cleanup resources
-        if hasattr(bot, 'conn'):
-            bot.conn.close()
-            logger.info("Database connection closed")
-        logger.info("Bot shutdown complete")
+        logger.error(f"Failed to start bot: {str(e)}")
+        sys.exit(1)
