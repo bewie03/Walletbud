@@ -746,7 +746,7 @@ class WalletBud(commands.Bot):
             
             # Get YUMMI token balance
             assets = await self.rate_limited_request(
-                self.blockfrost_client.get_address_assets,  # Correct method name
+                self.blockfrost_client.get_address_assets,
                 address=address
             )
             
@@ -813,7 +813,7 @@ class WalletBud(commands.Bot):
         try:
             # Get assets with retries
             assets = await self.rate_limited_request(
-                self.blockfrost_client.get_address_assets,  # Correct method name
+                self.blockfrost_client.get_address_assets,
                 address=address
             )
             
@@ -821,13 +821,24 @@ class WalletBud(commands.Bot):
                 logger.info(f"No assets found for {address}")
                 return False, 0
                 
+            # Debug log all assets
+            logger.info(f"Found {len(assets)} assets for {address}:")
+            for asset in assets:
+                logger.info(f"Asset: policy_id={asset.policy_id}, asset={asset.asset}, quantity={asset.quantity}")
+            
             # Find YUMMI token
             yummi_balance = 0
             for asset in assets:
-                if asset.unit.startswith(YUMMI_POLICY_ID):
-                    yummi_balance = int(asset.quantity)
-                    logger.info(f"Found YUMMI balance for {address}: {yummi_balance:,} tokens")
-                    break
+                # Check policy ID match
+                if asset.policy_id == YUMMI_POLICY_ID:
+                    try:
+                        # Convert quantity to integer
+                        yummi_balance = int(asset.quantity)
+                        logger.info(f"Found YUMMI balance for {address}: {yummi_balance:,} tokens")
+                        break
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Error parsing YUMMI quantity '{asset.quantity}': {str(e)}")
+                        continue
             
             has_enough = yummi_balance >= REQUIRED_YUMMI_TOKENS
             if not has_enough:
