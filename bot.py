@@ -59,7 +59,7 @@ except Exception as e:
     exit(1)
 
 # Initialize Blockfrost client
-blockfrost_client = None  # Global variable for Blockfrost client
+blockfrost_client = None
 
 async def init_blockfrost():
     """Initialize Blockfrost API client"""
@@ -73,9 +73,6 @@ async def init_blockfrost():
             project_id=blockfrost_key,
             base_url="https://cardano-mainnet.blockfrost.io/api/v0"
         )
-        # Test connection with a simple query
-        test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
-        await blockfrost_client.address(test_address)
         logger.info("Successfully connected to Blockfrost API")
     except Exception as e:
         logger.error(f"Failed to initialize Blockfrost client: {e}")
@@ -99,22 +96,12 @@ class WalletBud(commands.Bot):
         self.processing_wallets = False
         self.monitoring_paused = False
         self.tree = app_commands.CommandTree(self)
-        self._db_conn = None
-        
-    @property
-    def db(self):
-        """Get database connection, creating it if necessary"""
-        if self._db_conn is None:
-            self._db_conn = sqlite3.connect(DB_FILE)
-        return self._db_conn
         
     async def setup_hook(self):
         """Setup the bot when it starts"""
         try:
-            logger.info("Initializing bot...")
             await init_blockfrost()  # Initialize Blockfrost first
             self.check_wallets.start()
-            logger.info("Bot initialization complete")
         except Exception as e:
             logger.error(f"Failed to initialize bot: {e}")
             await self.close()
@@ -125,9 +112,6 @@ class WalletBud(commands.Bot):
         logger.info("Bot is shutting down...")
         if self.check_wallets.is_running():
             self.check_wallets.cancel()
-        if self._db_conn:
-            self._db_conn.close()
-            self._db_conn = None
         await super().close()
         
     async def on_ready(self):
@@ -143,11 +127,127 @@ class WalletBud(commands.Bot):
                     name="YUMMI wallets | /help"
                 )
             )
-            logger.info("Bot is fully ready")
         except Exception as e:
             logger.error(f"Failed to sync commands: {e}")
-            await self.close()
-            exit(1)
+
+    def get_all_active_wallets(self):
+        """Get all active wallets"""
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT address, discord_id FROM wallets WHERE is_active = TRUE'
+            )
+            return cursor.fetchall()
+
+    def add_wallet(self, wallet_address, discord_id):
+        """Add a new wallet to the database"""
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'INSERT INTO wallets (address, discord_id, last_checked, last_yummi_check) VALUES (?, ?, ?, ?)',
+                    (wallet_address, discord_id, datetime.utcnow(), datetime.utcnow())
+                )
+                conn.commit()
+                return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def update_last_checked(self, wallet_address, tx_hash=None):
+        """Update the last checked time and optionally the last transaction hash"""
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            if tx_hash:
+                cursor.execute(
+                    'UPDATE wallets SET last_checked = ?, last_tx_hash = ? WHERE address = ?',
+                    (datetime.utcnow(), tx_hash, wallet_address)
+                )
+            else:
+                cursor.execute(
+                    'UPDATE wallets SET last_checked = ? WHERE address = ?',
+                    (datetime.utcnow(), wallet_address)
+                )
+            conn.commit()
+
+    def update_last_yummi_check(self, wallet_address):
+        """Update the last YUMMI balance check time"""
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE wallets SET last_yummi_check = ? WHERE address = ?',
+                (datetime.utcnow(), wallet_address)
+            )
+            conn.commit()
+
+    def get_last_yummi_check(self, wallet_address):
+        """Get the last YUMMI balance check time"""
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT last_yummi_check FROM wallets WHERE address = ?',
+                (wallet_address,)
+            )
+            result = cursor.fetchone()
+            if result and result[0]:
+                return datetime.fromisoformat(result[0])
+            return None
+
+    def get_last_tx_hash(self, wallet_address):
+        """Get the last seen transaction hash for a wallet"""
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT last_tx_hash FROM wallets WHERE address = ?',
+                (wallet_address,)
+            )
+            result = cursor.fetchone()
+            return result[0] if result else None
+
+    def update_wallet_status(self, wallet_address, is_active):
+        """Update the status of a wallet"""
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE wallets SET is_active = ? WHERE address = ?',
+                (is_active, wallet_address)
+            )
+            conn.commit()
+
+    def is_wallet_active(self, wallet_address):
+        """Check if a wallet is active"""
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT is_active FROM wallets WHERE address = ?',
+                (wallet_address,)
+            )
+            result = cursor.fetchone()
+            return bool(result[0]) if result else False
+
+    def get_user_wallets(self, discord_id):
+        """Get all wallets for a user"""
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT address FROM wallets WHERE discord_id = ?',
+                (discord_id,)
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+    def remove_wallet(self, discord_id, wallet_address):
+        """Remove a wallet from a user"""
+        try:
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'DELETE FROM wallets WHERE discord_id = ? AND address = ?',
+                    (discord_id, wallet_address)
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error removing wallet: {e}")
+            return False
 
     async def check_wallets(self):
         """Check all active wallets for new transactions"""
@@ -485,124 +585,6 @@ class WalletBud(commands.Bot):
             )
             await interaction.response.send_message(embed=embed)
 
-    def get_all_active_wallets(self):
-        """Get all active wallets"""
-        with self.db as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'SELECT address, discord_id FROM wallets WHERE is_active = TRUE'
-            )
-            return cursor.fetchall()
-
-    def add_wallet(self, wallet_address, discord_id):
-        """Add a new wallet to the database"""
-        try:
-            with self.db as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    'INSERT INTO wallets (address, discord_id, last_checked, last_yummi_check) VALUES (?, ?, ?, ?)',
-                    (wallet_address, discord_id, datetime.utcnow(), datetime.utcnow())
-                )
-                conn.commit()
-                return True
-        except sqlite3.IntegrityError:
-            return False
-
-    def update_last_checked(self, wallet_address, tx_hash=None):
-        """Update the last checked time and optionally the last transaction hash"""
-        with self.db as conn:
-            cursor = conn.cursor()
-            if tx_hash:
-                cursor.execute(
-                    'UPDATE wallets SET last_checked = ?, last_tx_hash = ? WHERE address = ?',
-                    (datetime.utcnow(), tx_hash, wallet_address)
-                )
-            else:
-                cursor.execute(
-                    'UPDATE wallets SET last_checked = ? WHERE address = ?',
-                    (datetime.utcnow(), wallet_address)
-                )
-            conn.commit()
-
-    def update_last_yummi_check(self, wallet_address):
-        """Update the last YUMMI balance check time"""
-        with self.db as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'UPDATE wallets SET last_yummi_check = ? WHERE address = ?',
-                (datetime.utcnow(), wallet_address)
-            )
-            conn.commit()
-
-    def get_last_yummi_check(self, wallet_address):
-        """Get the last YUMMI balance check time"""
-        with self.db as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'SELECT last_yummi_check FROM wallets WHERE address = ?',
-                (wallet_address,)
-            )
-            result = cursor.fetchone()
-            if result and result[0]:
-                return datetime.fromisoformat(result[0])
-            return None
-
-    def get_last_tx_hash(self, wallet_address):
-        """Get the last seen transaction hash for a wallet"""
-        with self.db as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'SELECT last_tx_hash FROM wallets WHERE address = ?',
-                (wallet_address,)
-            )
-            result = cursor.fetchone()
-            return result[0] if result else None
-
-    def update_wallet_status(self, wallet_address, is_active):
-        """Update the status of a wallet"""
-        with self.db as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'UPDATE wallets SET is_active = ? WHERE address = ?',
-                (is_active, wallet_address)
-            )
-            conn.commit()
-
-    def is_wallet_active(self, wallet_address):
-        """Check if a wallet is active"""
-        with self.db as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'SELECT is_active FROM wallets WHERE address = ?',
-                (wallet_address,)
-            )
-            result = cursor.fetchone()
-            return result[0] if result else False
-
-    def get_user_wallets(self, discord_id):
-        """Get all wallets for a user"""
-        with self.db as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'SELECT address FROM wallets WHERE discord_id = ?',
-                (discord_id,)
-            )
-            return [row[0] for row in cursor.fetchall()]
-
-    def remove_wallet(self, discord_id, wallet_address):
-        """Remove a wallet from a user"""
-        try:
-            with self.db as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    'DELETE FROM wallets WHERE discord_id = ? AND address = ?',
-                    (discord_id, wallet_address)
-                )
-                conn.commit()
-                return True
-        except sqlite3.IntegrityError:
-            return False
-
     @app_commands.command(name="health", description="Check the bot's health status")
     async def health_check(self, interaction: discord.Interaction):
         """Check the health status of the bot and its connections"""
@@ -610,7 +592,7 @@ class WalletBud(commands.Bot):
             # Check database connection
             db_status = "✅ Connected"
             try:
-                with self.db as conn:
+                with sqlite3.connect(DB_FILE) as conn:
                     cursor = conn.cursor()
                     cursor.execute('SELECT COUNT(*) FROM wallets')
                     wallet_count = cursor.fetchone()[0]
