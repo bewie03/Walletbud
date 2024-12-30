@@ -146,23 +146,68 @@ MIN_YUMMI_REQUIRED = REQUIRED_BUD_TOKENS
 
 # Blockfrost setup
 project_id = os.getenv('BLOCKFROST_API_KEY')
-blockfrost_client = blockfrost.BlockFrostApi(
-    project_id=project_id,
-    base_url='https://cardano-mainnet.blockfrost.io/api/v0'
-)
+logger.info("Initializing Blockfrost client...")
+
+if not project_id:
+    logger.error("No Blockfrost API key found in environment variables")
+    raise ValueError("BLOCKFROST_API_KEY environment variable is not set")
+
+try:
+    # Remove any whitespace from API key
+    project_id = project_id.strip()
+    
+    # Initialize client
+    blockfrost_client = blockfrost.BlockFrostApi(
+        project_id=project_id,
+        base_url=blockfrost.ApiUrls.mainnet.value,
+        api_version=0
+    )
+    
+    # Test the connection
+    info = blockfrost_client.health()
+    if info.is_healthy:
+        logger.info("Blockfrost connection successful")
+    else:
+        logger.warning("Blockfrost connection may have issues")
+        
+except blockfrost.ApiError as e:
+    logger.error(f"Blockfrost API Error: {str(e)}")
+    if e.status_code == 403:
+        logger.error("Invalid Blockfrost API key")
+    elif e.status_code == 429:
+        logger.error("Rate limit exceeded")
+    raise
+except Exception as e:
+    logger.error(f"Failed to initialize Blockfrost client: {str(e)}")
+    raise
 
 def check_yummi_balance(wallet_address):
     """Check if wallet has required amount of YUMMI tokens"""
     try:
         logger.info(f"Checking wallet {wallet_address} for YUMMI tokens")
         
+        # Check if we have Blockfrost API key
+        if not project_id:
+            logger.error("No Blockfrost API key found")
+            return False, "Configuration error: No Blockfrost API key"
+
         # First verify the wallet exists
         try:
             wallet = blockfrost_client.address(wallet_address)
             logger.info(f"Wallet verified: {wallet_address}")
-        except Exception as e:
-            logger.error(f"Error verifying wallet: {str(e)}")
-            return False, "Could not verify wallet"
+        except blockfrost.ApiError as e:
+            if e.status_code == 400:
+                logger.error(f"Invalid wallet address format: {wallet_address}")
+                return False, "Invalid wallet address format"
+            elif e.status_code == 404:
+                logger.error(f"Wallet not found: {wallet_address}")
+                return False, "Wallet not found on the blockchain"
+            elif e.status_code == 429:
+                logger.error("Blockfrost rate limit exceeded")
+                return False, "Service temporarily unavailable (rate limit)"
+            else:
+                logger.error(f"Blockfrost API error: {str(e)}")
+                return False, "Error verifying wallet"
 
         # Get all assets in the wallet
         try:
@@ -177,10 +222,12 @@ def check_yummi_balance(wallet_address):
                         return True, "Sufficient YUMMI balance"
                     return False, f"Insufficient YUMMI balance (has {yummi_amount:,}, needs {MIN_YUMMI_REQUIRED:,})"
             
-            return False, "No YUMMI tokens found"
+            return False, "No YUMMI tokens found in wallet"
             
-        except Exception as e:
+        except blockfrost.ApiError as e:
             logger.error(f"Error checking assets: {str(e)}")
+            if e.status_code == 429:
+                return False, "Service temporarily unavailable (rate limit)"
             return False, "Could not check wallet assets"
             
     except Exception as e:
