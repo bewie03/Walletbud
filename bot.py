@@ -188,7 +188,7 @@ class WalletBud(commands.Bot):
                     try:
                         logger.info(f"Verifying address {address} exists...")
                         await self.rate_limited_request(
-                            self.blockfrost_client.addresses,  # Correct method name
+                            self.blockfrost_client.address_assets,  # Correct method name
                             address=address
                         )
                         
@@ -427,7 +427,7 @@ class WalletBud(commands.Bot):
                 logger.info("Testing Blockfrost connection...")
                 # Test by getting network info instead of health
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self.blockfrost_client.addresses_assets, "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz")  # Test with a known address
+                await loop.run_in_executor(None, self.blockfrost_client.address_assets, "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz")  # Test with a known address
                 
                 logger.info("Blockfrost connection test passed")
                 return True
@@ -480,7 +480,7 @@ class WalletBud(commands.Bot):
             async with self.wallet_task_lock:
                 # Get current assets
                 assets = await self.rate_limited_request(
-                    self.blockfrost_client.addresses_assets,
+                    self.blockfrost_client.address_assets,  # Fixed method name
                     address=address
                 )
                 
@@ -493,7 +493,7 @@ class WalletBud(commands.Bot):
                 
                 # Get recent transactions
                 txs = await self.rate_limited_request(
-                    self.blockfrost_client.addresses_transactions,
+                    self.blockfrost_client.address_transactions,  # Fixed method name
                     address=address,
                     count=10  # Only get recent transactions
                 )
@@ -522,7 +522,7 @@ class WalletBud(commands.Bot):
         try:
             # Get assets with retries
             assets = await self.rate_limited_request(
-                self.blockfrost_client.addresses_assets,  # Correct method name
+                self.blockfrost_client.address_assets,  # Fixed method name
                 address=address
             )
             
