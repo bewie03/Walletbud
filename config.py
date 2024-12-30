@@ -1,7 +1,14 @@
 import os
+import logging
+import re
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def validate_positive_int(value, default, name):
     """Validate and convert environment variable to positive integer"""
@@ -11,7 +18,7 @@ def validate_positive_int(value, default, name):
             raise ValueError
         return result
     except (ValueError, TypeError):
-        print(f"Warning: Invalid {name} value '{value}'. Using default: {default}")
+        logger.warning(f"Invalid {name} value '{value}'. Using default: {default}")
         return default
 
 # Discord Bot Configuration
@@ -39,8 +46,10 @@ REQUIRED_YUMMI_TOKENS = validate_positive_int(
 YUMMI_POLICY_ID = os.getenv('YUMMI_POLICY_ID')
 if not YUMMI_POLICY_ID:
     raise ValueError("No YUMMI_POLICY_ID found! Make sure YUMMI_POLICY_ID is set in .env")
+if not re.fullmatch(r"[a-fA-F0-9]{56}", YUMMI_POLICY_ID):
+    raise ValueError(f"Invalid YUMMI_POLICY_ID format: {YUMMI_POLICY_ID}. Must be a 56-character hexadecimal string.")
 
-# Transaction monitoring settings (with validation)
+# Monitoring Settings
 TRANSACTION_CHECK_INTERVAL = validate_positive_int(
     os.getenv('TRANSACTION_CHECK_INTERVAL', '5'),
     5,
@@ -65,10 +74,22 @@ MAX_TX_HISTORY = validate_positive_int(
     'MAX_TX_HISTORY'
 )
 
-# Rate limiting settings (in seconds)
-API_RETRY_DELAY = 2        # Time to wait after rate limit
-WALLET_CHECK_DELAY = 60    # Time between wallet check cycles
-WALLET_PROCESS_DELAY = 1   # Time between processing each wallet
+# Rate Limiting
+API_RETRY_DELAY = validate_positive_int(
+    os.getenv('API_RETRY_DELAY', '2'),
+    2,
+    'API_RETRY_DELAY'
+)
+WALLET_CHECK_DELAY = validate_positive_int(
+    os.getenv('WALLET_CHECK_DELAY', '60'),
+    60,
+    'WALLET_CHECK_DELAY'
+)
+WALLET_PROCESS_DELAY = validate_positive_int(
+    os.getenv('WALLET_PROCESS_DELAY', '1'),
+    1,
+    'WALLET_PROCESS_DELAY'
+)
 
 # Error Messages
 ERROR_MESSAGES = {
@@ -82,3 +103,10 @@ ERROR_MESSAGES = {
     'monitoring_paused': "Wallet monitoring is currently paused.",
     'db_error': "Database error occurred. Please try again later.",
 }
+
+# Log loaded configuration (excluding sensitive info)
+logger.info(f"Loaded configuration:\nDATABASE_NAME: {DATABASE_NAME}\n"
+            f"REQUIRED_YUMMI_TOKENS: {REQUIRED_YUMMI_TOKENS}\n"
+            f"TRANSACTION_CHECK_INTERVAL: {TRANSACTION_CHECK_INTERVAL}s\n"
+            f"WALLET_CHECK_INTERVAL: {WALLET_CHECK_INTERVAL}s\n"
+            f"YUMMI_CHECK_INTERVAL: {YUMMI_CHECK_INTERVAL} hours\n")
