@@ -30,25 +30,22 @@ if not token:
 else:
     logger.info("Discord token loaded successfully")
 
-# Bot setup with intents
+# Set up intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.dm_messages = True
-intents.guilds = True
-intents.messages = True
-intents.members = True
 
-# Create bot instance
 class WalletBud(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
         self.db = Database()
-        
+        self.tree = app_commands.CommandTree(self)
+
     async def setup_hook(self):
         await self.tree.sync()
+        logger.info("Command tree synced")
         self.check_wallets.start()
-
-bot = WalletBud()
+        logger.info("Started wallet checking task")
 
 # Constants
 YUMMI_POLICY_ID = YUMMI_POLICY_ID
@@ -191,6 +188,72 @@ async def list_wallets(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed)
 
+class WalletSelect(discord.ui.Select):
+    def __init__(self, wallets):
+        options = []
+        for wallet in wallets:
+            truncated = f"{wallet[:8]}...{wallet[-8:]}"
+            options.append(discord.SelectOption(
+                label=truncated,
+                value=wallet,
+                description="Click to remove this wallet"
+            ))
+        
+        super().__init__(
+            placeholder="Select a wallet to remove...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        wallet_address = self.values[0]
+        try:
+            if bot.db.remove_wallet(str(interaction.user.id), wallet_address):
+                embed = discord.Embed(
+                    title="✅ Wallet Removed",
+                    description="The wallet has been removed from tracking.",
+                    color=discord.Color.green()
+                )
+                embed.add_field(
+                    name="Wallet Address",
+                    value=f"`{wallet_address[:8]}...{wallet_address[-8:]}`",
+                    inline=False
+                )
+                await interaction.response.send_message(embed=embed)
+            else:
+                await interaction.response.send_message("❌ Failed to remove wallet. Please try again.")
+        except Exception as e:
+            logger.error(f"Error removing wallet: {str(e)}")
+            await interaction.response.send_message("An error occurred. Please try again.")
+
+class WalletSelectView(discord.ui.View):
+    def __init__(self, wallets):
+        super().__init__()
+        self.add_item(WalletSelect(wallets))
+
+@bot.tree.command(name="remove_wallet", description="Remove a wallet from tracking")
+async def remove_wallet(interaction: discord.Interaction):
+    """Remove a wallet using a dropdown menu"""
+    if not isinstance(interaction.channel, discord.DMChannel):
+        await interaction.response.send_message("Please use this command in DMs!", ephemeral=True)
+        return
+
+    try:
+        wallets = bot.db.get_user_wallets(str(interaction.user.id))
+        if not wallets:
+            await interaction.response.send_message("You don't have any registered wallets to remove.")
+            return
+
+        view = WalletSelectView(wallets)
+        await interaction.response.send_message(
+            "Select the wallet you want to remove:",
+            view=view
+        )
+    except Exception as e:
+        logger.error(f"Error showing wallet list: {str(e)}")
+        await interaction.response.send_message("An error occurred. Please try again.")
+
 @tasks.loop(minutes=TRANSACTION_CHECK_INTERVAL)
 async def check_wallets():
     """Check all active wallets for new transactions"""
@@ -248,6 +311,8 @@ async def check_wallets():
                 
         except Exception as e:
             logger.error(f"Error processing wallet {wallet_address}: {str(e)}")
+
+bot = WalletBud()
 
 if __name__ == "__main__":
     bot.run(token)
