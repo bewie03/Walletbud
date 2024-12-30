@@ -42,10 +42,22 @@ class WalletBud(commands.Bot):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        await self.tree.sync()
-        logger.info("Command tree synced")
-        self.check_wallets.start()
-        logger.info("Started wallet checking task")
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Synced {len(synced)} command(s)")
+            self.check_wallets.start()
+            logger.info("Started wallet checking task")
+        except Exception as e:
+            logger.error(f"Error in setup_hook: {str(e)}")
+
+    async def on_ready(self):
+        logger.info(f'{self.user} has connected to Discord!')
+        logger.info(f'Bot is in {len(self.guilds)} guilds')
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Re-synced {len(synced)} command(s) on ready")
+        except Exception as e:
+            logger.error(f"Error syncing commands: {str(e)}")
 
 # Constants
 YUMMI_POLICY_ID = YUMMI_POLICY_ID
@@ -58,12 +70,12 @@ blockfrost_client = blockfrost.BlockFrostApi(
     base_url='https://cardano-mainnet.blockfrost.io/api/v0'
 )
 
-@bot.event
+@WalletBud.event
 async def on_ready():
-    logger.info(f'Bot {bot.user} is ready and online!')
+    logger.info(f'Bot {WalletBud.user} is ready and online!')
     try:
         # Set bot presence
-        await bot.change_presence(
+        await WalletBud.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
                 name="YUMMI wallets | DM me!"
@@ -134,9 +146,9 @@ class WalletModal(discord.ui.Modal, title='Add Wallet'):
             return
 
         try:
-            bot.db.add_user(str(interaction.user.id))
-            if bot.db.add_wallet(str(interaction.user.id), wallet_address):
-                bot.db.update_wallet_status(wallet_address, True)
+            WalletBud.db.add_user(str(interaction.user.id))
+            if WalletBud.db.add_wallet(str(interaction.user.id), wallet_address):
+                WalletBud.db.update_wallet_status(wallet_address, True)
                 embed = discord.Embed(
                     title="✅ Wallet Added Successfully!",
                     description="You will receive DM notifications for transactions.",
@@ -154,20 +166,20 @@ class WalletModal(discord.ui.Modal, title='Add Wallet'):
             logger.error(f"Error adding wallet: {str(e)}")
             await interaction.response.send_message("An error occurred while adding the wallet. Please try again.")
 
-@bot.tree.command(name="addwallet", description="Add a Cardano wallet for tracking (requires 20,000 YUMMI tokens)")
+@WalletBud.tree.command(name="addwallet", description="Add a Cardano wallet for tracking (requires 20,000 YUMMI tokens)")
 async def add_wallet(interaction: discord.Interaction):
     if not isinstance(interaction.channel, discord.DMChannel):
         await interaction.response.send_message("Please use this command in DMs!", ephemeral=True)
         return
     await interaction.response.send_modal(WalletModal())
 
-@bot.tree.command(name="list_wallets", description="List your registered wallets")
+@WalletBud.tree.command(name="list_wallets", description="List your registered wallets")
 async def list_wallets(interaction: discord.Interaction):
     if not isinstance(interaction.channel, discord.DMChannel):
         await interaction.response.send_message("Please use this command in DMs!", ephemeral=True)
         return
         
-    wallets = bot.db.get_user_wallets(str(interaction.user.id))
+    wallets = WalletBud.db.get_user_wallets(str(interaction.user.id))
     if not wallets:
         await interaction.response.send_message("You don't have any registered wallets.")
         return
@@ -209,7 +221,7 @@ class WalletSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         wallet_address = self.values[0]
         try:
-            if bot.db.remove_wallet(str(interaction.user.id), wallet_address):
+            if WalletBud.db.remove_wallet(str(interaction.user.id), wallet_address):
                 embed = discord.Embed(
                     title="✅ Wallet Removed",
                     description="The wallet has been removed from tracking.",
@@ -232,7 +244,7 @@ class WalletSelectView(discord.ui.View):
         super().__init__()
         self.add_item(WalletSelect(wallets))
 
-@bot.tree.command(name="remove_wallet", description="Remove a wallet from tracking")
+@WalletBud.tree.command(name="remove_wallet", description="Remove a wallet from tracking")
 async def remove_wallet(interaction: discord.Interaction):
     """Remove a wallet using a dropdown menu"""
     if not isinstance(interaction.channel, discord.DMChannel):
@@ -240,7 +252,7 @@ async def remove_wallet(interaction: discord.Interaction):
         return
 
     try:
-        wallets = bot.db.get_user_wallets(str(interaction.user.id))
+        wallets = WalletBud.db.get_user_wallets(str(interaction.user.id))
         if not wallets:
             await interaction.response.send_message("You don't have any registered wallets to remove.")
             return
@@ -257,7 +269,7 @@ async def remove_wallet(interaction: discord.Interaction):
 @tasks.loop(minutes=TRANSACTION_CHECK_INTERVAL)
 async def check_wallets():
     """Check all active wallets for new transactions"""
-    active_wallets = bot.db.get_all_active_wallets()
+    active_wallets = WalletBud.db.get_all_active_wallets()
     
     for wallet_address, discord_id in active_wallets:
         try:
@@ -265,9 +277,9 @@ async def check_wallets():
             has_balance, message = check_yummi_balance(wallet_address)
             if not has_balance:
                 logger.info(f"Deactivating wallet {wallet_address}: {message}")
-                bot.db.update_wallet_status(wallet_address, False)
+                WalletBud.db.update_wallet_status(wallet_address, False)
                 try:
-                    user = await bot.fetch_user(int(discord_id))
+                    user = await WalletBud.fetch_user(int(discord_id))
                     if user:
                         embed = discord.Embed(
                             title="❌ Wallet Deactivated",
@@ -299,7 +311,7 @@ async def check_wallets():
                             inline=False
                         )
                         
-                        user = await bot.fetch_user(int(discord_id))
+                        user = await WalletBud.fetch_user(int(discord_id))
                         if user:
                             await user.send(embed=embed)
                             
@@ -312,7 +324,7 @@ async def check_wallets():
         except Exception as e:
             logger.error(f"Error processing wallet {wallet_address}: {str(e)}")
 
-bot = WalletBud()
+WalletBud = WalletBud()
 
 if __name__ == "__main__":
-    bot.run(token)
+    WalletBud.run(token)
