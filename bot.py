@@ -5,7 +5,6 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from uuid import uuid4
-from functools import wraps
 import time
 
 import discord
@@ -25,12 +24,19 @@ from database import (
     add_transaction
 )
 
+# Configure logging
+log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+logger.info(f"Starting bot with log level: {log_level}")
+
 # Create request ID for logging
 def get_request_id():
     return str(uuid4())[:8]
-
-# Set up logging
-logger = logging.getLogger(__name__)
 
 def dm_only():
     """Check if command is used in DM"""
@@ -56,6 +62,33 @@ def has_blockfrost():
             return False
         return True
     return app_commands.check(predicate)
+
+class RateLimiter:
+    """Rate limiter for API requests"""
+    def __init__(self, requests_per_second, burst_limit):
+        self.requests_per_second = requests_per_second
+        self.burst_limit = burst_limit
+        self.tokens = burst_limit
+        self.last_update = time.monotonic()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self):
+        """Acquire a rate limit token"""
+        async with self.lock:
+            now = time.monotonic()
+            time_passed = now - self.last_update
+            self.tokens = min(
+                self.burst_limit,
+                self.tokens + time_passed * self.requests_per_second
+            )
+            
+            if self.tokens < 1:
+                wait_time = (1 - self.tokens) / self.requests_per_second
+                await asyncio.sleep(wait_time)
+                self.tokens = 1
+            
+            self.tokens -= 1
+            self.last_update = now
 
 class WalletBud(commands.Bot):
     def __init__(self):
@@ -90,15 +123,36 @@ class WalletBud(commands.Bot):
             
             # Initialize database
             logger.info("Initializing database...")
-            await init_db()
+            try:
+                await init_db()
+                logger.info("Database initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize database: {str(e)}")
+                raise
             
             # Initialize Blockfrost client
             logger.info("Initializing Blockfrost client...")
-            await self.init_blockfrost()
+            try:
+                if not await self.init_blockfrost():
+                    raise Exception("Failed to initialize Blockfrost client")
+                logger.info("Blockfrost client initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize Blockfrost client: {str(e)}")
+                raise
+            
+            # Setup commands
+            logger.info("Setting up commands...")
+            try:
+                await self.setup_commands()
+                logger.info("Commands set up successfully")
+            except Exception as e:
+                logger.error(f"Failed to set up commands: {str(e)}")
+                raise
             
             # Start background tasks
             logger.info("Starting background tasks...")
-            self.check_wallets.start()
+            # Temporarily commenting out background task
+            # self.check_wallets.start()
             
             logger.info("Bot initialization complete!")
             
@@ -109,68 +163,41 @@ class WalletBud(commands.Bot):
     async def setup_commands(self):
         """Set up bot commands using app_commands"""
         try:
-            # Define command callbacks
-            async def addwallet_callback(interaction: discord.Interaction, address: str):
+            logger.info("Setting up commands...")
+            
+            # Add commands using app_commands.CommandTree
+            @self.tree.command(name='addwallet', description='Add a wallet to monitor')
+            @app_commands.check(dm_only())
+            @app_commands.check(has_blockfrost())
+            async def addwallet(interaction: discord.Interaction, address: str):
                 await self.addwallet_command(interaction, address)
-                
-            async def removewallet_callback(interaction: discord.Interaction, address: str):
+            
+            @self.tree.command(name='removewallet', description='Remove a wallet from monitoring')
+            @app_commands.check(dm_only())
+            async def removewallet(interaction: discord.Interaction, address: str):
                 await self.removewallet_command(interaction, address)
-                
-            async def listwallets_callback(interaction: discord.Interaction):
+            
+            @self.tree.command(name='listwallets', description='List your monitored wallets')
+            @app_commands.check(dm_only())
+            async def listwallets(interaction: discord.Interaction):
                 await self.listwallets_command(interaction)
-                
-            async def help_callback(interaction: discord.Interaction):
+            
+            @self.tree.command(name='help', description='Show bot help and commands')
+            async def help(interaction: discord.Interaction):
                 await self.help_command(interaction)
-                
-            async def health_callback(interaction: discord.Interaction):
+            
+            @self.tree.command(name='health', description='Check bot health status')
+            async def health(interaction: discord.Interaction):
                 await self.health_command(interaction)
-            
-            # Create commands
-            addwallet_cmd = app_commands.Command(
-                name='addwallet',
-                description='Add a wallet to monitor',
-                callback=addwallet_callback
-            )
-            addwallet_cmd.add_check(dm_only())
-            addwallet_cmd.add_check(has_blockfrost())
-            
-            removewallet_cmd = app_commands.Command(
-                name='removewallet',
-                description='Remove a wallet from monitoring',
-                callback=removewallet_callback
-            )
-            removewallet_cmd.add_check(dm_only())
-            
-            listwallets_cmd = app_commands.Command(
-                name='listwallets',
-                description='List your monitored wallets',
-                callback=listwallets_callback
-            )
-            listwallets_cmd.add_check(dm_only())
-            
-            help_cmd = app_commands.Command(
-                name='help',
-                description='Show bot help and commands',
-                callback=help_callback
-            )
-            
-            health_cmd = app_commands.Command(
-                name='health',
-                description='Check bot and API status',
-                callback=health_callback
-            )
-            
-            # Add commands to tree
-            self.tree.add_command(addwallet_cmd)
-            self.tree.add_command(removewallet_cmd)
-            self.tree.add_command(listwallets_cmd)
-            self.tree.add_command(help_cmd)
-            self.tree.add_command(health_cmd)
             
             # Sync with Discord
             logger.info("Syncing commands with Discord...")
-            await self.tree.sync()
-            logger.info("Commands synced successfully")
+            try:
+                await self.tree.sync()
+                logger.info("Commands synced with Discord successfully")
+            except Exception as e:
+                logger.error(f"Failed to sync commands with Discord: {str(e)}")
+                raise
             
         except Exception as e:
             logger.error(f"Error setting up commands: {str(e)}")
@@ -179,7 +206,12 @@ class WalletBud(commands.Bot):
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
         try:
-            logger.info("Initializing Blockfrost client...")
+            logger.info("Creating Blockfrost client...")
+            
+            # Check API key
+            if not BLOCKFROST_API_KEY:
+                logger.error("BLOCKFROST_API_KEY not set")
+                return False
             
             # Create client
             self.blockfrost_client = BlockFrostApi(
@@ -189,15 +221,16 @@ class WalletBud(commands.Bot):
             
             # Test connection
             try:
+                logger.info("Testing Blockfrost connection...")
                 # Run health check in a thread to avoid blocking
                 loop = asyncio.get_event_loop()
                 health = await loop.run_in_executor(None, self.blockfrost_client.health)
                 
                 if health:
-                    logger.info("Blockfrost client initialized successfully")
+                    logger.info("Blockfrost health check passed")
                     return True
                 else:
-                    logger.error("Failed to verify Blockfrost API health")
+                    logger.error("Blockfrost health check failed")
                     self.blockfrost_client = None
                     return False
                 
@@ -207,7 +240,7 @@ class WalletBud(commands.Bot):
                 return False
             
         except Exception as e:
-            logger.error(f"Failed to initialize Blockfrost client: {str(e)}")
+            logger.error(f"Failed to create Blockfrost client: {str(e)}")
             self.blockfrost_client = None
             return False
 
