@@ -33,11 +33,22 @@ async def on_ready():
     print(f'{bot.user} is ready and online!')
     try:
         print("Starting to sync commands...")
-        commands = await bot.sync_commands(guild=None)  # Set to None for global commands
-        print(f"Synced {len(commands)} commands globally")
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} commands")
+        check_wallets.start()
     except Exception as e:
         print(f"Error syncing commands: {e}")
-    check_wallets.start()
+
+@bot.event
+async def on_application_command_error(ctx, error):
+    """Handle command errors gracefully"""
+    if isinstance(error, discord.app_commands.CommandOnCooldown):
+        await ctx.response.send_message(f"This command is on cooldown. Try again in {error.retry_after:.2f} seconds.")
+    elif isinstance(error, discord.app_commands.MissingPermissions):
+        await ctx.response.send_message("You don't have permission to use this command.")
+    else:
+        print(f"Command error: {str(error)}")
+        await ctx.response.send_message("An error occurred while processing your command. Please try again later.")
 
 def check_yummi_balance(wallet_address):
     """Check if wallet has required amount of YUMMI tokens"""
@@ -100,22 +111,24 @@ def check_yummi_balance(wallet_address):
         print(f"Unexpected error: {str(e)}")
         return False, "An unexpected error occurred"
 
-@bot.tree.command(name="addwallet", description="Add a Cardano wallet for tracking (requires 20,000 YUMMI tokens)")
+@bot.tree.command(
+    name="addwallet",
+    description="Add a Cardano wallet for tracking (requires 20,000 YUMMI tokens)"
+)
 async def add_wallet(interaction: discord.Interaction):
+    """Add a new wallet for tracking"""
     modal = WalletModal()
     await interaction.response.send_modal(modal)
 
-class WalletModal(discord.ui.Modal):
-    def __init__(self):
-        super().__init__(title="Add Wallet")
-        self.wallet = discord.ui.InputText(
-            label="Wallet Address",
-            placeholder="Enter your Cardano wallet address",
-            style=discord.InputTextStyle.short
-        )
-        self.add_item(self.wallet)
+class WalletModal(discord.ui.Modal, title="Add Wallet"):
+    wallet = discord.ui.TextInput(
+        label="Wallet Address",
+        placeholder="Enter your Cardano wallet address",
+        style=discord.TextStyle.short,
+        required=True
+    )
 
-    async def callback(self, interaction: discord.Interaction):
+    async def on_submit(self, interaction: discord.Interaction):
         wallet_address = self.wallet.value
         
         # Validate wallet address format
@@ -205,7 +218,10 @@ class WalletSelect(discord.ui.Select):
         except Exception as e:
             await interaction.response.send_message(f"An error occurred: {str(e)}")
 
-@bot.tree.command(name="list_wallets", description="List all your registered wallets")
+@bot.tree.command(
+    name="list_wallets",
+    description="List all your registered wallets and their status"
+)
 async def list_wallets(interaction: discord.Interaction):
     """List all wallets registered to the user"""
     try:
@@ -240,7 +256,10 @@ async def list_wallets(interaction: discord.Interaction):
     except Exception as e:
         await interaction.response.send_message(f"An error occurred: {str(e)}")
 
-@bot.tree.command(name="remove_wallet", description="Remove a wallet from tracking")
+@bot.tree.command(
+    name="remove_wallet",
+    description="Remove a wallet from tracking"
+)
 async def remove_wallet(interaction: discord.Interaction):
     """Remove a wallet from tracking using a dropdown menu"""
     try:
