@@ -96,6 +96,7 @@ class WalletBud(commands.Bot):
         self.processing_wallets = False
         self.monitoring_paused = False
         self.tree = app_commands.CommandTree(self)
+        self.tree.copy_global_to_guild = True  # Copy global commands to guilds
         
     async def setup_hook(self):
         """Setup the bot when it starts"""
