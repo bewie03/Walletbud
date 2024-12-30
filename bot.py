@@ -118,6 +118,10 @@ class WalletBud(commands.Bot):
         self.blockfrost_client = None
         self.monitoring_paused = False
         
+        # Initialize locks for task management
+        self.wallet_task_lock = asyncio.Lock()
+        self.processing_wallets = False
+        
         # Register commands only once during initialization
         self.setup_commands()
         
@@ -402,59 +406,40 @@ class WalletBud(commands.Bot):
     @tasks.loop(minutes=WALLET_CHECK_INTERVAL)
     async def check_wallets(self):
         """Background task to check all wallets"""
-        while not self.is_closed():
-            try:
-                async with self.wallet_task_lock:
-                    if self.processing_wallets:
-                        logger.warning("Wallet check already in progress, skipping...")
-                        continue
-                        
-                    self.processing_wallets = True
+        if self.monitoring_paused:
+            logger.info("Wallet monitoring is paused")
+            return
+            
+        try:
+            if not hasattr(self, 'wallet_task_lock'):
+                self.wallet_task_lock = asyncio.Lock()
+                self.processing_wallets = False
+                logger.info("Initialized wallet task lock")
+                
+            async with self.wallet_task_lock:
+                if self.processing_wallets:
+                    logger.warning("Previous wallet check still in progress, skipping")
+                    return
                     
+                self.processing_wallets = True
                 try:
                     # Get all active wallets
                     self.cursor.execute('''
-                        SELECT w.id, w.address, w.discord_id, w.last_checked
-                        FROM wallets w
-                        WHERE w.is_active = TRUE
-                        ORDER BY w.last_checked ASC NULLS FIRST
-                        LIMIT ?
-                    ''', (WALLET_BATCH_SIZE,))
-                    
+                        SELECT w.*, u.discord_id 
+                        FROM wallets w 
+                        JOIN users u ON w.user_id = u.id 
+                        WHERE w.is_active = 1
+                    ''')
                     wallets = self.cursor.fetchall()
                     
                     if not wallets:
                         logger.info("No active wallets to check")
-                        continue
-                    
-                    logger.info(f"Checking {len(wallets)} wallets...")
-                    
-                    # Track API requests for rate limiting
-                    request_count = 0
-                    rate_limit_reached = False
+                        return
+                        
+                    logger.info(f"Checking {len(wallets)} active wallets...")
                     
                     for wallet in wallets:
                         try:
-                            # Check if we're approaching rate limit
-                            if request_count >= MAX_REQUESTS_PER_SECOND:
-                                rate_limit_reached = True
-                                await self.notify_admin(
-                                    "Rate limit threshold reached, pausing wallet checks",
-                                    "WARNING"
-                                )
-                                break
-                                
-                            # Check YUMMI balance
-                            success, result = await self.check_yummi_balance(wallet['address'])
-                            request_count += 1
-                            
-                            # Update last checked time
-                            update_last_checked(wallet['id'])
-                            
-                            if not success:
-                                logger.warning(f"Failed to check wallet {wallet['address']}: {result}")
-                                continue
-                                
                             # Get user's DM channel
                             user = await self.fetch_user(int(wallet['discord_id']))
                             if not user:
@@ -463,35 +448,41 @@ class WalletBud(commands.Bot):
                                 
                             dm_channel = await user.create_dm()
                             
-                            # Send notification if balance is too low
-                            if isinstance(result, int) and result < REQUIRED_YUMMI_TOKENS:
-                                await dm_channel.send(
-                                    f" Your wallet `{wallet['address']}` has insufficient YUMMI tokens!\n"
-                                    f"Required: {REQUIRED_YUMMI_TOKENS:,}\n"
-                                    f"Current: {result:,}"
-                                )
+                            # Check YUMMI balance
+                            success, result = await self.check_yummi_balance(wallet['address'])
                             
+                            if success:
+                                # Update last checked time
+                                self.cursor.execute(
+                                    'UPDATE wallets SET last_checked = ? WHERE address = ?',
+                                    (datetime.utcnow().isoformat(), wallet['address'])
+                                )
+                                self.conn.commit()
+                                
+                                # Send notification if balance is too low
+                                if isinstance(result, int) and result < REQUIRED_YUMMI_TOKENS:
+                                    await dm_channel.send(
+                                        f"Your wallet `{wallet['address']}` has insufficient YUMMI tokens!\n"
+                                        f"Required: {REQUIRED_YUMMI_TOKENS:,}\n"
+                                        f"Current: {result:,}"
+                                    )
+                            else:
+                                logger.warning(f"Failed to check balance for {wallet['address']}: {result}")
+                                
                         except Exception as e:
-                            error_msg = f"Error checking wallet {wallet['address']}: {str(e)}"
-                            logger.error(error_msg)
-                            await self.notify_admin(error_msg, "ERROR")
+                            logger.error(f"Error checking wallet {wallet['address']}: {str(e)}")
                             continue
                             
-                    if rate_limit_reached:
-                        # Add extra delay if we hit rate limit
-                        await asyncio.sleep(RATE_LIMIT_DELAY)
-                        
                 finally:
                     self.processing_wallets = False
                     
-            except Exception as e:
-                error_msg = f"Error in wallet check task: {str(e)}"
-                logger.error(error_msg)
-                await self.notify_admin(error_msg, "ERROR")
+        except Exception as e:
+            logger.error(f"Error in wallet check task: {str(e)}")
+            try:
+                await self.notify_admin(f"Error in wallet check task: {str(e)}", "ERROR")
+            except:
+                pass  # Ignore notification errors
                 
-            # Wait before next check
-            await asyncio.sleep(WALLET_CHECK_INTERVAL)
-            
 if __name__ == "__main__":
     try:
         logger.info("Starting WalletBud bot...")
