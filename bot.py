@@ -97,6 +97,7 @@ class WalletBud(commands.Bot):
         self.blockfrost_client = None
         self.processing_wallets = False
         self.monitoring_paused = False
+        self.wallet_check_task = tasks.loop(minutes=TRANSACTION_CHECK_INTERVAL)(self.wallet_check)
         
         # Initialize database
         if not init_db():
@@ -117,7 +118,7 @@ class WalletBud(commands.Bot):
             self.tree.command(name="togglemonitor", description="Toggle wallet monitoring")(self.toggle_monitoring)
             
             # Start wallet checking task
-            self.check_wallets.start()
+            self.wallet_check_task.start()
             
             # Sync commands
             await self.tree.sync()
@@ -144,8 +145,7 @@ class WalletBud(commands.Bot):
             self.blockfrost_client = None
             raise
 
-    @tasks.loop(minutes=TRANSACTION_CHECK_INTERVAL)
-    async def check_wallets(self):
+    async def wallet_check(self):
         """Check all active wallets for new transactions"""
         if not self.is_ready() or not self.blockfrost_client:
             return
@@ -205,11 +205,17 @@ class WalletBud(commands.Bot):
         finally:
             self.processing_wallets = False
 
-    @check_wallets.before_loop
-    async def before_check_wallets(self):
+    async def before_wallet_check(self):
         """Wait until bot is ready before starting the task"""
         await self.wait_until_ready()
         logger.info("Starting wallet check task")
+
+    async def close(self):
+        """Cleanup when bot is shutting down"""
+        logger.info("Bot is shutting down...")
+        if hasattr(self, 'wallet_check_task') and self.wallet_check_task.is_running():
+            self.wallet_check_task.cancel()
+        await super().close()
 
     async def check_wallet_transactions(self, wallet_address, discord_id):
         """Check transactions for a wallet"""
