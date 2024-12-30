@@ -87,8 +87,8 @@ async def add_wallet(user_id: str, address: str) -> bool:
                 user_id
             )
             
-            # Then add wallet
-            await conn.execute(
+            # Then add wallet and check if it was actually added
+            result = await conn.execute(
                 '''
                 INSERT INTO wallets (user_id, address)
                 VALUES ($1, $2)
@@ -96,7 +96,8 @@ async def add_wallet(user_id: str, address: str) -> bool:
                 ''',
                 user_id, address
             )
-            return True
+            # Check if a row was actually inserted
+            return result.split()[2] == '1'
             
     except Exception as e:
         logger.error(f"Error adding wallet: {str(e)}")
@@ -111,7 +112,8 @@ async def remove_wallet(user_id: str, address: str) -> bool:
                 'DELETE FROM wallets WHERE user_id = $1 AND address = $2',
                 user_id, address
             )
-            return 'DELETE' in result
+            # Check if any rows were actually deleted
+            return result.split()[1] != '0'
             
     except Exception as e:
         logger.error(f"Error removing wallet: {str(e)}")
