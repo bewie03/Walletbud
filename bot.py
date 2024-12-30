@@ -1,12 +1,13 @@
 import os
+import logging
+import sqlite3
+import asyncio
+from datetime import datetime, timedelta
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import logging
-import sqlite3
-from datetime import datetime, timedelta
-import asyncio
-from blockfrost import BlockFrostApi
+
 from config import *
 
 # Set up logging
@@ -44,43 +45,6 @@ def init_db():
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
         return False
-
-def dm_only():
-    """Check if command is being used in DMs"""
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if not isinstance(interaction.channel, discord.DMChannel):
-            await interaction.response.send_message(ERROR_MESSAGES['dm_only'], ephemeral=True)
-            return False
-        return True
-    return app_commands.check(predicate)
-
-def has_blockfrost():
-    """Check if Blockfrost API is available"""
-    async def predicate(interaction: discord.Interaction) -> bool:
-        bot = interaction.client
-        if not bot.blockfrost_client:
-            await interaction.response.send_message(ERROR_MESSAGES['api_unavailable'], ephemeral=True)
-            return False
-        return True
-    return app_commands.check(predicate)
-
-def not_monitoring_paused():
-    """Check if wallet monitoring is not paused"""
-    async def predicate(interaction: discord.Interaction) -> bool:
-        bot = interaction.client
-        if bot.monitoring_paused:
-            await interaction.response.send_message(ERROR_MESSAGES['monitoring_paused'], ephemeral=True)
-            return False
-        return True
-    return app_commands.check(predicate)
-
-def cooldown_5s():
-    """5 second cooldown between commands"""
-    return commands.cooldown(1, 5, commands.BucketType.user)
-
-def cooldown_10s():
-    """10 second cooldown between commands"""
-    return commands.cooldown(1, 10, commands.BucketType.user)
 
 class WalletModal(discord.ui.Modal, title='Add Wallet'):
     def __init__(self, bot):
@@ -175,10 +139,10 @@ class WalletBud(commands.Bot):
         intents.guilds = True          # Required for slash commands
         intents.message_content = True # Required for commands
         
-        # Create command tree before initializing bot
-        self.tree = app_commands.CommandTree(self)
-        
         super().__init__(command_prefix=COMMAND_PREFIX, intents=intents)
+        
+        # Create command tree
+        self.tree = app_commands.CommandTree(self)
         
         # Initialize core components
         self.blockfrost_client = None
@@ -188,33 +152,63 @@ class WalletBud(commands.Bot):
         
         # Remove default help command
         self.remove_command('help')
-        
-        # Register all commands
-        self.setup_commands()
 
-    def setup_commands(self):
+    async def setup_hook(self):
+        """Initialize the bot's command tree and sync commands"""
+        try:
+            # Initialize database
+            if not init_db():
+                raise RuntimeError("Failed to initialize database")
+
+            # Initialize Blockfrost API (non-blocking)
+            try:
+                await self.init_blockfrost()
+            except Exception as e:
+                logger.error(f"Blockfrost initialization failed: {e}")
+                logger.warning("Bot will start without Blockfrost...")
+            
+            # Register commands
+            self.register_commands()
+            
+            # Only sync commands once and globally
+            if not self._command_tree_synced:
+                try:
+                    logger.info("Syncing commands...")
+                    await self.tree.sync()
+                    self._command_tree_synced = True
+                    logger.info("Commands synced successfully")
+                except Exception as e:
+                    logger.error(f"Failed to sync commands: {e}")
+            
+        except Exception as e:
+            logger.error(f"Setup failed: {e}")
+            raise
+
+    def register_commands(self):
         """Register all commands with the command tree"""
-        # Add wallet command
+        
         @self.tree.command(
             name="addwallet",
             description="Add a Cardano wallet for tracking"
         )
-        @dm_only()
-        @has_blockfrost()
-        @not_monitoring_paused()
-        @cooldown_10s()
-        async def add_wallet_command(interaction: discord.Interaction):
+        async def addwallet(interaction: discord.Interaction):
+            """Add a wallet to monitor"""
+            if not isinstance(interaction.channel, discord.DMChannel):
+                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                return
             modal = WalletModal(self)
             await interaction.response.send_modal(modal)
-        
-        # Remove wallet command
+
         @self.tree.command(
             name="removewallet",
             description="Remove a wallet from monitoring"
         )
-        @dm_only()
-        @cooldown_5s()
-        async def remove_wallet(interaction: discord.Interaction, wallet_address: str):
+        async def removewallet(interaction: discord.Interaction, wallet_address: str):
+            """Remove a wallet from monitoring"""
+            if not isinstance(interaction.channel, discord.DMChannel):
+                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                return
+            
             with sqlite3.connect(DATABASE_NAME) as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT discord_id FROM wallets WHERE address = ?', (wallet_address,))
@@ -247,15 +241,17 @@ class WalletBud(commands.Bot):
                     color=discord.Color.green()
                 )
                 await interaction.response.send_message(embed=embed, ephemeral=True)
-        
-        # List wallets command
+
         @self.tree.command(
             name="listwallets",
-            description="List all monitored wallets"
+            description="List all your monitored wallets"
         )
-        @dm_only()
-        @cooldown_5s()
-        async def list_wallets(interaction: discord.Interaction):
+        async def listwallets(interaction: discord.Interaction):
+            """List all monitored wallets"""
+            if not isinstance(interaction.channel, discord.DMChannel):
+                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                return
+            
             with sqlite3.connect(DATABASE_NAME) as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT address, is_active FROM wallets WHERE discord_id = ?', (str(interaction.user.id),))
@@ -282,14 +278,13 @@ class WalletBud(commands.Bot):
                     )
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
-        
-        # Help command
+
         @self.tree.command(
             name="help",
-            description="Show available commands"
+            description="Show all available commands"
         )
-        @cooldown_5s()
-        async def help_command(interaction: discord.Interaction):
+        async def help(interaction: discord.Interaction):
+            """Show help information"""
             embed = discord.Embed(
                 title="WalletBud Commands",
                 description="Here are all available commands:",
@@ -298,17 +293,17 @@ class WalletBud(commands.Bot):
             
             embed.add_field(
                 name="/addwallet",
-                value="Add a Cardano wallet to monitor",
+                value="Add a Cardano wallet to monitor (DM only)",
                 inline=False
             )
             embed.add_field(
                 name="/removewallet",
-                value="Remove a wallet from monitoring",
+                value="Remove a wallet from monitoring (DM only)",
                 inline=False
             )
             embed.add_field(
                 name="/listwallets",
-                value="List all your monitored wallets",
+                value="List all your monitored wallets (DM only)",
                 inline=False
             )
             embed.add_field(
@@ -318,14 +313,13 @@ class WalletBud(commands.Bot):
             )
             
             await interaction.response.send_message(embed=embed, ephemeral=True)
-        
-        # Health check command
+
         @self.tree.command(
             name="health",
             description="Check bot health status"
         )
-        @cooldown_5s()
-        async def health_check(interaction: discord.Interaction):
+        async def health(interaction: discord.Interaction):
+            """Check bot health"""
             embed = discord.Embed(
                 title="Bot Health Status",
                 color=discord.Color.blue()
@@ -362,34 +356,6 @@ class WalletBud(commands.Bot):
             )
             
             await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def setup_hook(self):
-        """Initialize the bot's command tree and sync commands"""
-        try:
-            # Initialize database
-            if not init_db():
-                raise RuntimeError("Failed to initialize database")
-
-            # Initialize Blockfrost API (non-blocking)
-            try:
-                await self.init_blockfrost()
-            except Exception as e:
-                logger.error(f"Blockfrost initialization failed: {e}")
-                logger.warning("Bot will start without Blockfrost...")
-            
-            # Only sync commands once and globally
-            if not self._command_tree_synced:
-                # Sync to global command tree
-                await self.tree.sync()
-                # Also sync to all guilds the bot is in
-                for guild in self.guilds:
-                    await self.tree.sync(guild=guild)
-                self._command_tree_synced = True
-                logger.info("Commands synced successfully")
-            
-        except Exception as e:
-            logger.error(f"Setup failed: {e}")
-            raise
 
     async def on_ready(self):
         """Called when the bot is ready"""
