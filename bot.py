@@ -138,11 +138,14 @@ class WalletBud(commands.Bot):
             self.tree.clear_commands(guild=None)
             logger.info("Cleared existing commands")
             
-            # Register slash commands
-            @self.tree.command(name="addwallet", description="Add a wallet to monitor")
+            # Create wallet command group
+            wallet_group = app_commands.Group(name="wallet", description="Wallet management commands")
+            
+            # Add wallet command
+            @wallet_group.command(name="add", description="Add a wallet to monitor")
             @app_commands.describe(address="The Cardano wallet address to monitor")
             @app_commands.checks.cooldown(1, 30.0)  # One use per 30 seconds per user
-            async def addwallet(interaction: discord.Interaction, address: str):
+            async def wallet_add(interaction: discord.Interaction, address: str):
                 """Add a wallet to monitor"""
                 # Check if command is used in DM
                 if interaction.guild is not None:
@@ -202,7 +205,7 @@ class WalletBud(commands.Bot):
                     )
                 except Exception as e:
                     error_msg = str(e)
-                    logger.error(f"Error in addwallet command: {error_msg}")
+                    logger.error(f"Error in wallet add command: {error_msg}")
                     embed = discord.Embed(
                         title="❌ Error",
                         description="An error occurred while processing your request. Please try again later.",
@@ -210,10 +213,11 @@ class WalletBud(commands.Bot):
                     )
                     await interaction.response.send_message(embed=embed)
             
-            @self.tree.command(name="removewallet", description="Remove a wallet from monitoring")
+            # Remove wallet command
+            @wallet_group.command(name="remove", description="Remove a wallet from monitoring")
             @app_commands.describe(address="The Cardano wallet address to stop monitoring")
             @app_commands.checks.cooldown(1, 10.0)  # One use per 10 seconds per user
-            async def removewallet(interaction: discord.Interaction, address: str):
+            async def wallet_remove(interaction: discord.Interaction, address: str):
                 """Remove a wallet from monitoring"""
                 # Check if command is used in DM
                 if interaction.guild is not None:
@@ -259,7 +263,7 @@ class WalletBud(commands.Bot):
                     )
                 except Exception as e:
                     error_msg = str(e)
-                    logger.error(f"Error in removewallet command: {error_msg}")
+                    logger.error(f"Error in wallet remove command: {error_msg}")
                     embed = discord.Embed(
                         title="❌ Error",
                         description="An error occurred while processing your request.",
@@ -267,9 +271,10 @@ class WalletBud(commands.Bot):
                     )
                     await interaction.response.send_message(embed=embed)
             
-            @self.tree.command(name="listwallets", description="List all your monitored wallets")
+            # List wallets command
+            @wallet_group.command(name="list", description="List all your monitored wallets")
             @app_commands.checks.cooldown(1, 5.0)  # One use per 5 seconds per user
-            async def listwallets(interaction: discord.Interaction):
+            async def wallet_list(interaction: discord.Interaction):
                 """List all wallets being monitored"""
                 # Check if command is used in DM
                 if interaction.guild is not None:
@@ -325,13 +330,17 @@ class WalletBud(commands.Bot):
                     )
                 except Exception as e:
                     error_msg = str(e)
-                    logger.error(f"Error in listwallets command: {error_msg}")
+                    logger.error(f"Error in wallet list command: {error_msg}")
                     embed = discord.Embed(
                         title="❌ Error",
                         description="An error occurred while retrieving your wallets.",
                         color=discord.Color.red()
                     )
                     await interaction.response.send_message(embed=embed)
+            
+            # Add the wallet group to the command tree
+            self.tree.add_command(wallet_group)
+            logger.info("Added wallet command group")
             
             # Error handler for cooldown
             @self.tree.error
