@@ -134,15 +134,17 @@ class WalletModal(discord.ui.Modal, title='Add Wallet'):
 
 class WalletBud(commands.Bot):
     def __init__(self):
+        # Set up intents
         intents = discord.Intents.default()
         intents.dm_messages = True     # For DM notifications
         intents.guilds = True          # Required for slash commands
         intents.message_content = True # Required for commands
         
-        super().__init__(command_prefix=COMMAND_PREFIX, intents=intents)
-        
-        # Create command tree
-        self.tree = app_commands.CommandTree(self)
+        # Initialize the bot with intents
+        super().__init__(
+            command_prefix=COMMAND_PREFIX,
+            intents=intents
+        )
         
         # Initialize core components
         self.blockfrost_client = None
@@ -187,28 +189,19 @@ class WalletBud(commands.Bot):
     def register_commands(self):
         """Register all commands with the command tree"""
         
-        @self.tree.command(
-            name="addwallet",
-            description="Add a Cardano wallet for tracking"
-        )
-        async def addwallet(interaction: discord.Interaction):
-            """Add a wallet to monitor"""
-            if not isinstance(interaction.channel, discord.DMChannel):
-                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
-                return
+        @app_commands.command(name="addwallet", description="Add a Cardano wallet for tracking")
+        @dm_only()
+        @has_blockfrost()
+        @not_monitoring_paused()
+        @cooldown_10s()
+        async def add_wallet_command(self, interaction: discord.Interaction):
             modal = WalletModal(self)
             await interaction.response.send_modal(modal)
 
-        @self.tree.command(
-            name="removewallet",
-            description="Remove a wallet from monitoring"
-        )
-        async def removewallet(interaction: discord.Interaction, wallet_address: str):
-            """Remove a wallet from monitoring"""
-            if not isinstance(interaction.channel, discord.DMChannel):
-                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
-                return
-            
+        @app_commands.command(name="removewallet", description="Remove a wallet from monitoring")
+        @dm_only()
+        @cooldown_5s()
+        async def remove_wallet(self, interaction: discord.Interaction, wallet_address: str):
             with sqlite3.connect(DATABASE_NAME) as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT discord_id FROM wallets WHERE address = ?', (wallet_address,))
@@ -242,16 +235,10 @@ class WalletBud(commands.Bot):
                 )
                 await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        @self.tree.command(
-            name="listwallets",
-            description="List all your monitored wallets"
-        )
-        async def listwallets(interaction: discord.Interaction):
-            """List all monitored wallets"""
-            if not isinstance(interaction.channel, discord.DMChannel):
-                await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
-                return
-            
+        @app_commands.command(name="listwallets", description="List all monitored wallets")
+        @dm_only()
+        @cooldown_5s()
+        async def list_wallets(self, interaction: discord.Interaction):
             with sqlite3.connect(DATABASE_NAME) as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT address, is_active FROM wallets WHERE discord_id = ?', (str(interaction.user.id),))
@@ -279,18 +266,15 @@ class WalletBud(commands.Bot):
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        @self.tree.command(
-            name="help",
-            description="Show all available commands"
-        )
-        async def help(interaction: discord.Interaction):
-            """Show help information"""
+        @app_commands.command(name="help", description="Show available commands")
+        @cooldown_5s()
+        async def help_command(self, interaction: discord.Interaction):
             embed = discord.Embed(
                 title="WalletBud Commands",
                 description="Here are all available commands:",
                 color=discord.Color.blue()
             )
-            
+        
             embed.add_field(
                 name="/addwallet",
                 value="Add a Cardano wallet to monitor (DM only)",
@@ -311,20 +295,17 @@ class WalletBud(commands.Bot):
                 value="Check bot health status",
                 inline=False
             )
-            
+        
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        @self.tree.command(
-            name="health",
-            description="Check bot health status"
-        )
-        async def health(interaction: discord.Interaction):
-            """Check bot health"""
+        @app_commands.command(name="health", description="Check bot health status")
+        @cooldown_5s()
+        async def health_check(self, interaction: discord.Interaction):
             embed = discord.Embed(
                 title="Bot Health Status",
                 color=discord.Color.blue()
             )
-            
+        
             # Check Blockfrost API
             api_status = "🟢 Connected" if self.blockfrost_client else "🔴 Disconnected"
             embed.add_field(
@@ -332,7 +313,7 @@ class WalletBud(commands.Bot):
                 value=api_status,
                 inline=False
             )
-            
+        
             # Check monitoring status
             monitor_status = "🔴 Paused" if self.monitoring_paused else "🟢 Active"
             embed.add_field(
@@ -340,7 +321,7 @@ class WalletBud(commands.Bot):
                 value=monitor_status,
                 inline=False
             )
-            
+        
             # Get total wallets
             with sqlite3.connect(DATABASE_NAME) as conn:
                 cursor = conn.cursor()
@@ -348,13 +329,13 @@ class WalletBud(commands.Bot):
                 total_wallets = cursor.fetchone()[0]
                 cursor.execute('SELECT COUNT(*) FROM wallets WHERE is_active = 1')
                 active_wallets = cursor.fetchone()[0]
-            
+        
             embed.add_field(
                 name="Monitored Wallets",
                 value=f"Total: {total_wallets}\nActive: {active_wallets}",
                 inline=False
             )
-            
+        
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def on_ready(self):
