@@ -11,6 +11,21 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable not set")
 
+# Global connection pool
+_pool = None
+
+async def get_pool():
+    """Get or create database connection pool"""
+    global _pool
+    if _pool is None:
+        try:
+            _pool = await asyncpg.create_pool(DATABASE_URL)
+            logger.info("Created database connection pool")
+        except Exception as e:
+            logger.error(f"Failed to create connection pool: {str(e)}")
+            raise
+    return _pool
+
 # Create tables SQL
 CREATE_TABLES_SQL = """
 -- Drop existing tables
@@ -47,8 +62,8 @@ CREATE TABLE IF NOT EXISTS transactions (
 async def init_db():
     """Initialize database and create tables"""
     try:
-        # Create connection pool
-        pool = await asyncpg.create_pool(DATABASE_URL)
+        # Get pool
+        pool = await get_pool()
         
         # Create tables
         async with pool.acquire() as conn:
@@ -64,7 +79,7 @@ async def init_db():
 async def add_wallet(user_id: str, address: str) -> bool:
     """Add a wallet to monitor"""
     try:
-        pool = await init_db()
+        pool = await get_pool()
         async with pool.acquire() as conn:
             # First ensure user exists
             await conn.execute(
@@ -90,7 +105,7 @@ async def add_wallet(user_id: str, address: str) -> bool:
 async def remove_wallet(user_id: str, address: str) -> bool:
     """Remove a wallet from monitoring"""
     try:
-        pool = await init_db()
+        pool = await get_pool()
         async with pool.acquire() as conn:
             result = await conn.execute(
                 'DELETE FROM wallets WHERE user_id = $1 AND address = $2',
@@ -105,7 +120,7 @@ async def remove_wallet(user_id: str, address: str) -> bool:
 async def get_wallet(user_id: str, address: str):
     """Get a specific wallet"""
     try:
-        pool = await init_db()
+        pool = await get_pool()
         async with pool.acquire() as conn:
             return await conn.fetchrow(
                 'SELECT * FROM wallets WHERE user_id = $1 AND address = $2',
@@ -126,7 +141,7 @@ async def get_all_wallets(user_id: str) -> list[str]:
         list[str]: List of wallet addresses
     """
     try:
-        pool = await init_db()
+        pool = await get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 'SELECT address FROM wallets WHERE user_id = $1',
@@ -141,7 +156,7 @@ async def get_all_wallets(user_id: str) -> list[str]:
 async def update_last_checked(wallet_id: int, timestamp: datetime = None):
     """Update last checked timestamp for a wallet"""
     try:
-        pool = await init_db()
+        pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
                 'UPDATE wallets SET last_checked = $1 WHERE wallet_id = $2',
@@ -156,7 +171,7 @@ async def update_last_checked(wallet_id: int, timestamp: datetime = None):
 async def add_transaction(wallet_id: int, tx_hash: str, timestamp: datetime = None):
     """Add a transaction"""
     try:
-        pool = await init_db()
+        pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
                 '''

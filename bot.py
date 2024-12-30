@@ -162,25 +162,201 @@ class WalletBud(commands.Bot):
             @app_commands.check(dm_only())
             @app_commands.check(has_blockfrost())
             async def addwallet(interaction: discord.Interaction, address: str):
-                await self.addwallet_command(interaction, address)
+                try:
+                    # Defer response
+                    await interaction.response.defer(ephemeral=True)
+                    logger.info(f"Adding wallet {address} for user {interaction.user.id}")
+                    
+                    # Validate address
+                    if not address or len(address) < 10:
+                        await interaction.followup.send(
+                            "❌ Invalid wallet address. Please check and try again.",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    # Add to database
+                    success = await add_wallet(interaction.user.id, address)
+                    if success:
+                        await interaction.followup.send(
+                            f"✅ Successfully added wallet `{address}` to monitoring.",
+                            ephemeral=True
+                        )
+                    else:
+                        await interaction.followup.send(
+                            "❌ Failed to add wallet. Please try again later.",
+                            ephemeral=True
+                        )
+                        
+                except Exception as e:
+                    logger.error(f"Error in addwallet command: {str(e)}")
+                    await interaction.followup.send(
+                        "❌ An error occurred. Please try again later.",
+                        ephemeral=True
+                    )
             
             @self.tree.command(name='removewallet', description='Remove a wallet from monitoring')
             @app_commands.check(dm_only())
             async def removewallet(interaction: discord.Interaction, address: str):
-                await self.removewallet_command(interaction, address)
+                try:
+                    # Defer response
+                    await interaction.response.defer(ephemeral=True)
+                    logger.info(f"Removing wallet {address} for user {interaction.user.id}")
+                    
+                    # Remove from database
+                    success = await remove_wallet(interaction.user.id, address)
+                    if success:
+                        await interaction.followup.send(
+                            f"✅ Successfully removed wallet `{address}` from monitoring.",
+                            ephemeral=True
+                        )
+                    else:
+                        await interaction.followup.send(
+                            f"❌ Wallet `{address}` was not found in your monitored wallets.",
+                            ephemeral=True
+                        )
+                        
+                except Exception as e:
+                    logger.error(f"Error in removewallet command: {str(e)}")
+                    await interaction.followup.send(
+                        "❌ An error occurred. Please try again later.",
+                        ephemeral=True
+                    )
             
             @self.tree.command(name='listwallets', description='List your monitored wallets')
             @app_commands.check(dm_only())
             async def listwallets(interaction: discord.Interaction):
-                await self.listwallets_command(interaction)
+                try:
+                    # Defer response
+                    await interaction.response.defer(ephemeral=True)
+                    logger.info(f"Listing wallets for user {interaction.user.id}")
+                    
+                    # Get wallets
+                    wallets = await get_all_wallets(interaction.user.id)
+                    
+                    if not wallets:
+                        await interaction.followup.send(
+                            "You don't have any wallets being monitored.",
+                            ephemeral=True
+                        )
+                        return
+                    
+                    # Create embed
+                    embed = discord.Embed(
+                        title="🔍 Your Monitored Wallets",
+                        color=discord.Color.blue()
+                    )
+                    
+                    for wallet in wallets:
+                        embed.add_field(
+                            name="Wallet Address",
+                            value=f"`{wallet}`",
+                            inline=False
+                        )
+                    
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    
+                except Exception as e:
+                    logger.error(f"Error in listwallets command: {str(e)}")
+                    await interaction.followup.send(
+                        "❌ An error occurred. Please try again later.",
+                        ephemeral=True
+                    )
             
             @self.tree.command(name='help', description='Show bot help and commands')
             async def help(interaction: discord.Interaction):
-                await self.help_command(interaction)
+                try:
+                    # Create embed
+                    embed = discord.Embed(
+                        title="📚 Wallet Bud Help",
+                        description="Monitor your Cardano wallets for YUMMI token transactions",
+                        color=discord.Color.blue()
+                    )
+                    
+                    # Add command descriptions
+                    embed.add_field(
+                        name="/addwallet <address>",
+                        value="Add a wallet to monitor (DM only)",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="/removewallet <address>",
+                        value="Remove a wallet from monitoring (DM only)",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="/listwallets",
+                        value="List your monitored wallets (DM only)",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="/health",
+                        value="Check bot and API status",
+                        inline=False
+                    )
+                    
+                    # Add footer
+                    embed.set_footer(text="For support, please contact the bot owner")
+                    
+                    await interaction.response.send_message(embed=embed)
+                    
+                except Exception as e:
+                    logger.error(f"Error in help command: {str(e)}")
+                    await interaction.response.send_message(
+                        "❌ Failed to show help. Please try again later.",
+                        ephemeral=True
+                    )
             
             @self.tree.command(name='health', description='Check bot and API status')
             async def health(interaction: discord.Interaction):
-                await self.health_command(interaction)
+                try:
+                    # Check Blockfrost connection
+                    blockfrost_status = "✅ Connected" if self.blockfrost_client else "❌ Not Connected"
+                    try:
+                        if self.blockfrost_client:
+                            health = await asyncio.wait_for(
+                                asyncio.to_thread(self.blockfrost_client.health),
+                                timeout=5.0
+                            )
+                            if not health:
+                                blockfrost_status = "❌ Not Connected"
+                    except Exception:
+                        blockfrost_status = "❌ Not Connected"
+                    
+                    # Create embed
+                    embed = discord.Embed(
+                        title="🔍 Bot Status",
+                        color=discord.Color.blue()
+                    )
+                    
+                    # Add fields
+                    embed.add_field(
+                        name="Bot Status",
+                        value="✅ Online",
+                        inline=True
+                    )
+                    embed.add_field(
+                        name="Blockfrost API",
+                        value=blockfrost_status,
+                        inline=True
+                    )
+                    embed.add_field(
+                        name="Monitoring",
+                        value="✅ Active" if not self.monitoring_paused else "❌ Paused",
+                        inline=True
+                    )
+                    
+                    # Add timestamp
+                    embed.timestamp = discord.utils.utcnow()
+                    
+                    await interaction.response.send_message(embed=embed)
+                    
+                except Exception as e:
+                    logger.error(f"Error in health command: {str(e)}")
+                    await interaction.response.send_message(
+                        "❌ Failed to get bot status. Please try again later.",
+                        ephemeral=True
+                    )
             
             # Sync with Discord
             logger.info("Syncing commands with Discord...")
