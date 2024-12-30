@@ -194,9 +194,6 @@ class WalletBud(commands.Bot):
             help_command=None  # Disable default help command
         )
 
-        # Initialize command tree
-        self.tree = app_commands.CommandTree(self)
-
         # Initialize database
         try:
             # Get database path
@@ -224,6 +221,9 @@ class WalletBud(commands.Bot):
         # Initialize other attributes
         self.blockfrost_client = None
         self.monitoring_paused = False
+        
+        # Setup commands
+        self.setup_commands()
 
     async def setup_hook(self):
         """Called when the bot starts up"""
@@ -236,19 +236,14 @@ class WalletBud(commands.Bot):
                 logger.error("Failed to initialize Blockfrost API")
                 self.monitoring_paused = True
             
-            # Register commands
+            # Sync commands with Discord
             try:
-                logger.info("Setting up commands...")
-                self.setup_commands()
-                
-                # Clear existing commands and sync
-                await self.tree.clear_commands(guild=None)
+                logger.info("Registering commands...")
                 await self.tree.sync()
-                
                 command_list = [cmd.name for cmd in self.tree.get_commands()]
                 logger.info(f"Commands synced successfully: {command_list}")
             except Exception as e:
-                logger.error(f"Error during command registration: {e}")
+                logger.error(f"Error syncing commands: {e}")
                 raise
 
             # Start wallet monitoring if everything is ready
