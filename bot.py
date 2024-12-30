@@ -463,18 +463,17 @@ class WalletBud(commands.Bot):
         try:
             logger.info("Creating Blockfrost client...")
             
-            # Check API key
-            if not BLOCKFROST_API_KEY:
-                logger.error("BLOCKFROST_API_KEY not set")
+            # Check project ID
+            if not BLOCKFROST_PROJECT_ID:
+                logger.error("BLOCKFROST_PROJECT_ID not set")
                 return False
                 
-            # Log first few characters of API key for debugging
-            logger.info(f"Using API key starting with: {BLOCKFROST_API_KEY[:8]}...")
+            # Log first few characters of project ID for debugging
+            logger.info(f"Using project ID starting with: {BLOCKFROST_PROJECT_ID[:8]}...")
             
-            # Create client with correct base URL
+            # Create client with correct project ID
             self.blockfrost_client = BlockFrostApi(
-                api_key=BLOCKFROST_API_KEY,
-                base_url="https://cardano-mainnet.blockfrost.io/api/v0"
+                project_id=BLOCKFROST_PROJECT_ID
             )
             
             # Test connection with address endpoint

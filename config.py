@@ -39,9 +39,9 @@ if not DISCORD_TOKEN or not DISCORD_TOKEN.strip():
 COMMAND_PREFIX = os.getenv('COMMAND_PREFIX', '!')
 
 # Blockfrost API Configuration
-BLOCKFROST_API_KEY = os.getenv('BLOCKFROST_API_KEY')
-if not BLOCKFROST_API_KEY or not BLOCKFROST_API_KEY.strip():
-    raise ValueError("No valid Blockfrost API key found! Make sure BLOCKFROST_API_KEY is set in .env")
+BLOCKFROST_PROJECT_ID = os.getenv('BLOCKFROST_PROJECT_ID')
+if not BLOCKFROST_PROJECT_ID or not BLOCKFROST_PROJECT_ID.strip():
+    raise ValueError("No valid Blockfrost project ID found! Make sure BLOCKFROST_PROJECT_ID is set in .env")
 
 # YUMMI Token Configuration
 YUMMI_POLICY_ID = validate_hex(
@@ -65,7 +65,7 @@ API_RETRY_DELAY = float(os.getenv('API_RETRY_DELAY', '1.0'))
 WALLET_PROCESS_DELAY = float(os.getenv('WALLET_PROCESS_DELAY', '0.2'))
 
 # Validate required environment variables
-if not all([DISCORD_TOKEN, BLOCKFROST_API_KEY, YUMMI_POLICY_ID]):
+if not all([DISCORD_TOKEN, BLOCKFROST_PROJECT_ID, YUMMI_POLICY_ID]):
     raise ValueError("Missing required environment variables")
 
 # Rate Limiting Configuration
