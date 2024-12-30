@@ -95,14 +95,16 @@ class WalletBud(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.processing_wallets = False
         self.monitoring_paused = False
-        self.tree = app_commands.CommandTree(self)
-        self.tree.copy_global_to_guild = True  # Copy global commands to guilds
         
     async def setup_hook(self):
         """Setup the bot when it starts"""
         try:
+            logger.info("Initializing bot...")
             await init_blockfrost()  # Initialize Blockfrost first
             self.check_wallets.start()
+            self.tree = app_commands.CommandTree(self)
+            self.tree.copy_global_to_guild = True  # Copy global commands to guilds
+            logger.info("Bot initialization complete")
         except Exception as e:
             logger.error(f"Failed to initialize bot: {e}")
             await self.close()
