@@ -15,6 +15,8 @@ intents.message_content = True
 intents.dm_messages = True
 intents.guilds = True
 intents.messages = True
+intents.guild_messages = True
+intents.direct_messages = True
 
 bot = discord.Bot(intents=intents)
 db = Database()
@@ -38,7 +40,7 @@ async def on_ready():
         await bot.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
-                name="YUMMI wallets 👀"
+                name="YUMMI wallets | DM me!"
             ),
             status=discord.Status.online
         )
@@ -65,6 +67,19 @@ async def on_application_command_error(ctx, error):
     else:
         print(f"Command error: {str(error)}")
         await ctx.response.send_message("An error occurred while processing your command. Please try again later.")
+
+async def handle_database_error(interaction, operation):
+    """Handle database errors gracefully"""
+    error_embed = discord.Embed(
+        title="❌ Database Error",
+        description=f"An error occurred while {operation}. Please try again later.",
+        color=discord.Color.red()
+    )
+    try:
+        await interaction.response.send_message(embed=error_embed)
+    except:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=error_embed)
 
 def check_yummi_balance(wallet_address):
     """Check if wallet has required amount of YUMMI tokens"""
@@ -253,24 +268,32 @@ async def list_wallets(interaction: discord.Interaction):
         )
 
         for wallet in wallets:
-            # Get wallet status and YUMMI balance
-            has_balance, _ = check_yummi_balance(wallet)
-            status = "✅ Active" if has_balance else "❌ Inactive"
-            
-            # Get last checked time
-            last_checked = db.get_last_checked(wallet)
-            last_checked_str = last_checked.strftime("%Y-%m-%d %H:%M UTC") if last_checked else "Never"
-            
-            # Add wallet field
-            embed.add_field(
-                name=f"Wallet ({status})",
-                value=f"Address: `{wallet[:8]}...{wallet[-8:]}`\nLast Checked: {last_checked_str}",
-                inline=False
-            )
+            try:
+                # Get wallet status and YUMMI balance
+                has_balance, message = check_yummi_balance(wallet)
+                
+                # Get last checked time
+                last_checked = db.get_last_checked(wallet)
+                last_checked_str = last_checked.strftime("%Y-%m-%d %H:%M UTC") if last_checked else "Never"
+                
+                # Add wallet field
+                embed.add_field(
+                    name=f"Wallet ({'✅ Active' if has_balance else '❌ Inactive'})",
+                    value=f"Address: `{wallet[:8]}...{wallet[-8:]}`\nLast Checked: {last_checked_str}",
+                    inline=False
+                )
+            except Exception as e:
+                print(f"Error processing wallet {wallet}: {e}")
+                embed.add_field(
+                    name=f"Wallet (Status Unknown)",
+                    value=f"Address: `{wallet[:8]}...{wallet[-8:]}`\nError checking status",
+                    inline=False
+                )
 
         await interaction.response.send_message(embed=embed)
     except Exception as e:
-        await interaction.response.send_message(f"An error occurred: {str(e)}")
+        print(f"Error listing wallets: {e}")
+        await handle_database_error(interaction, "listing wallets")
 
 @bot.tree.command(
     name="remove_wallet",
@@ -292,97 +315,80 @@ async def remove_wallet(interaction: discord.Interaction):
             view=view
         )
     except Exception as e:
-        await interaction.response.send_message(f"An error occurred: {str(e)}")
+        print(f"Error removing wallet: {e}")
+        await handle_database_error(interaction, "accessing wallet list")
 
 async def process_transaction(wallet_address, discord_id, tx_hash):
     """Process a single transaction and send notification if relevant"""
     try:
         # Get transaction details
         tx = blockfrost_client.transaction(tx_hash)
-        utxos = blockfrost_client.transaction_utxos(tx_hash)
         
-        # Determine if transaction is incoming or outgoing
-        is_sender = any(input['address'] == wallet_address for input in utxos.inputs)
-        is_receiver = any(output['address'] == wallet_address for output in utxos.outputs)
-        
-        if not (is_sender or is_receiver):
-            return
-            
-        # Get the relevant amounts
-        amounts = []
-        if is_sender:
-            # Find outputs that aren't back to the sender (change)
-            for output in utxos.outputs:
-                if output['address'] != wallet_address:
-                    amounts.extend(output['amount'])
-        else:
-            # Find outputs to this wallet
-            for output in utxos.outputs:
-                if output['address'] == wallet_address:
-                    amounts.extend(output['amount'])
-        
-        # Create notification embed
+        # Create embed for notification
         embed = discord.Embed(
-            title="🔔 Transaction Detected!",
-            description=f"{'Outgoing ↗️' if is_sender else 'Incoming ↙️'} Transaction",
-            color=discord.Color.red() if is_sender else discord.Color.green(),
-            timestamp=datetime.fromtimestamp(tx.block_time)
+            title="🔔 New Transaction Detected!",
+            description=f"Transaction involving your wallet has been detected.",
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
         )
-        
-        # Add amount details
-        for amount in amounts:
-            if amount['unit'] == 'lovelace':
-                ada_amount = float(amount['quantity']) / 1_000_000
-                embed.add_field(
-                    name="ADA",
-                    value=f"{ada_amount:,.2f} ₳",
-                    inline=True
-                )
-            else:
-                # Handle other assets (including YUMMI)
-                asset_policy = amount['unit'][:56]  # First 56 chars are policy ID
-                if asset_policy.lower() == YUMMI_POLICY_ID.lower():
-                    embed.add_field(
-                        name="YUMMI",
-                        value=f"{int(amount['quantity']):,}",
-                        inline=True
-                    )
-                else:
-                    embed.add_field(
-                        name="Other Asset",
-                        value=f"{int(amount['quantity']):,} units",
-                        inline=True
-                    )
         
         # Add transaction details
-        cardanoscan_url = f"https://cardanoscan.io/transaction/{tx_hash}"
-        embed.add_field(
-            name="Transaction Details",
-            value=f"[View on Cardanoscan]({cardanoscan_url})",
-            inline=False
-        )
-        
-        # Add block details
-        embed.add_field(
-            name="Block",
-            value=f"`{tx.block}`",
-            inline=True
-        )
-        
-        # Add wallet address (truncated)
         embed.add_field(
             name="Wallet",
             value=f"`{wallet_address[:8]}...{wallet_address[-8:]}`",
-            inline=True
+            inline=False
+        )
+        embed.add_field(
+            name="Transaction Hash",
+            value=f"[View on Cardanoscan](https://cardanoscan.io/transaction/{tx_hash})",
+            inline=False
         )
         
-        # Send notification to user
-        user = await bot.fetch_user(int(discord_id))
-        if user:
-            await user.send(embed=embed)
+        # Add YUMMI balance
+        has_balance, message = check_yummi_balance(wallet_address)
+        embed.add_field(
+            name="YUMMI Status",
+            value=message,
+            inline=False
+        )
+        
+        # Send DM notification
+        await send_dm(discord_id, embed)
+        
+        # Update last checked time
+        db.update_last_checked(wallet_address)
+        
+        # If YUMMI balance is insufficient, deactivate the wallet
+        if not has_balance:
+            db.update_wallet_status(wallet_address, False)
+            
+            # Send deactivation notification
+            deactivate_embed = discord.Embed(
+                title="❌ Wallet Deactivated",
+                description="Your wallet has been deactivated due to insufficient YUMMI balance.",
+                color=discord.Color.red()
+            )
+            deactivate_embed.add_field(
+                name="Required Balance",
+                value=f"{MIN_YUMMI_REQUIRED:,} YUMMI",
+                inline=False
+            )
+            await send_dm(discord_id, deactivate_embed)
             
     except Exception as e:
         print(f"Error processing transaction {tx_hash}: {str(e)}")
+
+async def send_dm(user_id, embed):
+    """Helper function to send DM to user"""
+    try:
+        user = await bot.fetch_user(int(user_id))
+        if user:
+            await user.send(embed=embed)
+            print(f"DM sent to user {user_id}")
+        else:
+            print(f"Could not find user {user_id}")
+    except Exception as e:
+        print(f"Error sending DM to {user_id}: {str(e)}")
 
 @tasks.loop(minutes=TRANSACTION_CHECK_INTERVAL)
 async def check_wallets():

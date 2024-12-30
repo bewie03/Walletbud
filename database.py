@@ -3,14 +3,31 @@ from sqlalchemy import create_engine, Column, String, Boolean, DateTime, MetaDat
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
+import time
+from sqlalchemy.exc import OperationalError
 
 # Get database URL from environment variable (Heroku provides this)
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///walletbud.db')
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 
+def create_db_engine(max_retries=3, retry_delay=5):
+    """Create database engine with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            engine = create_engine(DATABASE_URL)
+            # Test the connection
+            engine.connect()
+            print("Database connection successful")
+            return engine
+        except OperationalError as e:
+            if attempt == max_retries - 1:
+                raise Exception(f"Failed to connect to database after {max_retries} attempts: {e}")
+            print(f"Database connection attempt {attempt + 1} failed, retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+
 # Create SQLAlchemy engine and base
-engine = create_engine(DATABASE_URL)
+engine = create_db_engine()
 Base = declarative_base()
 Session = sessionmaker(bind=engine)
 
