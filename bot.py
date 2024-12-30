@@ -417,7 +417,7 @@ class WalletBud(commands.Bot):
             # Create client
             self.blockfrost_client = BlockFrostApi(
                 project_id=BLOCKFROST_API_KEY,
-                base_url="https://cardano-mainnet.blockfrost.io/api/v0"  # Added /v0 for API version
+                base_url="https://cardano-mainnet.blockfrost.io/api/v0"  # Full mainnet URL with /api/v0
             )
             
             # Test connection
@@ -739,14 +739,14 @@ class WalletBud(commands.Bot):
             
             # Get latest transactions
             txs = await self.rate_limited_request(
-                self.blockfrost_client.address_transactions,
+                self.blockfrost_client.addresses_transactions,
                 address=address,
                 count=MAX_TX_HISTORY
             )
             
             # Get YUMMI token balance
             assets = await self.rate_limited_request(
-                self.blockfrost_client.address_assets,  # Correct method name from SDK
+                self.blockfrost_client.addresses_assets,
                 address=address
             )
             
@@ -813,7 +813,7 @@ class WalletBud(commands.Bot):
         try:
             # Get assets with retries
             assets = await self.rate_limited_request(
-                self.blockfrost_client.address_assets,  # Correct method name from SDK
+                self.blockfrost_client.addresses_assets,
                 address=address
             )
             
@@ -824,7 +824,7 @@ class WalletBud(commands.Bot):
             # Debug log all assets
             logger.info(f"Found {len(assets)} assets for {address}:")
             for asset in assets:
-                logger.info(f"Asset: policy_id={asset.policy_id}, asset={asset.asset}, quantity={asset.quantity}")
+                logger.info(f"Asset: policy_id={asset.policy_id}, quantity={asset.quantity}")
             
             # Find YUMMI token
             yummi_balance = 0
@@ -852,43 +852,44 @@ class WalletBud(commands.Bot):
             
     async def check_wallets(self):
         """Background task to check all wallets with proper concurrency"""
-        if self.processing_wallets:
-            logger.warning("Wallet check already in progress, skipping")
-            return
-            
-        try:
-            async with self.wallet_task_lock:
-                self.processing_wallets = True
-                
-                # Get all active wallets
-                wallets = await get_all_wallets()
-                
-                if not wallets:
-                    return
+        while True:
+            try:
+                if self.monitoring_paused:
+                    await asyncio.sleep(CHECK_INTERVAL)
+                    continue
+
+                async with self.wallet_task_lock:
+                    if self.processing_wallets:
+                        logger.info("Already processing wallets, skipping this iteration")
+                        continue
+                    self.processing_wallets = True
+
+                try:
+                    # Get all wallets without user_id filter
+                    wallets = await get_all_wallets()
                     
-                # Process wallets in chunks to manage rate limits
-                chunk_size = 5  # Process 5 wallets at a time
-                for i in range(0, len(wallets), chunk_size):
-                    chunk = wallets[i:i + chunk_size]
+                    if not wallets:
+                        logger.info("No wallets to check")
+                        continue
+
+                    # Process wallets concurrently
                     tasks = []
-                    
-                    # Create tasks for each wallet in chunk
-                    for wallet in chunk:
+                    for wallet in wallets:
                         task = asyncio.create_task(
                             self.process_wallet(wallet['user_id'], wallet['address'])
                         )
                         tasks.append(task)
-                    
-                    # Wait for chunk to complete
+
+                    # Wait for all tasks to complete
                     await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                    # Rate limit delay between chunks
-                    await asyncio.sleep(RATE_LIMIT_DELAY)
-                    
-        except Exception as e:
-            logger.error(f"Error in check_wallets task: {str(e)}")
-        finally:
-            self.processing_wallets = False
+
+                finally:
+                    self.processing_wallets = False
+
+            except Exception as e:
+                logger.error(f"Error in check_wallets task: {str(e)}")
+
+            await asyncio.sleep(CHECK_INTERVAL)
 
     async def process_wallet(self, user_id, address):
         """Process a single wallet with proper error handling"""
