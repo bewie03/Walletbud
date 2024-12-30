@@ -194,6 +194,9 @@ class WalletBud(commands.Bot):
             help_command=None  # Disable default help command
         )
 
+        # Initialize command tree
+        self.tree = app_commands.CommandTree(self)
+
         # Initialize database
         try:
             # Get database path
@@ -227,19 +230,26 @@ class WalletBud(commands.Bot):
         try:
             logger.info("Bot is starting up...")
 
-            # Call setup_commands to register commands
-            self.setup_commands()
-
-            # Clear existing commands and sync globally
-            await self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-            logger.info(f"Registered commands: {[cmd.name for cmd in self.tree.get_commands()]}")
-            
-            # Initialize Blockfrost
+            # Initialize Blockfrost first
             logger.info("Initializing Blockfrost...")
             if not await self.init_blockfrost():
                 logger.error("Failed to initialize Blockfrost API")
                 self.monitoring_paused = True
+            
+            # Register commands
+            try:
+                logger.info("Setting up commands...")
+                self.setup_commands()
+                
+                # Clear existing commands and sync
+                await self.tree.clear_commands(guild=None)
+                await self.tree.sync()
+                
+                command_list = [cmd.name for cmd in self.tree.get_commands()]
+                logger.info(f"Commands synced successfully: {command_list}")
+            except Exception as e:
+                logger.error(f"Error during command registration: {e}")
+                raise
 
             # Start wallet monitoring if everything is ready
             if not self.monitoring_paused:
@@ -249,7 +259,7 @@ class WalletBud(commands.Bot):
                 logger.warning("Wallet monitoring is paused due to initialization errors")
 
         except Exception as e:
-            logger.error(f"Error during bot setup: {str(e)}")
+            logger.error(f"Error during bot setup: {e}")
             self.monitoring_paused = True
             raise
 
@@ -750,70 +760,22 @@ class WalletBud(commands.Bot):
 
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
+        if not BLOCKFROST_API_KEY:
+            logger.error("BLOCKFROST_API_KEY is missing")
+            return False  # Explicitly return False if missing API key
+            
         try:
-            logger.info("Initializing Blockfrost API client...")
-            if not BLOCKFROST_API_KEY:
-                raise ValueError("BLOCKFROST_API_KEY not found in environment")
-                
-            # Log the first few characters of the API key for debugging
-            logger.debug(f"Using API key: {BLOCKFROST_API_KEY[:8]}...")
+            self.blockfrost_client = BlockFrostApi(
+                project_id=BLOCKFROST_API_KEY
+            )
+            # Check connection
+            await self.blockfrost_client.health()
+            logger.info("Blockfrost API initialized successfully")
+            return True
             
-            # Determine network from API key
-            network = "mainnet"
-            if BLOCKFROST_API_KEY.startswith("preprod"):
-                network = "preprod"
-            elif BLOCKFROST_API_KEY.startswith("preview"):
-                network = "preview"
-            logger.info(f"Using Blockfrost {network} network")
-            
-            # Initialize client
-            try:
-                self.blockfrost_client = BlockFrostApi(
-                    project_id=BLOCKFROST_API_KEY,
-                    base_url=f"https://cardano-{network}.blockfrost.io/api/v0"
-                )
-                logger.debug("BlockFrostApi instance created")
-            except Exception as e:
-                logger.error(f"Failed to create BlockFrostApi instance: {str(e)}")
-                raise ValueError("Failed to initialize Blockfrost client")
-            
-            # Test the connection
-            try:
-                logger.debug("Testing Blockfrost connection...")
-                health = await self.rate_limited_request(
-                    self.blockfrost_client.health
-                )
-                logger.debug(f"Health check response: {health}")
-                
-                # Also test a simple API call
-                logger.debug("Testing API call...")
-                network = await self.rate_limited_request(
-                    self.blockfrost_client.network
-                )
-                logger.debug(f"Network info: {network}")
-                
-                logger.info("Successfully connected to Blockfrost API")
-                return True
-                
-            except Exception as e:
-                logger.error(f"Failed to connect to Blockfrost API: {str(e)}")
-                if "Invalid project token" in str(e):
-                    raise ValueError(
-                        "Invalid Blockfrost API key. Please check your BLOCKFROST_API_KEY in .env"
-                    )
-                elif "Forbidden" in str(e):
-                    raise ValueError(
-                        "Access denied by Blockfrost. Your API key might be expired or invalid"
-                    )
-                elif "404" in str(e):
-                    raise ValueError(
-                        "API endpoint not found. Make sure you're using the correct network (mainnet/testnet)"
-                    )
-                raise
-                
         except Exception as e:
-            logger.error(f"Failed to initialize Blockfrost API: {str(e)}")
-            self.blockfrost_client = None
+            logger.error(f"Error initializing Blockfrost: {e}")
+            self.blockfrost_client = None  # Reset on error
             return False
 
     async def close(self):
