@@ -187,27 +187,10 @@ class WalletBud(commands.Bot):
                         )
                         
                         # Check YUMMI token balance
-                        logger.info(f"Checking YUMMI balance for {address}...")
-                        assets = await asyncio.wait_for(
-                            asyncio.to_thread(
-                                self.blockfrost_client.address_assets,
-                                address
-                            ),
-                            timeout=5.0
-                        )
-                        
-                        # Find YUMMI token
-                        yummi_balance = 0
-                        for asset in assets:
-                            if asset.unit.startswith(YUMMI_POLICY_ID):
-                                yummi_balance = int(asset.quantity)
-                                logger.info(f"Found YUMMI balance for {address}: {yummi_balance:,} tokens")
-                                break
-                        
-                        if yummi_balance < REQUIRED_YUMMI_TOKENS:
-                            logger.info(f"Insufficient YUMMI balance for {address}: {yummi_balance:,} < {REQUIRED_YUMMI_TOKENS:,}")
+                        has_enough, balance = await self.verify_yummi_balance(address)
+                        if not has_enough:
                             await interaction.followup.send(
-                                f"❌ This wallet does not have the required {REQUIRED_YUMMI_TOKENS:,} YUMMI tokens. Current balance: {yummi_balance:,}",
+                                f"❌ This wallet does not have the required {REQUIRED_YUMMI_TOKENS:,} YUMMI tokens. Current balance: {balance:,}",
                                 ephemeral=True
                             )
                             return
@@ -228,7 +211,7 @@ class WalletBud(commands.Bot):
                         return
                     
                     # Add to database
-                    logger.info(f"Adding wallet {address} with {yummi_balance:,} YUMMI to database...")
+                    logger.info(f"Adding wallet {address} with {balance:,} YUMMI to database...")
                     success = await add_wallet(str(interaction.user.id), address)
                     if success:
                         logger.info(f"Successfully added wallet {address} to monitoring")
@@ -477,7 +460,7 @@ class WalletBud(commands.Bot):
                     ephemeral=True
                 )
                 return
-            
+
             # Add wallet to database
             try:
                 logger.debug(f"Adding wallet {address} to database")
@@ -763,7 +746,7 @@ class WalletBud(commands.Bot):
             
             # Get YUMMI token balance
             assets = await self.rate_limited_request(
-                self.blockfrost_client.address_assets,
+                self.blockfrost_client.address_assets,  # Correct endpoint from docs
                 address=address
             )
             
@@ -818,50 +801,44 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Error processing transactions: {str(e)}")
 
-    async def verify_yummi_balance(self, address):
-        """Verify YUMMI token balance with robust asset parsing"""
+    async def verify_yummi_balance(self, address: str) -> tuple[bool, int]:
+        """Verify YUMMI token balance with robust asset parsing
+        
+        Args:
+            address (str): Wallet address to check
+            
+        Returns:
+            tuple[bool, int]: (has_enough_tokens, current_balance)
+        """
         try:
-            # Get asset balance with retries
+            # Get assets with retries
             assets = await self.rate_limited_request(
-                self.blockfrost_client.address_assets,
+                self.blockfrost_client.address_assets,  # Correct endpoint from docs
                 address=address
             )
             
-            # Find YUMMI token with proper parsing
+            if not assets:
+                logger.info(f"No assets found for {address}")
+                return False, 0
+                
+            # Find YUMMI token
             yummi_balance = 0
             for asset in assets:
-                # Verify both policy_id and unit (full asset ID)
-                if not isinstance(asset, dict):
-                    logger.error(f"Invalid asset format: {asset}")
-                    continue
-                    
-                policy_id = asset.get('policy_id')
-                unit = asset.get('unit')
-                
-                if not policy_id or not unit:
-                    logger.error(f"Missing policy_id or unit in asset: {asset}")
-                    continue
-                
-                # Double check both policy_id and full unit
-                if (policy_id == YUMMI_POLICY_ID and 
-                    unit.startswith(YUMMI_POLICY_ID)):
-                    try:
-                        quantity = asset.get('quantity', '0')
-                        yummi_balance = int(quantity)
-                        logger.info(f"Found YUMMI token: {yummi_balance} units")
-                        break
-                    except (ValueError, TypeError) as e:
-                        logger.error(f"Error parsing YUMMI quantity: {e}")
-                        continue
+                if asset.unit.startswith(YUMMI_POLICY_ID):
+                    yummi_balance = int(asset.quantity)
+                    logger.info(f"Found YUMMI balance for {address}: {yummi_balance:,} tokens")
+                    break
             
             has_enough = yummi_balance >= REQUIRED_YUMMI_TOKENS
-            logger.info(f"YUMMI balance check: {yummi_balance}/{REQUIRED_YUMMI_TOKENS} -> {has_enough}")
-            return has_enough
+            if not has_enough:
+                logger.info(f"Insufficient YUMMI balance for {address}: {yummi_balance:,} < {REQUIRED_YUMMI_TOKENS:,}")
+            
+            return has_enough, yummi_balance
             
         except Exception as e:
-            logger.error(f"Error verifying YUMMI balance: {str(e)}")
-            return False
-
+            logger.error(f"Error verifying YUMMI balance for {address}: {str(e)}")
+            return False, 0
+            
     async def check_wallets(self):
         """Background task to check all wallets with proper concurrency"""
         if self.processing_wallets:
@@ -915,7 +892,7 @@ class WalletBud(commands.Bot):
             await self.process_transactions(user_id, address, txs)
             
             # Verify YUMMI balance
-            has_yummi = await self.verify_yummi_balance(address)
+            has_yummi, balance = await self.verify_yummi_balance(address)
             if not has_yummi:
                 # Notify user about low YUMMI balance
                 try:
