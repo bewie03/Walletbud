@@ -13,16 +13,19 @@ A Discord bot for monitoring Cardano wallets and YUMMI token transactions.
 
 ## Commands
 
-- `/addwallet` - Add a Cardano wallet (requires 20,000 YUMMI tokens)
-- `/list_wallets` - View your registered wallets
-- `/remove_wallet` - Remove a wallet from tracking
+- `/addwallet` - Add a Cardano wallet (DM only, requires 20,000 YUMMI tokens)
+- `/removewallet` - Remove a wallet from tracking
+- `/listwallets` - View your registered wallets
+- `/health` - Check bot's health status
+- `/togglemonitor` - Pause/resume wallet monitoring
+- `/help` - Show available commands
 
 ## Requirements
 
 - Python 3.11.7
 - Discord Bot Token
 - Blockfrost API Key
-- PostgreSQL database (Heroku) or SQLite (local)
+- SQLite database
 
 ## Environment Variables
 
@@ -40,7 +43,7 @@ The bot can be configured using environment variables:
 - `DISCORD_TOKEN`: Your Discord bot token
 - `BLOCKFROST_API_KEY`: Your Blockfrost API key
 - `YUMMI_POLICY_ID`: The policy ID for YUMMI tokens
-- `REQUIRED_BUD_TOKENS`: Number of YUMMI tokens required (default: 1)
+- `REQUIRED_BUD_TOKENS`: Number of YUMMI tokens required (default: 20,000)
 - `TRANSACTION_CHECK_INTERVAL`: Minutes between wallet checks (default: 5)
 - `YUMMI_CHECK_INTERVAL`: Hours between YUMMI balance checks (default: 6)
 - `MAX_TX_HISTORY`: Maximum number of transactions to check per wallet (default: 10)
@@ -52,14 +55,18 @@ The bot implements several optimizations to reduce API usage:
 1. **YUMMI Balance Checks**: Only checks YUMMI balance every 6 hours instead of every transaction check
 2. **Transaction History Caching**: Stores the last seen transaction hash to avoid processing the same transactions multiple times
 3. **Rate Limit Management**: 
-   - Processes wallets in batches of 20
    - Adds small delays between wallet checks
    - Skips overlapping checks if previous batch is still processing
+   - Proper error handling for rate limits
 
-For 10,000 wallets, estimated daily API calls:
-- YUMMI Balance Checks: ~40,000 calls (4 checks per day)
-- Transaction Monitoring: ~4.3M calls
-- Total: ~4.35M calls per day
+## Error Handling
+
+The bot includes comprehensive error handling:
+- API rate limits
+- Network errors
+- Invalid wallet addresses
+- Database errors
+- Discord API issues
 
 ## Setup
 
@@ -68,14 +75,25 @@ For 10,000 wallets, estimated daily API calls:
 pip install -r requirements.txt
 ```
 
-2. Run the bot:
+2. Set up environment variables in `.env`
+
+3. Run the bot:
 ```bash
 python bot.py
 ```
 
-## Deployment
+## Development
 
-The bot is configured for Heroku deployment with:
-- Procfile for worker dyno
-- PostgreSQL database support
-- Runtime.txt specifying Python version
+The bot is built with:
+- discord.py for Discord integration
+- Blockfrost-python for Cardano blockchain interaction
+- SQLite for data persistence
+- Proper async/await patterns for optimal performance
+
+## Security
+
+- Wallet commands only work in DMs
+- Environment variables for sensitive data
+- Input validation for wallet addresses
+- Rate limiting and error handling
+- No sensitive data in logs
