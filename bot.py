@@ -64,30 +64,39 @@ def has_blockfrost():
 
 class RateLimiter:
     """Rate limiter for API requests"""
-    def __init__(self, requests_per_second, burst_limit):
-        self.requests_per_second = requests_per_second
+    def __init__(self, max_requests: int = 10, burst_limit: int = 50, window_seconds: int = 1):
+        self.max_requests = max_requests
         self.burst_limit = burst_limit
-        self.tokens = burst_limit
-        self.last_update = time.monotonic()
+        self.window_seconds = window_seconds
+        self.requests = []
         self.lock = asyncio.Lock()
 
     async def acquire(self):
         """Acquire a rate limit token"""
         async with self.lock:
-            now = time.monotonic()
-            time_passed = now - self.last_update
-            self.tokens = min(
-                self.burst_limit,
-                self.tokens + time_passed * self.requests_per_second
-            )
+            now = time.time()
             
-            if self.tokens < 1:
-                wait_time = (1 - self.tokens) / self.requests_per_second
-                await asyncio.sleep(wait_time)
-                self.tokens = 1
+            # Remove old requests
+            self.requests = [t for t in self.requests if now - t < self.window_seconds]
             
-            self.tokens -= 1
-            self.last_update = now
+            # Check if we've hit the burst limit
+            if len(self.requests) >= self.burst_limit:
+                wait_time = self.requests[0] + self.window_seconds - now
+                if wait_time > 0:
+                    logger.warning(f"Rate limit burst exceeded, waiting {wait_time:.2f}s")
+                    await asyncio.sleep(wait_time)
+                self.requests = self.requests[1:]
+            
+            # Check if we need to wait for the rolling window
+            if len(self.requests) >= self.max_requests:
+                wait_time = self.requests[0] + self.window_seconds - now
+                if wait_time > 0:
+                    logger.warning(f"Rate limit exceeded, waiting {wait_time:.2f}s")
+                    await asyncio.sleep(wait_time)
+                self.requests = self.requests[1:]
+            
+            # Add current request
+            self.requests.append(now)
 
 class WalletBud(commands.Bot):
     def __init__(self):
@@ -100,8 +109,9 @@ class WalletBud(commands.Bot):
         
         # Initialize rate limiter
         self.rate_limiter = RateLimiter(
-            requests_per_second=MAX_REQUESTS_PER_SECOND,
-            burst_limit=BURST_LIMIT
+            max_requests=10,  # 10 requests per second
+            burst_limit=50,   # 50 requests burst
+            window_seconds=1  # 1 second window
         )
         
         # Initialize Blockfrost client
@@ -166,24 +176,20 @@ class WalletBud(commands.Bot):
                     await interaction.response.defer(ephemeral=True)
                     logger.info(f"Adding wallet {address} for user {interaction.user.id}")
                     
-                    # Validate address
-                    if not address or len(address) < 10:
+                    # Basic address validation
+                    if not address or len(address) < 10 or not address.startswith('addr1'):
                         await interaction.followup.send(
-                            "❌ Invalid wallet address. Please check and try again.",
+                            "❌ Invalid Cardano wallet address format. Please check and try again.",
                             ephemeral=True
                         )
                         return
 
                     # Verify address with Blockfrost
                     try:
-                        # Check if address exists
                         logger.info(f"Verifying address {address} exists...")
-                        await asyncio.wait_for(
-                            asyncio.to_thread(
-                                self.blockfrost_client.address, 
-                                address
-                            ),
-                            timeout=5.0
+                        await self.rate_limited_request(
+                            self.blockfrost_client.addresses,  # Correct method name
+                            address=address
                         )
                         
                         # Check YUMMI token balance
@@ -195,44 +201,40 @@ class WalletBud(commands.Bot):
                             )
                             return
                             
-                    except asyncio.TimeoutError:
-                        logger.error(f"Blockfrost request timed out for {address}")
-                        await interaction.followup.send(
-                            "❌ Request timed out. Please try again later.",
-                            ephemeral=True
-                        )
-                        return
+                        # Add wallet to database
+                        try:
+                            await add_wallet(str(interaction.user.id), address)
+                            await interaction.followup.send(
+                                "✅ Successfully added wallet to monitoring!",
+                                ephemeral=True
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to add wallet to database: {str(e)}")
+                            await interaction.followup.send(
+                                "❌ Failed to add wallet. Please try again later.",
+                                ephemeral=True
+                            )
+                            
                     except Exception as e:
-                        logger.error(f"Blockfrost validation failed for {address}: {str(e)}")
+                        logger.error(f"Failed to verify address {address}: {str(e)}")
                         await interaction.followup.send(
-                            "❌ Invalid Cardano address or API error. Please try again later.",
-                            ephemeral=True
-                        )
-                        return
-                    
-                    # Add to database
-                    logger.info(f"Adding wallet {address} with {balance:,} YUMMI to database...")
-                    success = await add_wallet(str(interaction.user.id), address)
-                    if success:
-                        logger.info(f"Successfully added wallet {address} to monitoring")
-                        await interaction.followup.send(
-                            f"✅ Successfully added wallet `{address}` to monitoring.",
-                            ephemeral=True
-                        )
-                    else:
-                        logger.error(f"Failed to add wallet {address} to database")
-                        await interaction.followup.send(
-                            "❌ Failed to add wallet. Please try again later.",
+                            "❌ Invalid wallet address or API error. Please check the address and try again.",
                             ephemeral=True
                         )
                         
                 except Exception as e:
                     logger.error(f"Error in addwallet command: {str(e)}")
-                    await interaction.followup.send(
-                        "❌ An error occurred. Please try again later.",
-                        ephemeral=True
-                    )
-            
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message(
+                            "❌ An error occurred. Please try again later.",
+                            ephemeral=True
+                        )
+                    else:
+                        await interaction.followup.send(
+                            "❌ An error occurred. Please try again later.",
+                            ephemeral=True
+                        )
+
             @self.tree.command(name='removewallet', description='Remove a wallet from monitoring')
             @dm_only()
             async def removewallet(interaction: discord.Interaction, address: str):
@@ -440,361 +442,73 @@ class WalletBud(commands.Bot):
             self.blockfrost_client = None
             return False
 
-    async def addwallet_command(self, interaction: discord.Interaction, address: str):
-        """Handle the addwallet command"""
-        try:
-            # Defer the response since this might take time
-            await interaction.response.defer(ephemeral=True)
-            logger.info(f"Adding wallet {address} for user {interaction.user.id}")
-            
-            # Validate address format
-            if not address or len(address) < 10:
-                logger.warning(f"Invalid wallet address format: {address}")
-                await interaction.followup.send(
-                    "❌ Invalid wallet address. Please check and try again.",
-                    ephemeral=True
-                )
-                return
+    async def rate_limited_request(self, method, **kwargs):
+        """Make a rate-limited request to Blockfrost"""
+        await self.rate_limiter.acquire()
+        return await asyncio.to_thread(method, **kwargs)
 
-            # Add wallet to database
+    async def check_wallets(self):
+        """Background task to check all wallets periodically"""
+        await self.wait_until_ready()
+        
+        while not self.is_closed():
             try:
-                logger.debug(f"Adding wallet {address} to database")
-                success = await add_wallet(str(interaction.user.id), address)
-                
-                if success:
-                    logger.info(f"Successfully added wallet {address}")
-                    await interaction.followup.send(
-                        f"✅ Successfully added wallet `{address}` to monitoring.",
-                        ephemeral=True
-                    )
-                else:
-                    logger.error(f"Failed to add wallet {address} to database")
-                    await interaction.followup.send(
-                        "❌ Failed to add wallet. Please try again later.",
-                        ephemeral=True
-                    )
-                    
-            except Exception as e:
-                logger.error(f"Error adding wallet to database: {str(e)}")
-                await interaction.followup.send(
-                    "❌ Failed to add wallet. Please try again later.",
-                    ephemeral=True
-                )
-                
-        except Exception as e:
-            logger.error(f"Error in addwallet command: {str(e)}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ An error occurred. Please try again later.",
-                    ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ An error occurred. Please try again later.",
-                    ephemeral=True
-                )
-
-    async def removewallet_command(self, interaction: discord.Interaction, address: str):
-        """Handle the removewallet command"""
-        try:
-            # Defer the response since this might take time
-            await interaction.response.defer(ephemeral=True)
-            logger.info(f"Removing wallet {address} for user {interaction.user.id}")
-            
-            # Remove wallet from database
-            try:
-                logger.debug(f"Removing wallet {address} from database")
-                success = await remove_wallet(str(interaction.user.id), address)
-                
-                if success:
-                    logger.info(f"Successfully removed wallet {address}")
-                    await interaction.followup.send(
-                        f"✅ Successfully removed wallet `{address}` from monitoring.",
-                        ephemeral=True
-                    )
-                else:
-                    logger.warning(f"Wallet {address} not found for user {interaction.user.id}")
-                    await interaction.followup.send(
-                        f"❌ Wallet `{address}` was not found in your monitored wallets.",
-                        ephemeral=True
-                    )
-                
-            except Exception as e:
-                logger.error(f"Error removing wallet from database: {str(e)}")
-                await interaction.followup.send(
-                    "❌ Failed to remove wallet. Please try again later.",
-                    ephemeral=True
-                )
-                
-        except Exception as e:
-            logger.error(f"Error in removewallet command: {str(e)}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ An error occurred. Please try again later.",
-                    ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ An error occurred. Please try again later.",
-                    ephemeral=True
-                )
-
-    async def listwallets_command(self, interaction: discord.Interaction):
-        """Handle the listwallets command"""
-        try:
-            # Defer the response since this might take time
-            await interaction.response.defer(ephemeral=True)
-            logger.info(f"Fetching wallets for user {interaction.user.id}")
-            
-            # Get wallets from database
-            try:
-                logger.debug("Querying database for wallets...")
-                wallets = await get_all_wallets(str(interaction.user.id))
-                logger.debug(f"Found {len(wallets) if wallets else 0} wallets")
-                
+                # Get all wallets
+                wallets = await get_all_wallets()
                 if not wallets:
-                    await interaction.followup.send(
-                        "You don't have any wallets being monitored.",
-                        ephemeral=True
-                    )
+                    logger.debug("No wallets to check")
+                    await asyncio.sleep(CHECK_INTERVAL)
+                    continue
+                
+                logger.info(f"Checking {len(wallets)} wallets...")
+                
+                # Process wallets with concurrency limit
+                async with asyncio.TaskGroup() as tg:
+                    for wallet in wallets:
+                        tg.create_task(self.check_wallet(wallet['address']))
+                
+            except* Exception as e:
+                logger.error(f"Error in check_wallets task: {str(e)}")
+                
+            finally:
+                # Always sleep between checks
+                await asyncio.sleep(CHECK_INTERVAL)
+
+    async def check_wallet(self, address: str):
+        """Check a single wallet's balance and transactions"""
+        try:
+            async with self.wallet_task_lock:
+                # Get current assets
+                assets = await self.rate_limited_request(
+                    self.blockfrost_client.addresses_assets,
+                    address=address
+                )
+                
+                # Check YUMMI balance
+                has_enough, balance = await self.verify_yummi_balance(address)
+                if not has_enough:
+                    logger.warning(f"Wallet {address} YUMMI balance too low: {balance:,}")
+                    # TODO: Notify user and remove wallet
                     return
                 
-                # Create embed
-                embed = discord.Embed(
-                    title="🔍 Your Monitored Wallets",
-                    color=discord.Color.blue()
+                # Get recent transactions
+                txs = await self.rate_limited_request(
+                    self.blockfrost_client.addresses_transactions,
+                    address=address,
+                    count=10  # Only get recent transactions
                 )
                 
-                # Add wallets
-                for wallet in wallets:
-                    embed.add_field(
-                        name="Wallet Address",
-                        value=f"`{wallet}`",
-                        inline=False
-                    )
+                # Process new transactions
+                for tx in txs:
+                    try:
+                        # Add to database if new
+                        await add_transaction(address, tx.hash)
+                    except Exception as e:
+                        logger.error(f"Error processing transaction {tx.hash}: {str(e)}")
+                        continue
                 
-                logger.debug("Sending wallet list response")
-                await interaction.followup.send(embed=embed, ephemeral=True)
-                
-            except Exception as e:
-                logger.error(f"Failed to list wallets: {str(e)}")
-                await interaction.followup.send(
-                    "❌ Failed to list wallets. Please try again later.",
-                    ephemeral=True
-                )
-                
-        except Exception as e:
-            logger.error(f"Error in listwallets command: {str(e)}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ An error occurred. Please try again later.",
-                    ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ An error occurred. Please try again later.",
-                    ephemeral=True
-                )
-
-    async def help_command(self, interaction: discord.Interaction):
-        """Handle the help command"""
-        try:
-            embed = discord.Embed(
-                title="📚 Wallet Bud Help",
-                description="Monitor your Cardano wallets for YUMMI token transactions",
-                color=discord.Color.blue()
-            )
-            
-            # Add command descriptions
-            embed.add_field(
-                name="/addwallet <address>",
-                value="Add a wallet to monitor (DM only)",
-                inline=False
-            )
-            embed.add_field(
-                name="/removewallet <address>",
-                value="Remove a wallet from monitoring (DM only)",
-                inline=False
-            )
-            embed.add_field(
-                name="/listwallets",
-                value="List your monitored wallets (DM only)",
-                inline=False
-            )
-            embed.add_field(
-                name="/health",
-                value="Check bot and API status",
-                inline=False
-            )
-            
-            # Add footer
-            embed.set_footer(text="For support, please contact the bot owner")
-            
-            await interaction.response.send_message(embed=embed)
-            
-        except Exception as e:
-            logger.error(f"Error in help command: {str(e)}")
-            await interaction.response.send_message(
-                "❌ Failed to show help. Please try again later.",
-                ephemeral=True
-            )
-
-    async def health_command(self, interaction: discord.Interaction):
-        """Handle the health command"""
-        try:
-            # Check Blockfrost connection
-            blockfrost_status = "✅ Connected" if self.blockfrost_client else "❌ Not Connected"
-            try:
-                if self.blockfrost_client:
-                    health = await asyncio.wait_for(
-                        asyncio.to_thread(self.blockfrost_client.health),
-                        timeout=5.0
-                    )
-                    if not health:
-                        blockfrost_status = "❌ Not Connected"
-            except Exception:
-                blockfrost_status = "❌ Not Connected"
-            
-            # Create embed
-            embed = discord.Embed(
-                title="🔍 Bot Status",
-                color=discord.Color.blue()
-            )
-            
-            # Add fields
-            embed.add_field(
-                name="Bot Status",
-                value="✅ Online",
-                inline=True
-            )
-            embed.add_field(
-                name="Blockfrost API",
-                value=blockfrost_status,
-                inline=True
-            )
-            embed.add_field(
-                name="Monitoring",
-                value="✅ Active" if not self.monitoring_paused else "❌ Paused",
-                inline=True
-            )
-            
-            # Add timestamp
-            embed.timestamp = discord.utils.utcnow()
-            
-            await interaction.response.send_message(embed=embed)
-            
-        except Exception as e:
-            logger.error(f"Error in health command: {str(e)}")
-            await interaction.response.send_message(
-                "❌ Failed to get bot status. Please try again later.",
-                ephemeral=True
-            )
-
-    async def rate_limited_request(self, func, *args, **kwargs):
-        """Execute a rate-limited API request with exponential backoff"""
-        max_retries = API_RETRY_ATTEMPTS
-        base_delay = API_RETRY_DELAY
-        
-        for attempt in range(max_retries):
-            try:
-                # Wait for rate limit token
-                await self.rate_limiter.acquire()
-                
-                # Execute the API call
-                result = await func(*args, **kwargs)
-                return result
-                
-            except Exception as e:
-                error_msg = str(e).lower()
-                
-                # Check for rate limit errors
-                if "rate limit" in error_msg:
-                    if attempt == max_retries - 1:
-                        logger.error(f"Rate limit exceeded after {max_retries} attempts")
-                        raise
-                    
-                    # Calculate delay with exponential backoff
-                    delay = base_delay * (2 ** attempt)
-                    logger.warning(f"Rate limit hit, waiting {delay}s before retry")
-                    await asyncio.sleep(delay)
-                    continue
-                    
-                # For other errors, log and raise immediately
-                logger.error(f"API request failed: {str(e)}")
-                raise
-
-    async def check_wallet(self, address):
-        """Check wallet balance and transactions"""
-        try:
-            # Get wallet details
-            balance = await self.rate_limited_request(
-                self.blockfrost_client.address,
-                address=address
-            )
-            
-            # Get latest transactions
-            txs = await self.rate_limited_request(
-                self.blockfrost_client.addresses_transactions,
-                address=address,
-                count=MAX_TX_HISTORY
-            )
-            
-            # Get YUMMI token balance
-            assets = await self.rate_limited_request(
-                self.blockfrost_client.addresses_assets,
-                address=address
-            )
-            
-            return balance, txs, assets
         except Exception as e:
             logger.error(f"Error checking wallet {address}: {str(e)}")
-            return None, None, None
-
-    async def process_transactions(self, user_id, address, txs):
-        """Process new transactions for a wallet"""
-        try:
-            # Get last known transaction
-            result = await get_wallet(address, user_id)
-            last_tx = result['last_tx_hash'] if result else None
-            
-            # Check for new transactions
-            for tx in txs:
-                if last_tx and tx['hash'] == last_tx:
-                    break
-                    
-                # Get transaction details
-                tx_details = await self.rate_limited_request(
-                    self.blockfrost_client.transaction,
-                    hash=tx['hash']
-                )
-                
-                # Store transaction
-                await add_transaction(address, tx['hash'], tx_details['output_amount'][0]['quantity'], tx_details['block_height'], tx_details['block_time'])
-                
-                # Notify user
-                try:
-                    user = await self.fetch_user(user_id)
-                    if user:
-                        embed = discord.Embed(
-                            title="New Transaction",
-                            description=f"New transaction for wallet `{address}`",
-                            color=discord.Color.green(),
-                            timestamp=datetime.fromtimestamp(tx_details['block_time'])
-                        )
-                        embed.add_field(name="Amount", value=f"{tx_details['output_amount'][0]['quantity']} ADA", inline=True)
-                        embed.add_field(name="Hash", value=tx['hash'], inline=True)
-                        
-                        dm_channel = await user.create_dm()
-                        await dm_channel.send(embed=embed)
-                except Exception as e:
-                    logger.error(f"Error notifying user {user_id}: {str(e)}")
-            
-            # Update last transaction
-            if txs:
-                await update_last_checked(address, user_id, txs[0]['hash'])
-            
-        except Exception as e:
-            logger.error(f"Error processing transactions: {str(e)}")
 
     async def verify_yummi_balance(self, address: str) -> tuple[bool, int]:
         """Verify YUMMI token balance with robust asset parsing
@@ -808,7 +522,7 @@ class WalletBud(commands.Bot):
         try:
             # Get assets with retries
             assets = await self.rate_limited_request(
-                self.blockfrost_client.addresses_assets,
+                self.blockfrost_client.addresses_assets,  # Correct method name
                 address=address
             )
             
@@ -824,16 +538,16 @@ class WalletBud(commands.Bot):
             # Find YUMMI token
             yummi_balance = 0
             for asset in assets:
-                # Check policy ID match
-                if asset.policy_id == YUMMI_POLICY_ID:
-                    try:
+                try:
+                    # Check policy ID match
+                    if asset.policy_id == YUMMI_POLICY_ID:
                         # Convert quantity to integer
                         yummi_balance = int(asset.quantity)
                         logger.info(f"Found YUMMI balance for {address}: {yummi_balance:,} tokens")
                         break
-                    except (ValueError, TypeError) as e:
-                        logger.error(f"Error parsing YUMMI quantity '{asset.quantity}': {str(e)}")
-                        continue
+                except (ValueError, TypeError, AttributeError) as e:
+                    logger.error(f"Error parsing asset {asset}: {str(e)}")
+                    continue
             
             has_enough = yummi_balance >= REQUIRED_YUMMI_TOKENS
             if not has_enough:
@@ -845,88 +559,6 @@ class WalletBud(commands.Bot):
             logger.error(f"Error verifying YUMMI balance for {address}: {str(e)}")
             return False, 0
             
-    async def check_wallets(self):
-        """Background task to check all wallets with proper concurrency"""
-        while True:
-            try:
-                if self.monitoring_paused:
-                    await asyncio.sleep(CHECK_INTERVAL)
-                    continue
-
-                async with self.wallet_task_lock:
-                    if self.processing_wallets:
-                        logger.info("Already processing wallets, skipping this iteration")
-                        continue
-                    self.processing_wallets = True
-
-                try:
-                    # Get all wallets without user_id filter
-                    wallets = await get_all_wallets()
-                    
-                    if not wallets:
-                        logger.info("No wallets to check")
-                        continue
-
-                    # Process wallets concurrently
-                    tasks = []
-                    for wallet in wallets:
-                        task = asyncio.create_task(
-                            self.process_wallet(wallet['user_id'], wallet['address'])
-                        )
-                        tasks.append(task)
-
-                    # Wait for all tasks to complete
-                    await asyncio.gather(*tasks, return_exceptions=True)
-
-                finally:
-                    self.processing_wallets = False
-
-            except Exception as e:
-                logger.error(f"Error in check_wallets task: {str(e)}")
-
-            await asyncio.sleep(CHECK_INTERVAL)
-
-    async def process_wallet(self, user_id, address):
-        """Process a single wallet with proper error handling"""
-        try:
-            # Get wallet data
-            balance, txs, assets = await self.check_wallet(address)
-            if not balance or not txs:
-                logger.error(f"Failed to get wallet data for {address}")
-                return
-                
-            # Process new transactions
-            await self.process_transactions(user_id, address, txs)
-            
-            # Verify YUMMI balance
-            has_yummi, balance = await self.verify_yummi_balance(address)
-            if not has_yummi:
-                # Notify user about low YUMMI balance
-                try:
-                    user = await self.fetch_user(user_id)
-                    if user:
-                        embed = discord.Embed(
-                            title="⚠️ Low YUMMI Balance",
-                            description=f"Your wallet `{address}` has insufficient YUMMI tokens.",
-                            color=discord.Color.yellow()
-                        )
-                        embed.add_field(
-                            name="Required", 
-                            value=f"{REQUIRED_YUMMI_TOKENS:,} YUMMI",
-                            inline=True
-                        )
-                        
-                        dm_channel = await user.create_dm()
-                        await dm_channel.send(embed=embed)
-                except Exception as e:
-                    logger.error(f"Error notifying user about low YUMMI: {str(e)}")
-            
-            # Update last checked timestamp
-            await update_last_checked(address, user_id)
-            
-        except Exception as e:
-            logger.error(f"Error processing wallet {address}: {str(e)}")
-
     async def process_interaction(self, interaction: discord.Interaction, ephemeral: bool = True):
         """Process interaction with proper error handling"""
         try:
