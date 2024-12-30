@@ -402,10 +402,10 @@ class WalletBud(commands.Bot):
         """Check transactions for a wallet"""
         try:
             # Get wallet transactions (latest first)
-            url = f"addresses/{wallet_address}/transactions"
-            transactions = await self.blockfrost_client.client.get(
-                url,
-                params={"order": "desc", "count": 10}
+            transactions = await self.blockfrost_client.address_transactions(
+                address=wallet_address,
+                order='desc',
+                count=10
             )
             
             if not transactions:
@@ -433,8 +433,8 @@ class WalletBud(commands.Bot):
             for tx in reversed(new_txs):
                 try:
                     # Get transaction details
-                    tx_details = await self.blockfrost_client.client.get(
-                        f"txs/{tx.hash}/utxos"
+                    tx_details = await self.blockfrost_client.transaction_utxos(
+                        hash=tx.hash
                     )
                     
                     # Calculate total ADA and assets received
@@ -497,16 +497,16 @@ class WalletBud(commands.Bot):
         """Check YUMMI token balance"""
         try:
             # Get wallet's specific asset balance
-            address_info = await self.blockfrost_client.client.get(
-                f"addresses/{wallet_address}/total"
+            address_info = await self.blockfrost_client.addresses(
+                address=wallet_address
             )
             
-            if not address_info or not hasattr(address_info, 'received_sum'):
+            if not address_info or not hasattr(address_info, 'amount'):
                 return True, 0  # No assets means 0 balance, but not an error
             
             # Find YUMMI token balance
             yummi_balance = 0
-            for asset in address_info.received_sum:
+            for asset in address_info.amount:
                 if asset.unit == YUMMI_POLICY_ID:
                     yummi_balance = int(asset.quantity)
                     break
@@ -532,40 +532,37 @@ class WalletBud(commands.Bot):
             try:
                 # Create Blockfrost client with correct base URL
                 base_url = "https://cardano-mainnet.blockfrost.io/api/v0"
-                headers = {
-                    "Authorization": f"Bearer {BLOCKFROST_API_KEY}",
-                    "Content-Type": "application/json"
-                }
                 
-                # Create aiohttp session with default headers
-                session = aiohttp.ClientSession(headers=headers)
+                # Initialize BlockFrostApi first
+                self.blockfrost_client = BlockFrostApi(
+                    project_id=BLOCKFROST_API_KEY,
+                    base_url=base_url
+                )
                 
                 # Test connection with health check endpoint
                 try:
                     url = f"{base_url}/health"
                     logger.info(f"Making health check request to: {url}")
                     
-                    async with session.get(url) as response:
-                        if response.status == 200:
-                            health_data = await response.json()
-                            logger.info(f"Blockfrost health response: {health_data}")
-                            if health_data.get('is_healthy', False):
-                                # Initialize BlockFrostApi with working session
-                                self.blockfrost_client = BlockFrostApi(
-                                    project_id=BLOCKFROST_API_KEY,
-                                    base_url=base_url,
-                                    session=session
-                                )
-                                logger.info("Blockfrost API initialized successfully")
-                                return
-                        else:
-                            error_data = await response.text()
-                            logger.error(f"Health check failed with status {response.status}: {error_data}")
-                            raise Exception(f"Health check failed: {error_data}")
+                    headers = {
+                        "project_id": BLOCKFROST_API_KEY,
+                        "Content-Type": "application/json"
+                    }
+                    
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, headers=headers) as response:
+                            if response.status == 200:
+                                health_data = await response.json()
+                                logger.info(f"Blockfrost health response: {health_data}")
+                                if health_data.get('is_healthy', False):
+                                    logger.info("Blockfrost API initialized successfully")
+                                    return
+                            else:
+                                error_data = await response.text()
+                                logger.error(f"Health check failed with status {response.status}: {error_data}")
+                                raise Exception(f"Health check failed: {error_data}")
                 except Exception as health_error:
                     logger.error(f"Health check error details: {str(health_error)}")
-                    if session and not session.closed:
-                        await session.close()
                     raise
                 
             except Exception as e:
