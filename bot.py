@@ -126,10 +126,10 @@ class WalletModal(discord.ui.Modal, title='Add Wallet'):
                     await interaction.response.send_message(embed=embed)
                     return
 
-                if balance < REQUIRED_BUD_TOKENS:
+                if balance < REQUIRED_YUMMI_TOKENS:
                     embed = discord.Embed(
                         title="❌ Insufficient YUMMI",
-                        description=f"This wallet needs at least {REQUIRED_BUD_TOKENS:,} YUMMI tokens. Current balance: {balance:,}",
+                        description=f"This wallet needs at least {REQUIRED_YUMMI_TOKENS:,} YUMMI tokens. Current balance: {balance:,}",
                         color=discord.Color.red()
                     )
                     await interaction.response.send_message(embed=embed)
@@ -471,7 +471,7 @@ class WalletBud(commands.Bot):
             try:
                 # First, check if address exists and get basic info
                 address_info = await self.rate_limited_request(
-                    self.blockfrost_client.addresses,
+                    self.blockfrost_client.addresses_total,  # /addresses/{address}/total
                     address=wallet_address
                 )
                 logger.info(f"Received address info: {address_info}")
@@ -480,25 +480,29 @@ class WalletBud(commands.Bot):
                     logger.warning(f"No address info found for {wallet_address}")
                     return True, 0  # No assets means 0 balance, but not an error
                 
-                # Get detailed asset information
-                assets = await self.rate_limited_request(
-                    self.blockfrost_client.addresses_assets,
+                # Get detailed UTxOs to find YUMMI tokens
+                utxos = await self.rate_limited_request(
+                    self.blockfrost_client.addresses_utxos,  # /addresses/{address}/utxos
                     address=wallet_address
                 )
-                logger.info(f"Received assets: {assets}")
+                logger.info(f"Received UTXOs: {utxos}")
                 
-                # Find YUMMI token balance
+                # Find YUMMI token balance across all UTXOs
                 yummi_balance = 0
-                if assets:
-                    for asset in assets:
-                        if asset.unit == YUMMI_POLICY_ID:
-                            yummi_balance = int(asset.quantity)
-                            logger.info(f"Found YUMMI balance: {yummi_balance}")
-                            break
+                if utxos:
+                    for utxo in utxos:
+                        if hasattr(utxo, 'amount'):
+                            for asset in utxo.amount:
+                                logger.debug(f"Checking asset: {asset.unit}")
+                                if asset.unit == YUMMI_POLICY_ID:
+                                    yummi_balance += int(asset.quantity)
+                                    logger.info(f"Found YUMMI balance in UTXO: {asset.quantity}")
+                
+                logger.info(f"Total YUMMI balance: {yummi_balance}")
                 
                 # Check if balance meets requirement
-                if yummi_balance < REQUIRED_BUD_TOKENS:
-                    return False, f"Insufficient YUMMI balance. Required: {REQUIRED_BUD_TOKENS:,}, Current: {yummi_balance:,}"
+                if yummi_balance < REQUIRED_YUMMI_TOKENS:  
+                    return False, f"Insufficient YUMMI balance. Required: {REQUIRED_YUMMI_TOKENS:,}, Current: {yummi_balance:,}"
                 
                 return True, yummi_balance
                 
@@ -514,43 +518,35 @@ class WalletBud(commands.Bot):
             return False, "Failed to check YUMMI balance. Please try again later."
 
     async def check_wallet_transactions(self, wallet_address, discord_id):
-        """Check transactions for a wallet"""
+        """Check for new transactions in wallet"""
         try:
             # Get wallet transactions (latest first)
             transactions = await self.rate_limited_request(
-                self.blockfrost_client.addresses_transactions,
+                self.blockfrost_client.addresses_transactions,  # /addresses/{address}/transactions
                 address=wallet_address,
                 order='desc',
                 count=10
             )
             
             if not transactions:
-                return
-            
-            # Get last checked transaction from database
-            last_tx = None
-            with sqlite3.connect(DATABASE_NAME) as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT last_tx_hash FROM wallets WHERE address = ? AND discord_id = ?', 
-                             (wallet_address, discord_id))
-                result = cursor.fetchone()
-                if result:
-                    last_tx = result[0]
-            
-            # Process new transactions
-            new_txs = []
+                logger.info(f"No transactions found for wallet {wallet_address}")
+                return []
+                
+            new_transactions = []
             for tx in transactions:
-                if not last_tx or tx.hash != last_tx:
-                    new_txs.append(tx)
-                else:
-                    break
-            
-            # Process transactions in chronological order (oldest first)
-            for tx in reversed(new_txs):
+                # Skip if we've already seen this transaction
+                with sqlite3.connect(DATABASE_NAME) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT last_tx_hash FROM wallets WHERE address = ? AND discord_id = ?', 
+                                 (wallet_address, discord_id))
+                    result = cursor.fetchone()
+                    if result and tx.hash == result[0]:
+                        break
+                    
                 try:
                     # Get transaction details
                     tx_details = await self.rate_limited_request(
-                        self.blockfrost_client.transactions_utxos,
+                        self.blockfrost_client.transaction_utxos,  # /txs/{hash}/utxos
                         hash=tx.hash
                     )
                     

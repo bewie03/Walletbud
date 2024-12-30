@@ -30,10 +30,10 @@ if not BLOCKFROST_API_KEY:
 DATABASE_NAME = os.getenv('DATABASE_NAME', 'wallets.db')
 
 # Token Configuration
-REQUIRED_BUD_TOKENS = validate_positive_int(
-    os.getenv('REQUIRED_BUD_TOKENS', '20000'),
+REQUIRED_YUMMI_TOKENS = validate_positive_int(
+    os.getenv('REQUIRED_YUMMI_TOKENS', '20000'),
     20000,
-    'REQUIRED_BUD_TOKENS'
+    'REQUIRED_YUMMI_TOKENS'
 )
 
 YUMMI_POLICY_ID = os.getenv('YUMMI_POLICY_ID')
