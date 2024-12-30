@@ -473,6 +473,7 @@ class WalletBud(commands.Bot):
         """Check YUMMI token balance"""
         try:
             logger.info(f"Checking YUMMI balance for wallet: {wallet_address}")
+            logger.info(f"Looking for YUMMI policy ID: {YUMMI_POLICY_ID}")
             
             try:
                 # Get wallet's total balance and assets using correct method
@@ -486,14 +487,17 @@ class WalletBud(commands.Bot):
                 # Find YUMMI token balance
                 yummi_balance = 0
                 if hasattr(address_info, 'amount'):
+                    logger.info(f"Found {len(address_info.amount)} assets in wallet")
                     for asset in address_info.amount:
                         # Log each asset for debugging
-                        logger.debug(f"Found asset: {asset.unit} with quantity {asset.quantity}")
+                        logger.info(f"Checking asset: {asset.unit} with quantity {asset.quantity}")
                         # Check if asset unit starts with YUMMI policy ID
                         if asset.unit.startswith(YUMMI_POLICY_ID):
                             yummi_balance = int(asset.quantity)
                             logger.info(f"Found YUMMI balance: {yummi_balance}")
                             break
+                        else:
+                            logger.debug(f"Asset {asset.unit} does not match YUMMI policy ID")
                 
                 logger.info(f"Final YUMMI balance: {yummi_balance}")
                 
