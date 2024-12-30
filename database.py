@@ -5,26 +5,34 @@ from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime
 import time
 from sqlalchemy.exc import OperationalError
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Get database URL from environment variable (Heroku provides this)
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///walletbud.db')
-if DATABASE_URL.startswith('postgres://'):
+if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+    logger.info("Converted database URL to use postgresql:// scheme")
 
 def create_db_engine(max_retries=3, retry_delay=5):
     """Create database engine with retry logic"""
     for attempt in range(max_retries):
         try:
-            engine = create_engine(DATABASE_URL)
+            logger.info(f"Attempting to connect to database (attempt {attempt + 1}/{max_retries})")
+            engine = create_engine(DATABASE_URL, pool_pre_ping=True)
             # Test the connection
             engine.connect()
-            print("Database connection successful")
+            logger.info("Database connection successful")
             return engine
         except OperationalError as e:
-            if attempt == max_retries - 1:
-                raise Exception(f"Failed to connect to database after {max_retries} attempts: {e}")
-            print(f"Database connection attempt {attempt + 1} failed, retrying in {retry_delay} seconds...")
-            time.sleep(retry_delay)
+            if attempt < max_retries - 1:
+                logger.warning(f"Database connection failed, retrying in {retry_delay} seconds... Error: {str(e)}")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"Failed to connect to database after {max_retries} attempts. Error: {str(e)}")
+                raise
+    return None
 
 # Create SQLAlchemy engine and base
 engine = create_db_engine()
@@ -57,7 +65,7 @@ class Database:
             self.session.commit()
             return True
         except Exception as e:
-            print(f"Error adding user: {e}")
+            logger.error(f"Error adding user: {str(e)}")
             self.session.rollback()
             return False
 
@@ -73,7 +81,7 @@ class Database:
             self.session.commit()
             return True
         except Exception as e:
-            print(f"Error adding wallet: {e}")
+            logger.error(f"Error adding wallet: {str(e)}")
             self.session.rollback()
             return False
 
@@ -93,7 +101,7 @@ class Database:
                 return True
             return False
         except Exception as e:
-            print(f"Error updating wallet status: {e}")
+            logger.error(f"Error updating wallet status: {str(e)}")
             self.session.rollback()
             return False
 
@@ -115,7 +123,7 @@ class Database:
                 return True
             return False
         except Exception as e:
-            print(f"Error removing wallet: {e}")
+            logger.error(f"Error removing wallet: {str(e)}")
             self.session.rollback()
             return False
 
@@ -129,7 +137,7 @@ class Database:
                 return True
             return False
         except Exception as e:
-            print(f"Error updating last checked time: {e}")
+            logger.error(f"Error updating last checked time: {str(e)}")
             self.session.rollback()
             return False
 
@@ -139,7 +147,7 @@ class Database:
             wallet = self.session.query(Wallet).filter_by(wallet_address=wallet_address).first()
             return wallet.last_checked if wallet else None
         except Exception as e:
-            print(f"Error getting last checked time: {e}")
+            logger.error(f"Error getting last checked time: {str(e)}")
             return None
 
     def __del__(self):
