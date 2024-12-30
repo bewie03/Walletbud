@@ -113,8 +113,7 @@ class WalletBud(commands.Bot):
                 last_checked = datetime.utcnow() - timedelta(minutes=TRANSACTION_CHECK_INTERVAL)
 
             try:
-                # Get transactions since last check
-                # According to docs: /addresses/{address}/transactions
+                # Get transactions using /addresses/{address}/transactions endpoint
                 transactions = blockfrost_client.address_transactions(
                     wallet_address,
                     from_block=None,  # Get all recent transactions
@@ -125,7 +124,7 @@ class WalletBud(commands.Bot):
                 
                 # Process each transaction
                 for tx in transactions:
-                    # Get detailed transaction info
+                    # Get detailed transaction info using /txs/{hash} endpoint
                     tx_details = blockfrost_client.transaction(tx.tx_hash)
                     tx_time = datetime.fromtimestamp(tx_details.block_time)
                     
@@ -135,7 +134,7 @@ class WalletBud(commands.Bot):
                         
                     logger.info(f"Processing transaction {tx.tx_hash} from {tx_time}")
                     
-                    # Get transaction details including metadata
+                    # Get transaction UTXOs
                     tx_utxos = blockfrost_client.transaction_utxos(tx.tx_hash)
                     
                     # Process inputs and outputs
@@ -203,14 +202,14 @@ class WalletBud(commands.Bot):
                             
                     except Exception as e:
                         logger.error(f"Error sending transaction notification: {str(e)}")
-                
-                # Update last checked time
-                self.db.update_last_checked(wallet_address)
-                
-            except blockfrost.ApiError as e:
-                logger.error(f"Error fetching transactions: {str(e)}")
-                if e.status_code == 429:  # Rate limit
-                    return  # Skip this check, will try again next interval
+            
+            # Update last checked time
+            self.db.update_last_checked(wallet_address)
+            
+        except blockfrost.ApiError as e:
+            logger.error(f"Error fetching transactions: {str(e)}")
+            if e.status_code == 429:  # Rate limit
+                return  # Skip this check, will try again next interval
                 
         except Exception as e:
             logger.error(f"Error in check_wallet_transactions: {str(e)}")
@@ -241,39 +240,18 @@ def check_yummi_balance(wallet_address):
     try:
         logger.info(f"Checking wallet {wallet_address} for YUMMI tokens")
         
-        # First verify the wallet exists
         try:
-            # Get specific address
-            wallet = blockfrost_client.address(wallet_address)
-            logger.info(f"Wallet verified: {wallet_address}")
+            # Get wallet assets using /addresses/{address}/assets endpoint
+            assets = blockfrost_client.address_assets(wallet_address)
+            logger.info(f"Retrieved assets for wallet: {wallet_address}")
             
-            # Get specific asset details
-            # According to docs: /addresses/{address}/assets
-            assets = blockfrost_client.address_details(wallet_address)
             yummi_amount = 0
-            
-            # Log all assets for debugging
-            if hasattr(assets, 'amount'):
-                for asset in assets.amount:
-                    if isinstance(asset, dict):
-                        unit = asset.get('unit', '')
-                        quantity = asset.get('quantity', '0')
-                    else:
-                        unit = getattr(asset, 'unit', '')
-                        quantity = getattr(asset, 'quantity', '0')
-                        
-                    logger.info(f"Found asset: {unit} with quantity {quantity}")
-                    
-                    # Policy ID should be first 56 characters of the hex
-                    if unit and len(unit) >= 56:
-                        asset_policy_id = unit[:56]
-                        logger.info(f"Asset policy ID: {asset_policy_id}")
-                        logger.info(f"Expected policy ID: {YUMMI_POLICY_ID}")
-                        
-                        if asset_policy_id == YUMMI_POLICY_ID:
-                            yummi_amount = int(quantity)
-                            logger.info(f"Found {yummi_amount} YUMMI tokens in wallet {wallet_address}")
-                            break
+            for asset in assets:
+                # Policy ID is the first 56 characters of the asset unit
+                if asset.unit.startswith(YUMMI_POLICY_ID):
+                    yummi_amount = int(asset.quantity)
+                    logger.info(f"Found {yummi_amount} YUMMI tokens in wallet {wallet_address}")
+                    break
             
             if yummi_amount >= REQUIRED_BUD_TOKENS:
                 return True, f"Wallet has {yummi_amount} YUMMI tokens"
