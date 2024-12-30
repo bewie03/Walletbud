@@ -13,6 +13,11 @@ if not DATABASE_URL:
 
 # Create tables SQL
 CREATE_TABLES_SQL = """
+-- Drop existing tables
+DROP TABLE IF EXISTS transactions;
+DROP TABLE IF EXISTS wallets;
+DROP TABLE IF EXISTS users;
+
 -- Users table
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
@@ -168,4 +173,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())

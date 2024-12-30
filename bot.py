@@ -144,9 +144,6 @@ class WalletBud(commands.Bot):
         self.monitoring_paused = False
         self.wallet_task_lock = asyncio.Lock()
         self.processing_wallets = False
-        
-        # Initialize command tree
-        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
         """Called when the bot starts up"""
@@ -188,17 +185,17 @@ class WalletBud(commands.Bot):
             
             # Test connection
             try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self.blockfrost_client.health),
-                    timeout=5.0
-                )
-                logger.info("Blockfrost client initialized successfully")
-                return True
+                # Run health check in a thread to avoid blocking
+                loop = asyncio.get_event_loop()
+                health = await loop.run_in_executor(None, self.blockfrost_client.health)
                 
-            except asyncio.TimeoutError:
-                logger.error("Blockfrost client initialization timed out")
-                self.blockfrost_client = None
-                return False
+                if health:
+                    logger.info("Blockfrost client initialized successfully")
+                    return True
+                else:
+                    logger.error("Failed to verify Blockfrost API health")
+                    self.blockfrost_client = None
+                    return False
                 
             except Exception as e:
                 logger.error(f"Failed to test Blockfrost connection: {str(e)}")
@@ -214,6 +211,9 @@ class WalletBud(commands.Bot):
         """Set up bot commands using app_commands"""
         try:
             logger.info("Setting up commands...")
+            
+            # Create command tree
+            self.tree = app_commands.CommandTree(self)
             
             # Add commands
             @self.tree.command(name='addwallet', description='Add a wallet to monitor')
