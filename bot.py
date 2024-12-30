@@ -398,66 +398,69 @@ class WalletBud(commands.Bot):
         finally:
             self.processing_wallets = False
 
-    async def check_rate_limits(self):
-        """Check Blockfrost API rate limits"""
-        try:
-            # Get current rate limit status
-            url = "https://cardano-mainnet.blockfrost.io/api/v0/health/clock"
-            headers = {
-                "project_id": BLOCKFROST_API_KEY,
-                "Content-Type": "application/json"
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers) as response:
-                    if response.status != 200:
-                        error_data = await response.text()
-                        logger.error(f"Rate limit check failed with status {response.status}: {error_data}")
-                        return None, None
-                        
-                    # Check rate limit headers
-                    remaining = int(response.headers.get('x-ratelimit-remaining', 0))
-                    reset_in = int(response.headers.get('x-ratelimit-reset', 0))
-                    
-                    logger.info(f"Rate limit status - Remaining: {remaining}, Reset in: {reset_in}s")
-                    
-                    if remaining < 50:  # Warning threshold
-                        logger.warning(f"Rate limit running low! Only {remaining} requests remaining")
-                        if remaining < 10:  # Critical threshold
-                            logger.error("Rate limit critically low! Waiting for reset...")
-                            await asyncio.sleep(reset_in)
-                    
-                    return remaining, reset_in
-        except Exception as e:
-            logger.error(f"Failed to check rate limits: {e}")
-            return None, None
-
-    async def rate_limited_request(self, func, *args, **kwargs):
-        """Execute a rate-limited API request with retries"""
+    async def rate_limited_request(self, method, **kwargs):
+        """Make a rate-limited request to Blockfrost API with burst handling
+        
+        Blockfrost limits:
+        - 10 requests per second
+        - Burst of 500 requests, then cooldown at 10 req/sec
+        """
         max_retries = 3
-        base_delay = 2  # seconds
+        base_delay = 0.1  # 100ms between requests to stay under 10/sec
+        burst_cooldown = 50  # 50 seconds cooldown after burst (500/10)
         
         for attempt in range(max_retries):
             try:
-                # Check rate limits before making request
-                remaining, reset_in = await self.check_rate_limits()
+                # Add small delay between requests to respect 10/sec limit
+                await asyncio.sleep(base_delay)
                 
-                if remaining is not None and remaining < 10:
-                    logger.warning(f"Rate limit low, waiting {reset_in}s before retry...")
-                    await asyncio.sleep(reset_in)
+                # Make the actual API request
+                response = await method(**kwargs)
                 
-                # Make the actual request
-                return await func(*args, **kwargs)
+                # Check rate limit headers
+                if hasattr(response, 'headers'):
+                    remaining = int(response.headers.get('x-ratelimit-remaining', 0))
+                    reset_in = int(response.headers.get('x-ratelimit-reset', 0))
+                    logger.debug(f"Rate limit status - Remaining: {remaining}, Reset in: {reset_in}s")
+                    
+                    # If we're close to burst limit, implement cooldown
+                    if remaining < 50:  # Buffer before burst limit
+                        logger.warning(f"Approaching burst limit. Remaining: {remaining}")
+                        if remaining < 10:  # Critical - enforce cooldown
+                            wait_time = burst_cooldown
+                            logger.warning(f"Burst limit reached. Cooling down for {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                
+                return response
                 
             except Exception as e:
-                if "rate limit exceeded" in str(e).lower():
-                    delay = base_delay * (attempt + 1)
-                    logger.warning(f"Rate limit exceeded, attempt {attempt + 1}/{max_retries}. Waiting {delay}s...")
+                delay = base_delay * (2 ** attempt)  # Exponential backoff starting from base_delay
+                
+                if hasattr(e, 'response') and e.response:
+                    status = getattr(e.response, 'status_code', None)
+                    if status == 429:  # Too Many Requests
+                        # Use server's reset time if available, otherwise use burst cooldown
+                        reset_time = getattr(e.response.headers, 'x-ratelimit-reset', burst_cooldown)
+                        wait_time = int(reset_time) + 1  # Add 1s buffer
+                        logger.warning(f"Rate limit exceeded. Waiting {wait_time}s for reset...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    elif status == 400:  # Bad Request
+                        logger.error(f"Bad request error: {str(e)}")
+                        raise  # Don't retry on bad requests
+                    elif status in [500, 502, 503, 504]:  # Server errors
+                        logger.warning(f"Server error {status}. Retrying in {delay}s...")
+                        await asyncio.sleep(delay)
+                        continue
+                
+                logger.error(f"Request failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {delay}s...")
                     await asyncio.sleep(delay)
-                else:
-                    raise
+                    continue
+                raise
         
-        raise Exception("Max retries exceeded for rate-limited request")
+        raise Exception(f"Failed after {max_retries} retries")
 
     async def check_yummi_balance(self, wallet_address):
         """Check YUMMI token balance"""
@@ -466,8 +469,9 @@ class WalletBud(commands.Bot):
             
             # Get wallet's total balance including all assets
             try:
+                # First, check if address exists and get basic info
                 address_info = await self.rate_limited_request(
-                    self.blockfrost_client.address_total,  # Using address_total() for overall balances
+                    self.blockfrost_client.addresses,
                     address=wallet_address
                 )
                 logger.info(f"Received address info: {address_info}")
@@ -476,25 +480,21 @@ class WalletBud(commands.Bot):
                     logger.warning(f"No address info found for {wallet_address}")
                     return True, 0  # No assets means 0 balance, but not an error
                 
-                # Get detailed UTXOs to find YUMMI tokens
-                utxos = await self.rate_limited_request(
-                    self.blockfrost_client.address_utxos,  # Using address_utxos() for detailed asset info
+                # Get detailed asset information
+                assets = await self.rate_limited_request(
+                    self.blockfrost_client.addresses_assets,
                     address=wallet_address
                 )
-                logger.info(f"Received UTXOs: {utxos}")
+                logger.info(f"Received assets: {assets}")
                 
-                # Find YUMMI token balance across all UTXOs
+                # Find YUMMI token balance
                 yummi_balance = 0
-                if utxos:
-                    for utxo in utxos:
-                        if hasattr(utxo, 'amount'):
-                            for asset in utxo.amount:
-                                logger.debug(f"Checking asset: {asset.unit}")
-                                if asset.unit == YUMMI_POLICY_ID:
-                                    yummi_balance += int(asset.quantity)
-                                    logger.info(f"Found YUMMI balance in UTXO: {asset.quantity}")
-                
-                logger.info(f"Total YUMMI balance: {yummi_balance}")
+                if assets:
+                    for asset in assets:
+                        if asset.unit == YUMMI_POLICY_ID:
+                            yummi_balance = int(asset.quantity)
+                            logger.info(f"Found YUMMI balance: {yummi_balance}")
+                            break
                 
                 # Check if balance meets requirement
                 if yummi_balance < REQUIRED_BUD_TOKENS:
@@ -518,7 +518,7 @@ class WalletBud(commands.Bot):
         try:
             # Get wallet transactions (latest first)
             transactions = await self.rate_limited_request(
-                self.blockfrost_client.address_transactions,
+                self.blockfrost_client.addresses_transactions,
                 address=wallet_address,
                 order='desc',
                 count=10
@@ -550,7 +550,7 @@ class WalletBud(commands.Bot):
                 try:
                     # Get transaction details
                     tx_details = await self.rate_limited_request(
-                        self.blockfrost_client.transaction_utxos,
+                        self.blockfrost_client.transactions_utxos,
                         hash=tx.hash
                     )
                     
