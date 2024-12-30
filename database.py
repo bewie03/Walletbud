@@ -85,6 +85,46 @@ class Database:
         wallets = self.session.query(Wallet).filter_by(is_active=True).all()
         return [(w.wallet_address, w.discord_id) for w in wallets]
 
+    def remove_wallet(self, discord_id, wallet_address):
+        """Remove a wallet from tracking"""
+        try:
+            wallet = self.session.query(Wallet).filter_by(
+                wallet_address=wallet_address,
+                discord_id=discord_id
+            ).first()
+            if wallet:
+                self.session.delete(wallet)
+                self.session.commit()
+                return True
+            return False
+        except Exception as e:
+            print(f"Error removing wallet: {e}")
+            self.session.rollback()
+            return False
+
+    def update_last_checked(self, wallet_address):
+        """Update the last_checked timestamp for a wallet"""
+        try:
+            wallet = self.session.query(Wallet).filter_by(wallet_address=wallet_address).first()
+            if wallet:
+                wallet.last_checked = datetime.utcnow()
+                self.session.commit()
+                return True
+            return False
+        except Exception as e:
+            print(f"Error updating last checked time: {e}")
+            self.session.rollback()
+            return False
+
+    def get_last_checked(self, wallet_address):
+        """Get the last checked time for a wallet"""
+        try:
+            wallet = self.session.query(Wallet).filter_by(wallet_address=wallet_address).first()
+            return wallet.last_checked if wallet else None
+        except Exception as e:
+            print(f"Error getting last checked time: {e}")
+            return None
+
     def __del__(self):
         """Close the database session"""
         self.session.close()
