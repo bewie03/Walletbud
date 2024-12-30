@@ -188,7 +188,7 @@ class WalletBud(commands.Bot):
                     try:
                         logger.info(f"Verifying address {address} exists...")
                         await self.rate_limited_request(
-                            self.blockfrost_client.get_address,
+                            self.blockfrost_client.address,
                             address=address
                         )
                         
@@ -359,7 +359,7 @@ class WalletBud(commands.Bot):
                     
                     # Get total balance using address/total endpoint
                     balance_info = await self.rate_limited_request(
-                        self.blockfrost_client.get_address_total,
+                        self.blockfrost_client.address_total,
                         address=address
                     )
                     
@@ -487,17 +487,17 @@ class WalletBud(commands.Bot):
                 
                 # Test basic address info
                 address_info = await loop.run_in_executor(None, 
-                    lambda: self.blockfrost_client.get_address(test_address))
+                    lambda: self.blockfrost_client.address(test_address))
                 logger.info(f"Address info: {address_info}")
                 
                 # Test address total
                 total = await loop.run_in_executor(None,
-                    lambda: self.blockfrost_client.get_address_total(test_address))
+                    lambda: self.blockfrost_client.address_total(test_address))
                 logger.info(f"Address total: {total}")
                 
                 # Test UTXOs
                 utxos = await loop.run_in_executor(None,
-                    lambda: self.blockfrost_client.get_address_utxos(test_address))
+                    lambda: self.blockfrost_client.address_utxos(test_address))
                 logger.info(f"Address UTXOs: {utxos[:2]}")  # Show first 2 UTXOs
                 
                 logger.info("Blockfrost connection test passed")
@@ -555,7 +555,7 @@ class WalletBud(commands.Bot):
             async with self.wallet_task_lock:
                 # Get current assets
                 assets = await self.rate_limited_request(
-                    self.blockfrost_client.get_address_utxos,
+                    self.blockfrost_client.address_utxos,
                     address=address,
                     count=100,  # Reasonable limit
                     page=1,
@@ -571,7 +571,7 @@ class WalletBud(commands.Bot):
                 
                 # Get recent transactions
                 txs = await self.rate_limited_request(
-                    self.blockfrost_client.get_address_transactions,
+                    self.blockfrost_client.address_transactions,
                     address=address,
                     count=10,  # Only get recent transactions
                     page=1,    # First page
@@ -602,7 +602,7 @@ class WalletBud(commands.Bot):
         try:
             # Get YUMMI token UTXOs directly using the asset endpoint
             assets = await self.rate_limited_request(
-                self.blockfrost_client.get_address_utxos_asset,
+                self.blockfrost_client.address_utxos_asset,
                 address=address,
                 asset=f"{YUMMI_POLICY_ID}"
             )
