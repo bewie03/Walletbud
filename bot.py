@@ -425,9 +425,9 @@ class WalletBud(commands.Bot):
             # Test connection
             try:
                 logger.info("Testing Blockfrost connection...")
-                # Test by getting network info instead of health
+                # Test using health endpoint which is simpler
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self.blockfrost_client.address_utxos, "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz")  # Test with a known address
+                await loop.run_in_executor(None, self.blockfrost_client.health)
                 
                 logger.info("Blockfrost connection test passed")
                 return True
