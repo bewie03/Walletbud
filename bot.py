@@ -43,6 +43,15 @@ def init_db():
         logger.error(f"Database initialization failed: {e}")
         return False
 
+def dm_only():
+    """Check if command is being used in DMs"""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.channel, discord.DMChannel):
+            await interaction.response.send_message(ERROR_MESSAGES['dm_only'], ephemeral=True)
+            return False
+        return True
+    return app_commands.check(predicate)
+
 class WalletModal(discord.ui.Modal, title='Add Wallet'):
     def __init__(self, bot):
         super().__init__()
@@ -192,7 +201,7 @@ class WalletBud(commands.Bot):
             logger.error(f"Error in error handler: {e}")
 
     @app_commands.command(name="addwallet", description="Add a Cardano wallet for tracking")
-    @app_commands.checks.dm_only()
+    @dm_only()
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def add_wallet_command(self, interaction: discord.Interaction):
         if not self.blockfrost_client:
@@ -208,7 +217,7 @@ class WalletBud(commands.Bot):
         await interaction.response.send_modal(modal)
 
     @app_commands.command(name="removewallet", description="Remove a wallet from monitoring")
-    @app_commands.checks.dm_only()
+    @dm_only()
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def remove_wallet(self, interaction: discord.Interaction, wallet_address: str):
         with sqlite3.connect(DATABASE_NAME) as conn:
@@ -242,7 +251,7 @@ class WalletBud(commands.Bot):
                 await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="listwallets", description="List all monitored wallets")
-    @app_commands.checks.dm_only()
+    @dm_only()
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def list_wallets(self, interaction: discord.Interaction):
         with sqlite3.connect(DATABASE_NAME) as conn:
