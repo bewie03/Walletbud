@@ -176,6 +176,8 @@ class WalletBud(commands.Bot):
 
                     # Verify address with Blockfrost
                     try:
+                        # Check if address exists
+                        logger.info(f"Verifying address {address} exists...")
                         await asyncio.wait_for(
                             asyncio.to_thread(
                                 self.blockfrost_client.address, 
@@ -183,22 +185,59 @@ class WalletBud(commands.Bot):
                             ),
                             timeout=5.0
                         )
+                        
+                        # Check YUMMI token balance
+                        logger.info(f"Checking YUMMI balance for {address}...")
+                        assets = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self.blockfrost_client.address_assets,
+                                address
+                            ),
+                            timeout=5.0
+                        )
+                        
+                        # Find YUMMI token
+                        yummi_balance = 0
+                        for asset in assets:
+                            if asset.unit.startswith(YUMMI_POLICY_ID):
+                                yummi_balance = int(asset.quantity)
+                                logger.info(f"Found YUMMI balance for {address}: {yummi_balance:,} tokens")
+                                break
+                        
+                        if yummi_balance < REQUIRED_YUMMI_TOKENS:
+                            logger.info(f"Insufficient YUMMI balance for {address}: {yummi_balance:,} < {REQUIRED_YUMMI_TOKENS:,}")
+                            await interaction.followup.send(
+                                f"❌ This wallet does not have the required {REQUIRED_YUMMI_TOKENS:,} YUMMI tokens. Current balance: {yummi_balance:,}",
+                                ephemeral=True
+                            )
+                            return
+                            
+                    except asyncio.TimeoutError:
+                        logger.error(f"Blockfrost request timed out for {address}")
+                        await interaction.followup.send(
+                            "❌ Request timed out. Please try again later.",
+                            ephemeral=True
+                        )
+                        return
                     except Exception as e:
                         logger.error(f"Blockfrost validation failed for {address}: {str(e)}")
                         await interaction.followup.send(
-                            "❌ Invalid Cardano address. Please check and try again.",
+                            "❌ Invalid Cardano address or API error. Please try again later.",
                             ephemeral=True
                         )
                         return
                     
                     # Add to database
+                    logger.info(f"Adding wallet {address} with {yummi_balance:,} YUMMI to database...")
                     success = await add_wallet(str(interaction.user.id), address)
                     if success:
+                        logger.info(f"Successfully added wallet {address} to monitoring")
                         await interaction.followup.send(
                             f"✅ Successfully added wallet `{address}` to monitoring.",
                             ephemeral=True
                         )
                     else:
+                        logger.error(f"Failed to add wallet {address} to database")
                         await interaction.followup.send(
                             "❌ Failed to add wallet. Please try again later.",
                             ephemeral=True
@@ -931,7 +970,7 @@ class WalletBud(commands.Bot):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        """Called when the bot is ready"""
+        """Called when bot is ready"""
         try:
             logger.info(f"Logged in as {self.user.name} ({self.user.id})")
             logger.info(f"Discord API version: {discord.__version__}")
@@ -941,36 +980,22 @@ class WalletBud(commands.Bot):
             for guild in self.guilds:
                 logger.info(f"Connected to guild: {guild.name} ({guild.id})")
                 
-            # Sync commands
-            await self.tree.sync()
-            logger.info("Commands synced with Discord")
+            # Initialize Blockfrost
+            await self.init_blockfrost()
+            
+            # Start monitoring task
+            self.bg_task = self.loop.create_task(self.check_wallets())
+            logger.info("Started wallet monitoring task")
+            
+            logger.info("Bot initialization complete!")
             
         except Exception as e:
             logger.error(f"Error in on_ready: {str(e)}")
 
     @commands.Cog.listener()
-    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        """Handle command errors"""
-        error_msg = None
-        
-        if isinstance(error, app_commands.CommandOnCooldown):
-            error_msg = f"This command is on cooldown. Try again in {error.retry_after:.2f} seconds."
-        elif isinstance(error, app_commands.CheckFailure):
-            # Already handled by dm_only check
-            return
-        elif isinstance(error, app_commands.CommandInvokeError):
-            logger.error(f"Command error: {str(error.original)}")
-            error_msg = "An error occurred while processing your command. Please try again later."
-        else:
-            logger.error(f"Unhandled command error: {str(error)}")
-            error_msg = "An unexpected error occurred. Please try again later."
-        
-        if error_msg:
-            try:
-                await interaction.response.send_message(error_msg, ephemeral=True)
-            except:
-                if not interaction.response.is_done():
-                    await interaction.followup.send(error_msg, ephemeral=True)
+    async def on_guild_join(self, guild):
+        """Called when bot joins a guild"""
+        logger.info(f"Joined guild {guild.name} ({guild.id})")
 
 if __name__ == "__main__":
     try:
