@@ -50,12 +50,22 @@ try:
         56,  # Cardano policy IDs are 56 characters
         "YUMMI_POLICY_ID"
     )
-    YUMMI_ASSET_NAME = validate_hex(
-        os.getenv('YUMMI_ASSET_NAME', "59554d4d49"),  # hex for "YUMMI" in lowercase
-        10,  # "YUMMI" in hex is 10 characters
-        "YUMMI_ASSET_NAME"
+    
+    YUMMI_TOKEN_NAME = validate_hex(
+        os.getenv('YUMMI_TOKEN_NAME', "59554d4d49"),  # "YUMMI" in hex
+        10,  # Token names are typically 10 characters in hex
+        "YUMMI_TOKEN_NAME"
     )
-    YUMMI_TOKEN_ID = f"{YUMMI_POLICY_ID}{YUMMI_ASSET_NAME}"
+    
+    YUMMI_TOKEN_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}"
+    
+    # Minimum YUMMI token requirement
+    MIN_YUMMI_REQUIREMENT = validate_positive_int(
+        os.getenv('MIN_YUMMI_REQUIREMENT', 1000),
+        1000,  # Default to 1000 YUMMI tokens
+        "MIN_YUMMI_REQUIREMENT"
+    )
+    
     YUMMI_REQUIREMENT = validate_positive_int(
         os.getenv('REQUIRED_YUMMI_TOKENS', '25000'),
         25000,
@@ -67,59 +77,36 @@ except ValueError as e:
 
 REQUIRED_YUMMI_TOKENS = YUMMI_REQUIREMENT  # Updated threshold
 
-# Rate Limiting Configuration (based on Blockfrost limits)
-try:
-    MAX_REQUESTS_PER_SECOND = validate_positive_int(
-        os.getenv('MAX_REQUESTS_PER_SECOND', '10'),
-        10,
-        "MAX_REQUESTS_PER_SECOND"
-    )
-    BURST_LIMIT = validate_positive_int(
-        os.getenv('BURST_LIMIT', '500'),
-        500,
-        "BURST_LIMIT"
-    )
-    RATE_LIMIT_COOLDOWN = validate_positive_int(
-        os.getenv('RATE_LIMIT_COOLDOWN', '50'),
-        50,
-        "RATE_LIMIT_COOLDOWN"
-    )
-    RATE_LIMIT_DELAY = 0.1  # 100ms minimum delay between requests
+# API Rate Limiting
+MAX_REQUESTS_PER_SECOND = validate_positive_int(
+    os.getenv('MAX_REQUESTS_PER_SECOND', '10'),
+    10,
+    "MAX_REQUESTS_PER_SECOND"
+)
 
-    # Validate relationships between rate limit values
-    if BURST_LIMIT < MAX_REQUESTS_PER_SECOND:
-        raise ValueError(f"BURST_LIMIT ({BURST_LIMIT}) must be >= MAX_REQUESTS_PER_SECOND ({MAX_REQUESTS_PER_SECOND})")
-    
-    if RATE_LIMIT_COOLDOWN < 1:
-        raise ValueError(f"RATE_LIMIT_COOLDOWN ({RATE_LIMIT_COOLDOWN}) must be >= 1 second")
+BURST_LIMIT = validate_positive_int(
+    os.getenv('BURST_LIMIT', '500'),
+    500,
+    "BURST_LIMIT"
+)
 
-except ValueError as e:
-    logger.error(f"Rate limit configuration error: {str(e)}")
-    raise
+RATE_LIMIT_COOLDOWN = validate_positive_int(
+    os.getenv('RATE_LIMIT_COOLDOWN', '60'),
+    60,
+    "RATE_LIMIT_COOLDOWN"
+)
 
-# Update other rate-related settings to align with Blockfrost
-WALLET_BATCH_SIZE = min(10, MAX_REQUESTS_PER_SECOND)  # Don't exceed rate limit
-WALLET_CHECK_DELAY = max(1.0, 1.0/MAX_REQUESTS_PER_SECOND)  # Ensure we don't exceed rate
-TRANSACTION_CHECK_INTERVAL = int(os.getenv('TRANSACTION_CHECK_INTERVAL', '5'))
-WALLET_CHECK_INTERVAL = int(os.getenv('WALLET_CHECK_INTERVAL', '5'))
-YUMMI_CHECK_INTERVAL = int(os.getenv('YUMMI_CHECK_INTERVAL', '24'))  # hours
-MAX_TX_HISTORY = int(os.getenv('MAX_TX_HISTORY', '10'))
-API_RETRY_ATTEMPTS = int(os.getenv('API_RETRY_ATTEMPTS', '3'))
-API_RETRY_DELAY = float(os.getenv('API_RETRY_DELAY', '1.0'))
-WALLET_PROCESS_DELAY = float(os.getenv('WALLET_PROCESS_DELAY', '0.2'))
-
-# Validate required environment variables
-if not all([DISCORD_TOKEN, BLOCKFROST_PROJECT_ID]):
-    raise ValueError("Missing required environment variables")
+# Wallet Monitoring
+WALLET_CHECK_INTERVAL = validate_positive_int(
+    os.getenv('WALLET_CHECK_INTERVAL', '60'),
+    60,
+    "WALLET_CHECK_INTERVAL"
+)
 
 # Wallet Monitoring Configuration
 MIN_ADA_BALANCE = 5  # Minimum ADA balance threshold (5 ADA)
 MAX_TX_PER_HOUR = 10  # Maximum transactions per hour before alerting
 MONITORING_INTERVAL = 60  # Check wallets every 60 seconds
-
-# API Retry Configuration
-
-# Wallet Check Settings
 
 # Logging Settings
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
@@ -131,16 +118,11 @@ LOG_BACKUP_COUNT = 5
 logger.info(
     "Loaded configuration:\n"
     f"  REQUIRED_YUMMI_TOKENS: {REQUIRED_YUMMI_TOKENS}\n"
+    f"  MIN_YUMMI_REQUIREMENT: {MIN_YUMMI_REQUIREMENT}\n"
     f"  MAX_REQUESTS_PER_SECOND: {MAX_REQUESTS_PER_SECOND}\n"
-    f"  RATE_LIMIT_DELAY: {RATE_LIMIT_DELAY}s\n"
-    f"  WALLET_BATCH_SIZE: {WALLET_BATCH_SIZE}\n"
-    f"  WALLET_CHECK_DELAY: {WALLET_CHECK_DELAY}s\n"
-    f"  TRANSACTION_CHECK_INTERVAL: {TRANSACTION_CHECK_INTERVAL}s\n"
-    f"  WALLET_CHECK_INTERVAL: {WALLET_CHECK_INTERVAL}s\n"
-    f"  YUMMI_CHECK_INTERVAL: {YUMMI_CHECK_INTERVAL} hours\n"
-    f"  MAX_TX_HISTORY: {MAX_TX_HISTORY}\n"
-    f"  API_RETRY_DELAY: {API_RETRY_DELAY}s\n"
-    f"  WALLET_PROCESS_DELAY: {WALLET_PROCESS_DELAY}s\n"
+    f"  BURST_LIMIT: {BURST_LIMIT}\n"
+    f"  RATE_LIMIT_COOLDOWN: {RATE_LIMIT_COOLDOWN}\n"
+    f"  WALLET_CHECK_INTERVAL: {WALLET_CHECK_INTERVAL}\n"
     f"  MIN_ADA_BALANCE: {MIN_ADA_BALANCE}\n"
     f"  MAX_TX_PER_HOUR: {MAX_TX_PER_HOUR}\n"
     f"  MONITORING_INTERVAL: {MONITORING_INTERVAL}s\n"
