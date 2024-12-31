@@ -6,11 +6,12 @@ import time
 import uuid
 import asyncio
 from functools import wraps
+import random
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from blockfrost import BlockFrostApi
+from blockfrost import BlockFrostApi, ApiUrls
 
 # Configure logging
 logging.basicConfig(
@@ -24,12 +25,11 @@ logger = logging.getLogger(__name__)
 
 from config import (
     BLOCKFROST_PROJECT_ID,
-    BLOCKFROST_BASE_URL,
     MAX_REQUESTS_PER_SECOND,
     BURST_LIMIT,
     RATE_LIMIT_COOLDOWN,
     YUMMI_TOKEN_ID,
-    YUMMI_REQUIREMENT,
+    MIN_YUMMI_REQUIREMENT,
     API_RETRY_ATTEMPTS,
     API_RETRY_DELAY,
     WALLET_CHECK_INTERVAL
@@ -314,12 +314,10 @@ class WalletBud(commands.Bot):
                     
                 # Log first few characters of project ID for debugging
                 logger.info(f"Using project ID starting with: {BLOCKFROST_PROJECT_ID[:8]}...")
-                logger.info(f"Using base URL: {BLOCKFROST_BASE_URL}")
                 
-                # Create client with correct project ID and base URL
+                # Create client with correct project ID
                 self.blockfrost_client = BlockFrostApi(
-                    project_id=BLOCKFROST_PROJECT_ID,
-                    base_url=BLOCKFROST_BASE_URL
+                    project_id=BLOCKFROST_PROJECT_ID
                 )
                 logger.info("BlockFrostApi client created successfully")
                 
@@ -332,24 +330,43 @@ class WalletBud(commands.Bot):
                     
                     # Test basic address info
                     logger.info("Testing address info endpoint...")
-                    address_info = await self.rate_limited_request(
-                        self.blockfrost_client.address,
-                        test_address
-                    )
-                    if not address_info:
-                        raise Exception("Failed to get address info")
-                    logger.info("Address info test passed")
-                    
-                    # Test UTXOs
-                    logger.info("Testing UTXOs endpoint...")
-                    utxos = await self.rate_limited_request(
-                        self.blockfrost_client.address_utxos,
-                        test_address
-                    )
-                    if not utxos:
-                        raise Exception("Failed to get UTXOs")
-                    logger.info("UTXOs test passed")
-                    
+                    try:
+                        # Get basic address info
+                        address_info = await self.blockfrost_client.addresses(test_address)
+                        if not address_info:
+                            raise Exception("Failed to get address info")
+                        logger.info("Basic address info test passed")
+                        
+                        # Get extended address info
+                        extended_info = await self.blockfrost_client.addresses_extended(test_address)
+                        if not extended_info:
+                            raise Exception("Failed to get extended address info")
+                        logger.info("Extended address info test passed")
+                        
+                        # Get address total
+                        total_info = await self.blockfrost_client.addresses_total(test_address)
+                        if not total_info:
+                            raise Exception("Failed to get address total")
+                        logger.info("Address total test passed")
+                        
+                        # Test UTXOs
+                        logger.info("Testing UTXOs endpoint...")
+                        utxos = await self.blockfrost_client.addresses_utxos(test_address)
+                        if not utxos:
+                            raise Exception("Failed to get UTXOs")
+                        logger.info("UTXOs test passed")
+                        
+                        # Test transactions
+                        logger.info("Testing transactions endpoint...")
+                        txs = await self.blockfrost_client.addresses_transactions(test_address)
+                        if txs is None:  # Can be empty list but shouldn't be None
+                            raise Exception("Failed to get transactions")
+                        logger.info("Transactions test passed")
+                        
+                    except Exception as e:
+                        logger.error(f"Blockfrost test failed: {str(e)}")
+                        raise
+                        
                     logger.info("All Blockfrost connection tests passed")
                     return True
                     
@@ -397,39 +414,62 @@ class WalletBud(commands.Bot):
             Exception: If all retry attempts fail or if client is not initialized
         """
         if not self.blockfrost_client:
-            raise Exception("Blockfrost client is not initialized")
+            raise Exception("Blockfrost client not initialized")
             
         request_id = get_request_id()
         logger.info(f"[{request_id}] Making rate-limited request to {func.__name__}")
         
-        for attempt in range(API_RETRY_ATTEMPTS):
+        # Exponential backoff settings
+        max_retries = 3
+        base_delay = 1.0  # Start with 1 second
+        max_jitter = 0.1  # 10% jitter
+        
+        for attempt in range(max_retries):
             try:
-                # Acquire rate limit token
-                await self.rate_limiter.acquire()
-                
-                try:
-                    # Make request
-                    response = await asyncio.to_thread(func, *args, **kwargs)
-                    logger.info(f"[{request_id}] Request successful")
-                    return response
-                    
-                finally:
-                    # Always release the rate limit token
-                    await self.rate_limiter.release()
+                async with self.rate_limiter:
+                    result = await func(*args, **kwargs)
+                    return result
                     
             except Exception as e:
-                logger.error(f"[{request_id}] Request failed (attempt {attempt + 1}/{API_RETRY_ATTEMPTS}): {str(e)}")
-                if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                    logger.error(f"[{request_id}] Response details: {e.response.text}")
-                    
-                    # Check for specific API errors
-                    if "Invalid path" in str(e):
-                        logger.error(f"[{request_id}] Invalid API path. Please check the Blockfrost API documentation.")
-                        raise ValueError(f"Invalid API path for {func.__name__}. Please check the documentation.")
-                    
-                if attempt < API_RETRY_ATTEMPTS - 1:
-                    logger.info(f"[{request_id}] Retrying in {API_RETRY_DELAY} seconds...")
-                    await asyncio.sleep(API_RETRY_DELAY)
+                # Get status code if available
+                status_code = None
+                if hasattr(e, 'status_code'):
+                    status_code = e.status_code
+                elif hasattr(e, 'response') and hasattr(e.response, 'status'):
+                    status_code = e.response.status
+                
+                # Handle specific error codes
+                if status_code:
+                    if status_code == 400:
+                        logger.error(f"[{request_id}] Bad Request - Check parameters")
+                        raise  # Don't retry invalid requests
+                    elif status_code == 403:
+                        logger.error(f"[{request_id}] Forbidden - Check API key")
+                        raise  # Don't retry auth errors
+                    elif status_code == 429:
+                        # Rate limit hit - use exponential backoff with jitter
+                        delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
+                        jitter = random.uniform(-max_jitter * delay, max_jitter * delay)
+                        delay = max(0.1, delay + jitter)  # Ensure minimum delay of 0.1s
+                        logger.warning(f"[{request_id}] Rate limit hit. Retrying in {delay:.2f} seconds...")
+                    elif status_code == 500:
+                        # Server error - use exponential backoff with jitter
+                        delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
+                        jitter = random.uniform(-max_jitter * delay, max_jitter * delay)
+                        delay = max(0.1, delay + jitter)  # Ensure minimum delay of 0.1s
+                        logger.error(f"[{request_id}] Server error. Retrying in {delay:.2f} seconds...")
+                    else:
+                        # Unknown error - use exponential backoff with jitter
+                        delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
+                        jitter = random.uniform(-max_jitter * delay, max_jitter * delay)
+                        delay = max(0.1, delay + jitter)  # Ensure minimum delay of 0.1s
+                        logger.error(f"[{request_id}] Request failed with status {status_code}")
+                
+                # Log the error
+                logger.error(f"[{request_id}] Request failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                
+                if attempt < max_retries - 1:  # Don't sleep on last attempt
+                    await asyncio.sleep(delay)
                 else:
                     logger.error(f"[{request_id}] All retry attempts failed")
                     raise
@@ -465,50 +505,26 @@ class WalletBud(commands.Bot):
             tuple: (bool, int) - (meets requirement, current balance)
         """
         try:
-            # First check UTXOs using the correct endpoint
-            utxos = await self.rate_limited_request(
-                self.blockfrost_client.address_utxos,
-                address
+            # Get UTXOs for the specific token
+            utxos = await self.blockfrost_client.addresses_utxos_asset(
+                address=address,
+                asset=YUMMI_TOKEN_ID
             )
             
-            # Calculate YUMMI amount from UTXOs
-            yummi_amount = 0
-            for utxo in utxos:
-                for amount in utxo.amount:
-                    if amount.unit == f"{YUMMI_POLICY_ID}{YUMMI_ASSET_NAME}":
-                        yummi_amount += int(amount.quantity)
+            # Calculate total balance
+            total_balance = 0
+            if utxos:
+                for utxo in utxos:
+                    for amount in utxo.amount:
+                        if amount.unit == YUMMI_TOKEN_ID:
+                            total_balance += int(amount.quantity)
             
-            # If UTXOs show 0, try getting address details directly
-            if yummi_amount == 0:
-                logger.info(f"UTXOs showed 0 balance for {address}, checking address details...")
-                try:
-                    # Use the correct endpoint for address details
-                    details = await self.rate_limited_request(
-                        self.blockfrost_client.address,  # This is the correct endpoint
-                        address
-                    )
-                    
-                    # Log all amounts found
-                    if hasattr(details, 'amount'):
-                        for amount in details.amount:
-                            logger.info(f"Found token in details for {address}: {amount.unit} = {amount.quantity}")
-                            if amount.unit == f"{YUMMI_POLICY_ID}{YUMMI_ASSET_NAME}":
-                                yummi_amount = int(amount.quantity)
-                                break
-                                
-                except Exception as e:
-                    logger.error(f"Failed to get address details: {str(e)}")
-                    if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                        logger.error(f"Response details: {e.response.text}")
-                    # Continue with the amount we found from UTXOs
-            
-            meets_requirement = yummi_amount >= YUMMI_REQUIREMENT
-            return meets_requirement, yummi_amount
+            # Check if balance meets requirement
+            meets_requirement = total_balance >= MIN_YUMMI_REQUIREMENT
+            return meets_requirement, total_balance
             
         except Exception as e:
-            logger.error(f"Error checking YUMMI requirement: {str(e)}")
-            if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                logger.error(f"Response details: {e.response.text}")
+            logger.error(f"Failed to check YUMMI requirement: {str(e)}")
             return False, 0
 
     @tasks.loop(seconds=WALLET_CHECK_INTERVAL)
@@ -594,7 +610,7 @@ class WalletBud(commands.Bot):
                                 int(user_id),
                                 f"❌ Your wallet `{address[:8]}...{address[-8:]}` has been removed due to insufficient YUMMI balance.\n"
                                 f"Current balance: {balance:,} YUMMI\n"
-                                f"Required balance: {YUMMI_REQUIREMENT:,} YUMMI"
+                                f"Required balance: {MIN_YUMMI_REQUIREMENT:,} YUMMI"
                             )
                             return
                         
@@ -603,7 +619,7 @@ class WalletBud(commands.Bot):
                             int(user_id),
                             f"⚠️ Warning ({warning_count}/3): Your wallet `{address[:8]}...{address[-8:]}` has insufficient YUMMI balance.\n"
                             f"Current balance: {balance:,} YUMMI\n"
-                            f"Required balance: {YUMMI_REQUIREMENT:,} YUMMI\n\n"
+                            f"Required balance: {MIN_YUMMI_REQUIREMENT:,} YUMMI\n\n"
                             f"Your wallet will be removed after 3 warnings."
                         )
 
@@ -614,7 +630,7 @@ class WalletBud(commands.Bot):
 
                 # Get current UTxO state
                 current_utxos = await self.rate_limited_request(
-                    self.blockfrost_client.address_utxos,
+                    self.blockfrost_client.addresses_utxos,
                     address
                 )
                 
@@ -755,7 +771,7 @@ class WalletBud(commands.Bot):
         try:
             # Get all tokens in wallet
             assets = await self.rate_limited_request(
-                self.blockfrost_client.address_assets,
+                self.blockfrost_client.addresses_assets,
                 address
             )
             
@@ -798,7 +814,7 @@ class WalletBud(commands.Bot):
         try:
             # Get address details
             addr_details = await self.rate_limited_request(
-                self.blockfrost_client.address,
+                self.blockfrost_client.addresses,
                 address
             )
             
@@ -843,7 +859,7 @@ class WalletBud(commands.Bot):
         try:
             # Get latest transactions
             transactions = await self.rate_limited_request(
-                self.blockfrost_client.address_transactions,
+                self.blockfrost_client.addresses_transactions,
                 address,
                 count=10
             )
@@ -1344,10 +1360,7 @@ class WalletBud(commands.Bot):
             try:
                 # Test with a known address
                 test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
-                await self.rate_limited_request(
-                    self.blockfrost_client.address,
-                    test_address
-                )
+                await self.blockfrost_client.addresses(test_address)
                 blockfrost_status = "✅ Connected"
             except Exception as e:
                 logger.error(f"Blockfrost health check failed: {str(e)}")
@@ -1419,10 +1432,7 @@ class WalletBud(commands.Bot):
                     wallet_id = wallet['id']
                     
                     # Get UTXOs for balance calculation
-                    utxos = await self.rate_limited_request(
-                        self.blockfrost_client.address_utxos,
-                        address
-                    )
+                    utxos = await self.blockfrost_client.addresses_utxos(address)
                     
                     if utxos:
                         # Calculate ADA balance
@@ -1441,10 +1451,7 @@ class WalletBud(commands.Bot):
                         )
                         
                         # Get transaction count
-                        tx_info = await self.rate_limited_request(
-                            self.blockfrost_client.address_total,
-                            address
-                        )
+                        tx_info = await self.blockfrost_client.addresses_total(address)
                         tx_count = tx_info.tx_count if tx_info else 0
                         
                         # Get warning count

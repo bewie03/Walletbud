@@ -43,9 +43,6 @@ BLOCKFROST_PROJECT_ID = os.getenv('BLOCKFROST_PROJECT_ID')
 if not BLOCKFROST_PROJECT_ID or not BLOCKFROST_PROJECT_ID.strip():
     raise ValueError("No valid Blockfrost project ID found! Make sure BLOCKFROST_PROJECT_ID is set in .env")
 
-# Set Blockfrost base URL
-BLOCKFROST_BASE_URL = "https://cardano-mainnet.blockfrost.io/api/v0"
-
 # YUMMI Token Configuration
 try:
     YUMMI_POLICY_ID = validate_hex(
