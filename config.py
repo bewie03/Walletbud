@@ -47,17 +47,62 @@ if not BLOCKFROST_PROJECT_ID or not BLOCKFROST_PROJECT_ID.strip():
 BLOCKFROST_BASE_URL = "https://cardano-mainnet.blockfrost.io/api/v0"
 
 # YUMMI Token Configuration
-YUMMI_POLICY_ID = "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6"
-YUMMI_ASSET_NAME = "4d494d4d49"  # hex for "YUMMI"
-YUMMI_TOKEN_ID = f"{YUMMI_POLICY_ID}{YUMMI_ASSET_NAME}"
-YUMMI_REQUIREMENT = 25000
+try:
+    YUMMI_POLICY_ID = validate_hex(
+        os.getenv('YUMMI_POLICY_ID', "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6"),
+        56,  # Cardano policy IDs are 56 characters
+        "YUMMI_POLICY_ID"
+    )
+    YUMMI_ASSET_NAME = validate_hex(
+        os.getenv('YUMMI_ASSET_NAME', "4d494d4d49"),  # hex for "YUMMI"
+        10,  # "YUMMI" in hex is 10 characters
+        "YUMMI_ASSET_NAME"
+    )
+    YUMMI_TOKEN_ID = f"{YUMMI_POLICY_ID}{YUMMI_ASSET_NAME}"
+    YUMMI_REQUIREMENT = validate_positive_int(
+        os.getenv('REQUIRED_YUMMI_TOKENS', '25000'),
+        25000,
+        "REQUIRED_YUMMI_TOKENS"
+    )
+except ValueError as e:
+    logger.error(f"YUMMI token configuration error: {str(e)}")
+    raise
 
 REQUIRED_YUMMI_TOKENS = YUMMI_REQUIREMENT  # Updated threshold
-MAX_REQUESTS_PER_SECOND = int(os.getenv('MAX_REQUESTS_PER_SECOND', '10'))
-BURST_LIMIT = int(os.getenv('BURST_LIMIT', '20'))
-RATE_LIMIT_DELAY = float(os.getenv('RATE_LIMIT_DELAY', '0.1'))
-WALLET_BATCH_SIZE = int(os.getenv('WALLET_BATCH_SIZE', '10'))
-WALLET_CHECK_DELAY = float(os.getenv('WALLET_CHECK_DELAY', '1.0'))
+
+# Rate Limiting Configuration (based on Blockfrost limits)
+try:
+    MAX_REQUESTS_PER_SECOND = validate_positive_int(
+        os.getenv('MAX_REQUESTS_PER_SECOND', '10'),
+        10,
+        "MAX_REQUESTS_PER_SECOND"
+    )
+    BURST_LIMIT = validate_positive_int(
+        os.getenv('BURST_LIMIT', '500'),
+        500,
+        "BURST_LIMIT"
+    )
+    RATE_LIMIT_COOLDOWN = validate_positive_int(
+        os.getenv('RATE_LIMIT_COOLDOWN', '50'),
+        50,
+        "RATE_LIMIT_COOLDOWN"
+    )
+    RATE_LIMIT_DELAY = 0.1  # 100ms minimum delay between requests
+
+    # Validate relationships between rate limit values
+    if BURST_LIMIT < MAX_REQUESTS_PER_SECOND:
+        raise ValueError(f"BURST_LIMIT ({BURST_LIMIT}) must be >= MAX_REQUESTS_PER_SECOND ({MAX_REQUESTS_PER_SECOND})")
+    
+    if RATE_LIMIT_COOLDOWN < 1:
+        raise ValueError(f"RATE_LIMIT_COOLDOWN ({RATE_LIMIT_COOLDOWN}) must be >= 1 second")
+
+except ValueError as e:
+    logger.error(f"Rate limit configuration error: {str(e)}")
+    raise
+
+# Update other rate-related settings to align with Blockfrost
+WALLET_BATCH_SIZE = min(10, MAX_REQUESTS_PER_SECOND)  # Don't exceed rate limit
+WALLET_CHECK_DELAY = max(1.0, 1.0/MAX_REQUESTS_PER_SECOND)  # Ensure we don't exceed rate
 TRANSACTION_CHECK_INTERVAL = int(os.getenv('TRANSACTION_CHECK_INTERVAL', '5'))
 WALLET_CHECK_INTERVAL = int(os.getenv('WALLET_CHECK_INTERVAL', '5'))
 YUMMI_CHECK_INTERVAL = int(os.getenv('YUMMI_CHECK_INTERVAL', '24'))  # hours

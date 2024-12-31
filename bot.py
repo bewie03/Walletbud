@@ -1,11 +1,11 @@
 import os
 import sys
 import json
+import time
 import asyncio
 import logging
 from datetime import datetime, timedelta
 from uuid import uuid4
-import time
 
 import discord
 from discord import app_commands
@@ -15,9 +15,10 @@ import aiohttp
 
 from config import (
     DISCORD_TOKEN, BLOCKFROST_PROJECT_ID, BLOCKFROST_BASE_URL,
-    MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_DELAY,
+    MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_COOLDOWN,
     MIN_ADA_BALANCE, WALLET_CHECK_INTERVAL, MAX_TX_PER_HOUR,
-    WALLET_PROCESS_DELAY, YUMMI_TOKEN_ID, YUMMI_REQUIREMENT
+    WALLET_PROCESS_DELAY, YUMMI_TOKEN_ID, YUMMI_REQUIREMENT,
+    API_RETRY_ATTEMPTS, API_RETRY_DELAY
 )
 from database import (
     init_db,
@@ -94,43 +95,84 @@ def has_blockfrost(func=None):
     return app_commands.check(predicate)(func)
 
 class RateLimiter:
-    """Rate limiter for API requests"""
-    def __init__(self, max_requests: int = 10, burst_limit: int = 50, window_seconds: int = 1):
+    """Rate limiter that implements Blockfrost's rate limiting rules:
+    - 10 requests per second base rate
+    - Burst of 500 requests allowed
+    - Burst cools off at 10 requests per second
+    """
+    def __init__(self, max_requests: int = MAX_REQUESTS_PER_SECOND, 
+                 burst_limit: int = BURST_LIMIT, 
+                 cooldown_seconds: int = RATE_LIMIT_COOLDOWN):
+        if max_requests <= 0:
+            raise ValueError("max_requests must be positive")
+        if burst_limit < max_requests:
+            raise ValueError("burst_limit must be >= max_requests")
+        if cooldown_seconds <= 0:
+            raise ValueError("cooldown_seconds must be positive")
+            
         self.max_requests = max_requests
         self.burst_limit = burst_limit
-        self.window_seconds = window_seconds
+        self.cooldown_seconds = cooldown_seconds
         self.requests = []
+        self.burst_tokens = burst_limit
+        self.last_burst_update = time.time()
         self.lock = asyncio.Lock()
+        
+        logger.info(
+            f"Initialized RateLimiter with: max_requests={max_requests}, "
+            f"burst_limit={burst_limit}, cooldown_seconds={cooldown_seconds}"
+        )
 
     async def acquire(self):
-        """Acquire a rate limit token"""
+        """Acquire a rate limit token, implementing Blockfrost's burst behavior"""
         async with self.lock:
             now = time.time()
             
-            # Remove old requests
-            self.requests = [t for t in self.requests if now - t < self.window_seconds]
+            # Remove requests older than 1 second
+            cutoff = now - 1
+            old_count = len(self.requests)
+            self.requests = [t for t in self.requests if t > cutoff]
+            if old_count - len(self.requests) > 0:
+                logger.debug(f"Cleaned up {old_count - len(self.requests)} old requests")
             
-            # Check if we've hit the burst limit
-            if len(self.requests) >= self.burst_limit:
-                wait_time = self.requests[0] + self.window_seconds - now
+            # Replenish burst tokens at base rate
+            time_passed = now - self.last_burst_update
+            tokens_to_add = min(
+                self.burst_limit - self.burst_tokens,  # Don't exceed burst limit
+                int(time_passed * self.max_requests)   # Add tokens at base rate
+            )
+            
+            if tokens_to_add > 0:
+                logger.debug(f"Replenishing {tokens_to_add} burst tokens")
+                
+            self.burst_tokens = min(self.burst_limit, self.burst_tokens + tokens_to_add)
+            self.last_burst_update = now
+
+            # Check if we can proceed
+            if len(self.requests) >= self.max_requests and self.burst_tokens <= 0:
+                # We're at base rate limit and no burst tokens available
+                wait_time = self.requests[0] - now + 1
                 if wait_time > 0:
-                    logger.warning(f"Rate limit burst exceeded, waiting {wait_time:.2f}s")
+                    logger.debug(f"Rate limited, waiting {wait_time:.2f}s (requests={len(self.requests)}, burst_tokens={self.burst_tokens})")
                     await asyncio.sleep(wait_time)
-                self.requests = self.requests[1:]
+                    return await self.acquire()
             
-            # Check if we need to wait for the rolling window
+            # Use a burst token if we're over base rate
             if len(self.requests) >= self.max_requests:
-                wait_time = self.requests[0] + self.window_seconds - now
-                if wait_time > 0:
-                    logger.warning(f"Rate limit exceeded, waiting {wait_time:.2f}s")
-                    await asyncio.sleep(wait_time)
-                self.requests = self.requests[1:]
+                self.burst_tokens -= 1
+                logger.debug(f"Using burst token, {self.burst_tokens} remaining")
             
-            # Add current request
             self.requests.append(now)
             
+            # Log current state periodically
+            if len(self.requests) % 100 == 0:
+                logger.info(
+                    f"Rate limiter status: requests_in_window={len(self.requests)}, "
+                    f"burst_tokens={self.burst_tokens}"
+                )
+            
     async def release(self):
-        """Release a rate limit token (no-op since we use time-based windowing)"""
+        """Release is a no-op since we use time-based windowing"""
         pass
 
 class WalletBud(commands.Bot):
@@ -145,9 +187,9 @@ class WalletBud(commands.Bot):
         
         # Initialize rate limiter
         self.rate_limiter = RateLimiter(
-            max_requests=10,  # 10 requests per second
-            burst_limit=50,   # 50 requests burst
-            window_seconds=1  # 1 second window
+            max_requests=MAX_REQUESTS_PER_SECOND,  # 10 requests per second
+            burst_limit=BURST_LIMIT,   # 500 requests burst
+            cooldown_seconds=RATE_LIMIT_COOLDOWN  # 1 second cooldown
         )
         
         # Initialize Blockfrost client
@@ -243,7 +285,7 @@ class WalletBud(commands.Bot):
             return False
 
     async def rate_limited_request(self, func, *args, **kwargs):
-        """Make a rate-limited request to the Blockfrost API
+        """Make a rate-limited request to the Blockfrost API with retry logic
         
         Args:
             func: The Blockfrost API function to call
@@ -254,22 +296,60 @@ class WalletBud(commands.Bot):
             The result of the API call
             
         Raises:
-            Exception: If the API call fails
+            Exception: If all retry attempts fail
         """
-        await self.rate_limiter.acquire()
-        try:
-            loop = asyncio.get_event_loop()
-            if args and not kwargs:
-                # If only positional args, pass them directly
-                return await loop.run_in_executor(None, func, *args)
-            elif kwargs and not args:
-                # If only keyword args, pass them as kwargs
-                return await loop.run_in_executor(None, lambda: func(**kwargs))
-            else:
-                # If both, combine them
-                return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-        finally:
-            await self.rate_limiter.release()
+        if not self.blockfrost_client:
+            raise RuntimeError("Blockfrost client not initialized")
+            
+        last_error = None
+        for attempt in range(API_RETRY_ATTEMPTS):
+            try:
+                # First acquire rate limit token
+                await self.rate_limiter.acquire()
+                
+                # Make the API call
+                try:
+                    loop = asyncio.get_event_loop()
+                    if args and not kwargs:
+                        result = await loop.run_in_executor(None, func, *args)
+                    elif kwargs and not args:
+                        result = await loop.run_in_executor(None, lambda: func(**kwargs))
+                    else:
+                        result = await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+                    
+                    # If we get here, the call succeeded
+                    return result
+                    
+                except Exception as e:
+                    last_error = e
+                    # Check if error is retryable
+                    if hasattr(e, 'status_code'):
+                        # Don't retry auth errors or invalid requests
+                        if e.status_code in [401, 403, 400]:
+                            logger.error(f"Non-retryable API error: {str(e)}")
+                            raise
+                        # If rate limited, wait longer
+                        elif e.status_code == 429:
+                            retry_delay = API_RETRY_DELAY * (4 ** attempt)  # Wait even longer for rate limits
+                            logger.warning(f"Rate limit hit, backing off for {retry_delay:.2f}s")
+                        else:
+                            retry_delay = API_RETRY_DELAY * (2 ** attempt)
+                            logger.warning(f"API error (status={e.status_code}): {str(e)}")
+                    else:
+                        # For network errors, use standard backoff
+                        retry_delay = API_RETRY_DELAY * (2 ** attempt)
+                        logger.warning(f"Network error: {str(e)}")
+                    
+                    # Log retry attempt
+                    if attempt < API_RETRY_ATTEMPTS - 1:
+                        logger.info(f"Retrying in {retry_delay:.2f}s (attempt {attempt + 1}/{API_RETRY_ATTEMPTS})")
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        logger.error(f"All retry attempts failed: {str(last_error)}")
+                        raise last_error
+                        
+            finally:
+                await self.rate_limiter.release()
 
     async def check_yummi_requirement(self, address: str, user_id: str = None):
         """Check if wallet meets YUMMI token requirement
@@ -289,14 +369,17 @@ class WalletBud(commands.Bot):
             )
             
             # Calculate YUMMI balance
-            yummi_balance = sum(
+            logger.info(f"Checking YUMMI balance for address {address}")
+            logger.info(f"YUMMI Token ID: {YUMMI_TOKEN_ID}")
+            yummi_amount = sum(
                 int(amount.quantity)
                 for utxo in utxos
                 for amount in utxo.amount
-                if amount.unit == "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49"
+                if amount.unit == YUMMI_TOKEN_ID
             )
+            logger.info(f"Found YUMMI amount: {yummi_amount}")
             
-            meets_requirement = yummi_balance >= 25000
+            meets_requirement = yummi_amount >= YUMMI_REQUIREMENT
             
             # If user_id provided and requirement not met, notify user
             if user_id and not meets_requirement:
@@ -306,14 +389,14 @@ class WalletBud(commands.Bot):
                         await user.send(
                             f"⚠️ **YUMMI Requirement Not Met!**\n"
                             f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                            f"Current YUMMI: `{yummi_balance:,}`\n"
-                            f"Required: `25,000`\n\n"
+                            f"Current YUMMI: `{yummi_amount:,}`\n"
+                            f"Required: `{YUMMI_REQUIREMENT:,}`\n\n"
                             f"Your wallet will be removed from monitoring if the requirement is not met within 24 hours."
                         )
                 except Exception as e:
                     logger.error(f"Error notifying user about YUMMI requirement: {str(e)}")
             
-            return meets_requirement, yummi_balance
+            return meets_requirement, yummi_amount
             
         except Exception as e:
             logger.error(f"Error checking YUMMI requirement: {str(e)}")
@@ -376,7 +459,7 @@ class WalletBud(commands.Bot):
                                         f"Wallet: `{address[:8]}...{address[-8:]}`\n"
                                         f"Reason: YUMMI requirement not met for 24 hours\n"
                                         f"Current YUMMI: `{balance:,}`\n"
-                                        f"Required: `25,000`"
+                                        f"Required: `{YUMMI_REQUIREMENT:,}`"
                                     )
                             except Exception as e:
                                 logger.error(f"Error notifying user about wallet removal: {str(e)}")
@@ -711,16 +794,19 @@ class WalletBud(commands.Bot):
                 )
                 
                 # Calculate YUMMI balance
+                logger.info(f"Checking YUMMI balance for address {address}")
+                logger.info(f"YUMMI Token ID: {YUMMI_TOKEN_ID}")
                 yummi_amount = sum(
                     int(amount.quantity)
                     for utxo in utxos
                     for amount in utxo.amount
-                    if amount.unit == "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49"
+                    if amount.unit == YUMMI_TOKEN_ID
                 )
+                logger.info(f"Found YUMMI amount: {yummi_amount}")
 
-                if yummi_amount < 25000:
+                if yummi_amount < YUMMI_REQUIREMENT:
                     await interaction.response.send_message(
-                        f"❌ Wallet must hold at least 25,000 YUMMI tokens!\n"
+                        f"❌ Wallet must hold at least {YUMMI_REQUIREMENT:,} YUMMI tokens!\n"
                         f"Current balance: `{yummi_amount:,} YUMMI`", 
                         ephemeral=True
                     )
@@ -807,7 +893,7 @@ class WalletBud(commands.Bot):
                             int(amount.quantity)
                             for utxo in utxos
                             for amount in utxo.amount
-                            if amount.unit == "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49"
+                            if amount.unit == YUMMI_TOKEN_ID
                         )
                         
                         # Get transaction count
