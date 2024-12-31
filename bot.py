@@ -38,7 +38,16 @@ from database import (
     update_last_yummi_check,
     get_yummi_warning_count,
     increment_yummi_warning,
-    reset_yummi_warning
+    reset_yummi_warning,
+    get_policy_expiry,
+    update_policy_expiry,
+    get_delegation_status,
+    update_delegation_status,
+    get_dapp_interactions,
+    update_dapp_interaction,
+    update_notification_setting,
+    get_last_dapp_tx,
+    update_last_dapp_tx
 )
 
 # Configure logging
@@ -165,6 +174,59 @@ class RateLimiter:
 
 class WalletBud(commands.Bot):
     """WalletBud Discord bot"""
+    NOTIFICATION_TYPES = {
+        # Command value -> Database key
+        "ada": "ada_transactions",
+        "token": "token_changes", 
+        "nft": "nft_updates",
+        "staking": "staking_rewards",
+        "stake": "stake_changes",
+        "balance": "low_balance",
+        "policy": "policy_expiry",
+        "delegation": "delegation_status",
+        "dapp": "dapp_interactions"
+    }
+    
+    NOTIFICATION_DISPLAY = {
+        # Database key -> Display name
+        "ada_transactions": "ADA Transactions",
+        "token_changes": "Token Changes",
+        "nft_updates": "NFT Updates",
+        "staking_rewards": "Staking Rewards",
+        "stake_changes": "Stake Key Changes",
+        "low_balance": "Low Balance Alerts",
+        "policy_expiry": "Policy Expiry Alerts",
+        "delegation_status": "Delegation Status",
+        "dapp_interactions": "DApp Interactions"
+    }
+    
+    DEFAULT_SETTINGS = {
+        "ada_transactions": True,
+        "token_changes": True,
+        "nft_updates": True,
+        "staking_rewards": True,
+        "stake_changes": True,
+        "low_balance": True,
+        "policy_expiry": True,
+        "delegation_status": True,
+        "dapp_interactions": True
+    }
+
+    DAPP_IDENTIFIERS = {
+        # DApp name -> List of identifiers in metadata
+        "SundaeSwap": ["sundae", "sundaeswap"],
+        "MuesliSwap": ["muesli", "muesliswap"],
+        "MinSwap": ["min", "minswap"],
+        "WingRiders": ["wing", "wingriders"],
+        "VyFinance": ["vyfi", "vyfinance"],
+        "Genius Yield": ["genius", "geniusyield"],
+        "Indigo Protocol": ["indigo", "indigoprotocol"],
+        "Liqwid Finance": ["liqwid", "liqwidfinance"],
+        "AADA Finance": ["aada", "aadafinance"],
+        "Djed": ["djed", "shen"],
+        "NFT/Token Contract": ["721", "20"]  # NFT and Token standards
+    }
+
     def __init__(self):
         """Initialize the bot"""
         super().__init__(
@@ -349,13 +411,13 @@ class WalletBud(commands.Bot):
             tuple: (bool, int) - (meets requirement, current balance)
         """
         try:
-            # Get UTXOs
+            # First try getting UTXOs
             utxos = await self.rate_limited_request(
                 self.blockfrost_client.address_utxos,
                 address
             )
             
-            # Calculate YUMMI balance
+            # Calculate YUMMI balance from UTXOs
             logger.info(f"Checking YUMMI balance for address {address}")
             logger.info(f"YUMMI Token ID: {YUMMI_TOKEN_ID}")
             yummi_amount = sum(
@@ -364,8 +426,21 @@ class WalletBud(commands.Bot):
                 for amount in utxo.amount
                 if amount.unit.lower() == YUMMI_TOKEN_ID.lower()  # Case-insensitive comparison
             )
-            logger.info(f"Found YUMMI amount: {yummi_amount}")
             
+            # If UTXOs show 0, try getting address assets directly
+            if yummi_amount == 0:
+                logger.info("UTXOs showed 0 balance, checking address assets directly...")
+                assets = await self.rate_limited_request(
+                    self.blockfrost_client.address_assets,
+                    address
+                )
+                yummi_amount = sum(
+                    int(asset.quantity)
+                    for asset in assets
+                    if asset.unit.lower() == YUMMI_TOKEN_ID.lower()
+                )
+            
+            logger.info(f"Found YUMMI amount: {yummi_amount}")
             return yummi_amount >= YUMMI_REQUIREMENT, yummi_amount
             
         except Exception as e:
@@ -558,8 +633,149 @@ class WalletBud(commands.Bot):
                 await update_ada_balance(address, current_balance)
                 await update_token_balances(address, current_tokens)
 
+                # New checks
+                await self._check_policy_expiry(address, user)
+                await self._check_delegation_status(address, user)
+                await self._check_dapp_interactions(address, user)
+                
         except Exception as e:
             logger.error(f"Error checking wallet: {str(e)}")
+
+    async def _check_policy_expiry(self, address: str, user: discord.User):
+        """Check for expiring token policies"""
+        try:
+            # Get all tokens in wallet
+            assets = await self.rate_limited_request(
+                self.blockfrost_client.address_assets,
+                address
+            )
+            
+            for asset in assets:
+                policy_id = asset.unit[:56]  # First 56 chars are policy ID
+                
+                # Get policy script
+                try:
+                    policy = await self.rate_limited_request(
+                        self.blockfrost_client.script,
+                        policy_id
+                    )
+                    
+                    if hasattr(policy, 'timelock'):
+                        expiry_slot = int(policy.timelock.slot)
+                        stored_expiry = await get_policy_expiry(policy_id)
+                        
+                        if stored_expiry != expiry_slot:
+                            await update_policy_expiry(policy_id, expiry_slot)
+                            
+                            # Get current slot
+                            tip = await self.rate_limited_request(
+                                self.blockfrost_client.block_latest
+                            )
+                            current_slot = tip.slot
+                            
+                            # Alert if policy expires within ~5 days (432000 slots)
+                            if expiry_slot - current_slot < 432000:
+                                days_left = (expiry_slot - current_slot) // 86400  # ~86400 slots per day
+                                if await self.should_notify(int(user.id), "policy_expiry"):
+                                    await user.send(
+                                        f"⚠️ **Token Policy Expiring Soon!**\n"
+                                        f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                                        f"Policy ID: `{policy_id}`\n"
+                                        f"Days until expiry: `{days_left}`"
+                                    )
+                except Exception as e:
+                    logger.error(f"Error checking policy {policy_id}: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error checking policy expiry: {str(e)}")
+
+    async def _check_delegation_status(self, address: str, user: discord.User):
+        """Check for delegation status changes"""
+        try:
+            # Get stake address
+            addr_details = await self.rate_limited_request(
+                self.blockfrost_client.address_details,
+                address
+            )
+            
+            if addr_details and addr_details.stake_address:
+                # Get delegation info
+                delegation = await self.rate_limited_request(
+                    self.blockfrost_client.account_delegation_history,
+                    addr_details.stake_address,
+                    count=1,
+                    page=1
+                )
+                
+                if delegation:
+                    current_pool = delegation[0].pool_id
+                    stored_pool = await get_delegation_status(address)
+                    
+                    if current_pool != stored_pool:
+                        await update_delegation_status(address, current_pool)
+                        
+                        if await self.should_notify(int(user.id), "delegation"):
+                            pool_info = await self.rate_limited_request(
+                                self.blockfrost_client.pool,
+                                current_pool
+                            )
+                            pool_name = pool_info.metadata.name if pool_info.metadata else "Unknown Pool"
+                            
+                            await user.send(
+                                f"🔄 **Delegation Status Changed**\n"
+                                f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                                f"New Pool: `{pool_name}`\n"
+                                f"Pool ID: `{current_pool}`"
+                            )
+                            
+        except Exception as e:
+            logger.error(f"Error checking delegation status: {str(e)}")
+
+    async def _check_dapp_interactions(self, address: str, user: discord.User):
+        """Check for DApp interactions"""
+        try:
+            # Get last processed transaction
+            last_tx = await get_last_dapp_tx(address)
+            
+            # Get recent transactions
+            txs = await self.rate_limited_request(
+                self.blockfrost_client.address_transactions,
+                address,
+                params={'order': 'desc'}
+            )
+            
+            for tx in txs:
+                # Skip if we've already processed this tx
+                if last_tx and tx.tx_hash == last_tx:
+                    break
+                    
+                # Get transaction details
+                tx_details = await self.rate_limited_request(
+                    self.blockfrost_client.transaction_metadata,
+                    tx.tx_hash
+                )
+                
+                # Check for contract interactions (metadata with known DApp identifiers)
+                if tx_details.metadata:
+                    metadata_str = str(tx_details.metadata).lower()
+                    
+                    for dapp_name, identifiers in self.DAPP_IDENTIFIERS.items():
+                        if any(id.lower() in metadata_str for id in identifiers):
+                            if await self.should_notify(int(user.id), "dapp_interactions"):
+                                await user.send(
+                                    f"🔗 **DApp Interaction Detected**\n"
+                                    f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                                    f"DApp: `{dapp_name}`\n"
+                                    f"Transaction: `{tx.tx_hash}`"
+                                )
+                            break  # Only notify once per transaction
+                
+                # Update last processed
+                await update_last_dapp_tx(address, tx.tx_hash)
+                
+        except Exception as e:
+            logger.error(f"Error checking DApp interactions: {str(e)}")
 
     async def should_notify(self, user_id: int, notification_type: str):
         """Check if we should send a notification to the user
@@ -574,86 +790,11 @@ class WalletBud(commands.Bot):
         try:
             settings = await get_notification_settings(str(user_id))
             if not settings:
-                # Default to True if no settings exist
-                return True
+                return self.DEFAULT_SETTINGS.get(notification_type, True)
             return settings.get(notification_type, True)
-            
         except Exception as e:
             logger.error(f"Error checking notification settings: {str(e)}")
-            # Default to True on error
             return True
-
-    async def _check_staking_and_stake_key(self, address: str, user: discord.User):
-        """Helper method to check staking rewards and stake key changes"""
-        try:
-            # Check Staking Rewards
-            rewards = await self.rate_limited_request(
-                self.blockfrost_client.account_rewards,
-                address,
-                count=5,
-                page=1
-            )
-            
-            for reward in rewards:
-                if not await is_reward_processed(address, reward.epoch):
-                    await add_processed_reward(address, reward.epoch)
-                    
-                    embed = discord.Embed(
-                        title="🎁 Staking Reward Received",
-                        description="You've received staking rewards!",
-                        color=discord.Color.gold()
-                    )
-                    embed.add_field(
-                        name="Wallet",
-                        value=f"`{address}`",
-                        inline=False
-                    )
-                    embed.add_field(
-                        name="Amount",
-                        value=f"`{int(reward.amount) / 1_000_000:,.6f} ADA`",
-                        inline=True
-                    )
-                    embed.add_field(
-                        name="Epoch",
-                        value=f"`{reward.epoch}`",
-                        inline=True
-                    )
-                    if await self.should_notify(int(user.id), "staking_rewards"):
-                        await user.send(embed=embed)
-            
-            # Check Stake Key Changes
-            stake_address = await self.rate_limited_request(
-                self.blockfrost_client.address_details,
-                address
-            )
-            
-            if stake_address and stake_address.stake_address:
-                current_stake = stake_address.stake_address
-                prev_stake = await get_stake_address(address)
-                
-                if current_stake != prev_stake:
-                    await update_stake_address(address, current_stake)
-                    
-                    embed = discord.Embed(
-                        title="🔑 Stake Key Change Detected",
-                        description="Your stake key registration has changed.",
-                        color=discord.Color.yellow()
-                    )
-                    embed.add_field(
-                        name="Wallet",
-                        value=f"`{address}`",
-                        inline=False
-                    )
-                    embed.add_field(
-                        name="New Stake Address",
-                        value=f"`{current_stake}`",
-                        inline=False
-                    )
-                    if await self.should_notify(int(user.id), "stake_changes"):
-                        await user.send(embed=embed)
-                    
-        except Exception as e:
-            logger.error(f"Error checking staking and stake key: {str(e)}")
 
     async def process_interaction(self, interaction: discord.Interaction, ephemeral: bool = True):
         """Process interaction with proper error handling"""
@@ -744,18 +885,51 @@ class WalletBud(commands.Bot):
             async def notifications(interaction: discord.Interaction):
                 await self._notifications(interaction)
 
-            @self.tree.command(name="toggle", description="Toggle a notification type")
-            @app_commands.describe(notification_type="Type of notification to toggle")
+            @self.tree.command(name="toggle", description="Toggle notification types")
             @app_commands.choices(notification_type=[
                 app_commands.Choice(name="ADA Transactions", value="ada"),
                 app_commands.Choice(name="Token Changes", value="token"),
                 app_commands.Choice(name="NFT Updates", value="nft"),
                 app_commands.Choice(name="Staking Rewards", value="staking"),
                 app_commands.Choice(name="Stake Key Changes", value="stake"),
-                app_commands.Choice(name="Low Balance Alerts", value="balance")
+                app_commands.Choice(name="Low Balance Alerts", value="balance"),
+                app_commands.Choice(name="Policy Expiry Alerts", value="policy"),
+                app_commands.Choice(name="Delegation Changes", value="delegation"),
+                app_commands.Choice(name="DApp Interactions", value="dapp")
             ])
             async def toggle(interaction: discord.Interaction, notification_type: str):
-                await self._toggle_notification(interaction, notification_type)
+                """Toggle notification settings
+                
+                Args:
+                    interaction (discord.Interaction): Discord interaction
+                    notification_type (str): Type of notification to toggle
+                """
+                if notification_type not in self.NOTIFICATION_TYPES:
+                    await self.send_response(
+                        interaction,
+                        "❌ Invalid notification type. Use `/help` to see valid options.",
+                        ephemeral=True
+                    )
+                    return
+                    
+                setting_key = self.NOTIFICATION_TYPES[notification_type]
+                
+                # Get current settings
+                settings = await get_notification_settings(str(interaction.user.id))
+                if not settings:
+                    await update_notification_setting(str(interaction.user.id), setting_key, True)
+                    settings = self.DEFAULT_SETTINGS.copy()
+        
+                # Toggle the setting
+                current = settings.get(setting_key, True)
+                await update_notification_setting(str(interaction.user.id), setting_key, not current)
+        
+                status = "enabled" if not current else "disabled"
+                await self.send_response(
+                    interaction,
+                    f"✅ {self.NOTIFICATION_DISPLAY[setting_key]} notifications {status}!",
+                    ephemeral=True
+                )
 
             # Sync the commands
             await self.tree.sync()
@@ -973,11 +1147,14 @@ class WalletBud(commands.Bot):
                     "`/notifications` - View your notification settings\n"
                     "`/toggle <type>` - Toggle a notification type on/off\n\n"
                     "**Notification Types:**\n"
-                    "• `balance` - ADA balance changes\n"
-                    "• `tokens` - Token transfers\n"
-                    "• `nfts` - NFT transfers\n"
+                    "• `balance` - Low balance alerts\n"
+                    "• `delegation` - Delegation status changes\n"
+                    "• `dapp` - DApp interactions\n"
+                    "• `nft` - NFT updates\n"
+                    "• `policy` - Policy expiry alerts\n"
+                    "• `stake` - Stake key changes\n"
                     "• `staking` - Staking rewards\n"
-                    "• `stake_key` - Stake key changes"
+                    "• `token` - Token changes"
                 ),
                 inline=False
             )
@@ -1151,93 +1328,39 @@ class WalletBud(commands.Bot):
         try:
             settings = await get_notification_settings(str(interaction.user.id))
             if not settings:
-                await interaction.response.send_message("❌ You don't have any notification settings! Use `/addwallet` first.", ephemeral=True)
-                return
-                        
-            # Create embed
+                settings = self.DEFAULT_SETTINGS.copy()
+            
             embed = discord.Embed(
                 title="🔔 Notification Settings",
                 description="Your current notification settings:",
                 color=discord.Color.blue()
             )
             
-            # Add each setting
-            settings_display = {
-                "ada_transactions": "ADA Transactions",
-                "token_changes": "Token Changes",
-                "nft_updates": "NFT Updates",
-                "staking_rewards": "Staking Rewards",
-                "stake_changes": "Stake Key Changes",
-                "low_balance": "Low Balance Alerts"
-            }
-            
-            for setting, display_name in settings_display.items():
-                status = settings.get(setting, False)
+            for setting_key, display_name in self.NOTIFICATION_DISPLAY.items():
+                status = "✅ Enabled" if settings.get(setting_key, True) else "❌ Disabled"
                 embed.add_field(
                     name=display_name,
-                    value=f"{'✅ Enabled' if status else '❌ Disabled'}",
+                    value=status,
                     inline=True
                 )
             
-            # Add instructions
             embed.add_field(
-                name="How to Change",
-                value="Use `/toggle_notification [type]` to enable/disable notifications",
+                name="\u200b",
+                value=(
+                    "\nUse `/toggle <type>` to enable/disable notifications.\n"
+                    "Example: `/toggle ada` to toggle ADA transaction notifications."
+                ),
                 inline=False
             )
             
             await interaction.response.send_message(embed=embed, ephemeral=True)
-                    
+            
         except Exception as e:
             logger.error(f"Error getting notification settings: {str(e)}")
-            await interaction.response.send_message("❌ An error occurred while getting your notification settings.", ephemeral=True)
-
-    async def _toggle_notification(self, interaction: discord.Interaction, notification_type: str):
-        """Toggle a specific notification type on/off"""
-        try:
-            valid_types = {
-                "ada": "ada_transactions",
-                "token": "token_changes",
-                "nft": "nft_updates",
-                "staking": "staking_rewards",
-                "stake": "stake_changes",
-                "balance": "low_balance"
-            }
-            
-            if notification_type not in valid_types:
-                type_list = ", ".join(f"`{t}`" for t in valid_types.keys())
-                await interaction.response.send_message(f"❌ Invalid notification type! Valid types are: {type_list}", ephemeral=True)
-                return
-                        
-            setting_key = valid_types[notification_type]
-            settings = await get_notification_settings(str(interaction.user.id))
-            
-            if not settings:
-                # Initialize settings if they don't exist
-                default_settings = {
-                    "ada_transactions": True,
-                    "token_changes": True,
-                    "nft_updates": True,
-                    "staking_rewards": True,
-                    "stake_changes": True,
-                    "low_balance": True
-                }
-                await update_notification_setting(str(interaction.user.id), setting_key, True)
-                settings = default_settings
-            
-            # Toggle the setting
-            new_status = not settings.get(setting_key, True)
-            success = await update_notification_setting(str(interaction.user.id), setting_key, new_status)
-            
-            if success:
-                status = "enabled" if new_status else "disabled"
-                await interaction.response.send_message(f"✅ Successfully {status} {notification_type} notifications!", ephemeral=True)
-            else:
-                await interaction.response.send_message("❌ Failed to update notification setting.", ephemeral=True)
-                    
-        except Exception as e:
-            logger.error(f"Error toggling notification: {str(e)}")
-            await interaction.response.send_message("❌ An error occurred while updating your notification settings.", ephemeral=True)
+            await interaction.response.send_message(
+                "❌ An error occurred while getting your notification settings.",
+                ephemeral=True
+            )
 
 if __name__ == "__main__":
     try:
