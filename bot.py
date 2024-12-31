@@ -40,7 +40,11 @@ from database import (
     get_removed_nfts,
     check_ada_balance,
     get_all_wallets_for_user,
-    get_wallet_id
+    get_wallet_id,
+    get_last_yummi_check,
+    update_last_yummi_check,
+    get_yummi_warning_count,
+    increment_yummi_warning
 )
 
 # Configure logging
@@ -262,6 +266,54 @@ class WalletBud(commands.Bot):
         finally:
             await self.rate_limiter.release()
 
+    async def check_yummi_requirement(self, address: str, user_id: str = None):
+        """Check if wallet meets YUMMI token requirement
+        
+        Args:
+            address (str): Wallet address to check
+            user_id (str, optional): User ID for notifications. Defaults to None.
+            
+        Returns:
+            tuple: (bool, int) - (meets requirement, current balance)
+        """
+        try:
+            # Get UTXOs
+            utxos = await self.rate_limited_request(
+                self.blockfrost_client.address_utxos,
+                address
+            )
+            
+            # Calculate YUMMI balance
+            yummi_balance = sum(
+                int(amount.quantity)
+                for utxo in utxos
+                for amount in utxo.amount
+                if amount.unit == '29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49'
+            )
+            
+            meets_requirement = yummi_balance >= 25000
+            
+            # If user_id provided and requirement not met, notify user
+            if user_id and not meets_requirement:
+                try:
+                    user = await self.fetch_user(int(user_id))
+                    if user:
+                        await user.send(
+                            f"⚠️ **YUMMI Requirement Not Met!**\n"
+                            f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                            f"Current YUMMI: `{yummi_balance:,}`\n"
+                            f"Required: `25,000`\n\n"
+                            f"Your wallet will be removed from monitoring if the requirement is not met within 24 hours."
+                        )
+                except Exception as e:
+                    logger.error(f"Error notifying user about YUMMI requirement: {str(e)}")
+            
+            return meets_requirement, yummi_balance
+            
+        except Exception as e:
+            logger.error(f"Error checking YUMMI requirement: {str(e)}")
+            return False, 0
+
     async def check_wallets(self):
         """Background task to check all wallets periodically"""
         await self.wait_until_ready()
@@ -299,14 +351,56 @@ class WalletBud(commands.Bot):
                     logger.error(f"No user found for wallet {address}")
                     return
 
+                # Check YUMMI requirement every 6 hours
+                last_check = await get_last_yummi_check(address)
+                if not last_check or (datetime.now() - last_check).total_seconds() > 21600:  # 6 hours
+                    meets_req, balance = await self.check_yummi_requirement(address, user_id)
+                    await update_last_yummi_check(address)
+                    
+                    if not meets_req:
+                        # Get current warning count
+                        warning_count = await get_yummi_warning_count(address)
+                        
+                        if warning_count >= 4:  # Remove wallet after 24 hours (4 warnings)
+                            await remove_wallet(user_id, address)
+                            try:
+                                user = await self.fetch_user(int(user_id))
+                                if user:
+                                    await user.send(
+                                        f"❌ **Wallet Removed**\n"
+                                        f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                                        f"Reason: YUMMI requirement not met for 24 hours\n"
+                                        f"Current YUMMI: `{balance:,}`\n"
+                                        f"Required: `25,000`"
+                                    )
+                            except Exception as e:
+                                logger.error(f"Error notifying user about wallet removal: {str(e)}")
+                            return
+                        else:
+                            await increment_yummi_warning(address)
+                
                 # Get current wallet state
-                current_balance = 0
-                current_tokens = {}
                 try:
-                    current_balance, current_tokens = await self.rate_limited_request(
-                        self.blockfrost_client.address_total,
+                    # Get UTXOs
+                    utxos = await self.rate_limited_request(
+                        self.blockfrost_client.address_utxos,
                         address
                     )
+                    
+                    # Calculate current balance
+                    current_balance = sum(
+                        int(utxo.amount[0].quantity) / 1_000_000 
+                        for utxo in utxos 
+                        if utxo.amount and utxo.amount[0].unit == 'lovelace'
+                    )
+                    
+                    # Calculate current token amounts
+                    current_tokens = {}
+                    for utxo in utxos:
+                        for amount in utxo.amount:
+                            if amount.unit != 'lovelace':
+                                current_tokens[amount.unit] = current_tokens.get(amount.unit, 0) + int(amount.quantity)
+                
                 except Exception as e:
                     logger.error(f"Error getting wallet state: {str(e)}")
                     return
@@ -329,292 +423,62 @@ class WalletBud(commands.Bot):
 
                 # Update last checked timestamp
                 await update_last_checked(wallet_id)
-                
-                # Get current UTXOs
-                current_utxos = await self.rate_limited_request(
-                    self.blockfrost_client.address_utxos,
-                    address
-                )
-                
-                # Convert UTXOs to comparable format
-                current_state = {
-                    utxo.tx_hash: {
-                        amount.unit: amount.quantity 
-                        for amount in utxo.amount
-                    }
-                    for utxo in current_utxos
-                }
-                
-                # Get previous state
-                prev_state_json = await get_utxo_state(address)
-                prev_state = json.loads(prev_state_json) if prev_state_json else {}
-                
-                # Store current state
-                await store_utxo_state(address, json.dumps(current_state))
-                
-                # Check YUMMI balance
-                has_enough, balance = await self.verify_yummi_balance(address)
-                if not has_enough:
-                    logger.warning(f"Wallet {address} YUMMI balance too low: {balance:,}")
-                    # TODO: Notify user and remove wallet
-                    return
-                
-                # 1. Check ADA Transactions and Unusual Activity
-                txs = await self.rate_limited_request(
-                    self.blockfrost_client.address_transactions,
-                    address,
-                    count=10,
-                    page=1,
-                    order='desc'
-                )
-                
-                # Check for unusual transaction frequency
-                recent_txs = await get_recent_transactions(address, hours=1)
-                if len(recent_txs) > MAX_TX_PER_HOUR:
-                    embed = discord.Embed(
-                        title="⚠️ Unusual Wallet Activity",
-                        description="High frequency of transactions detected!",
-                        color=discord.Color.orange()
-                    )
-                    embed.add_field(
-                        name="Wallet",
-                        value=f"`{address}`",
-                        inline=False
-                    )
-                    embed.add_field(
-                        name="Transactions (Last Hour)",
-                        value=f"`{len(recent_txs)}`",
-                        inline=True
-                    )
-                    embed.add_field(
-                        name="Threshold",
-                        value=f"`{MAX_TX_PER_HOUR}`",
-                        inline=True
-                    )
-                    if await self.should_notify(int(user_id), "unusual_activity"):
-                        await user.send(embed=embed)
-                
-                for tx in txs:
-                    try:
-                        tx_hash = tx.tx_hash if hasattr(tx, 'tx_hash') else None
-                        if not tx_hash:
-                            continue
-                            
-                        # Check if transaction is new
-                        is_new = await add_transaction(address, tx_hash)
-                        if is_new:
-                            # Get transaction details to check ADA movement
-                            tx_details = await self.rate_limited_request(
-                                self.blockfrost_client.transaction_utxos,
-                                tx_hash
-                            )
-                            
-                            # Calculate ADA change
-                            ada_change = 0
-                            for output in tx_details.outputs:
-                                if output.address == address:
-                                    for amount in output.amount:
-                                        if amount.unit == "lovelace":
-                                            ada_change += int(amount.quantity)
-                            
-                            for input in tx_details.inputs:
-                                if input.address == address:
-                                    for amount in input.amount:
-                                        if amount.unit == "lovelace":
-                                            ada_change -= int(amount.quantity)
-                            
-                            if ada_change != 0:
-                                # Send ADA transaction notification
-                                embed = discord.Embed(
-                                    title="💰 ADA Transaction Detected",
-                                    description=f"{'Received' if ada_change > 0 else 'Sent'} ADA in your monitored wallet.",
-                                    color=discord.Color.green() if ada_change > 0 else discord.Color.red()
+
+                # Check for balance changes
+                if await self.should_notify(int(user_id), 'balance'):
+                    previous_balance = await check_ada_balance(address)
+                    if previous_balance is not None and abs(current_balance - previous_balance) > 1:  # 1 ADA threshold
+                        change = current_balance - previous_balance
+                        direction = "received" if change > 0 else "sent"
+                        await user.send(
+                            f"💰 **Balance Change Detected!**\n"
+                            f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                            f"{direction.title()}: `{abs(change):,.2f} ADA`\n"
+                            f"New Balance: `{current_balance:,.2f} ADA`"
+                        )
+
+                # Check for token changes
+                if await self.should_notify(int(user_id), 'tokens'):
+                    previous_tokens = await get_new_tokens(address)
+                    if previous_tokens is not None:
+                        # Check for new tokens
+                        for token_id, amount in current_tokens.items():
+                            if token_id not in previous_tokens:
+                                token_name = token_id.encode('utf-8').hex()[-8:]  # Get last 4 bytes of policy ID
+                                await user.send(
+                                    f"🪙 **New Token Detected!**\n"
+                                    f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                                    f"Token: `{token_name}`\n"
+                                    f"Amount: `{amount:,}`"
                                 )
-                                embed.add_field(
-                                    name="Wallet",
-                                    value=f"`{address}`",
-                                    inline=False
+                            elif amount > previous_tokens[token_id]:
+                                token_name = token_id.encode('utf-8').hex()[-8:]
+                                change = amount - previous_tokens[token_id]
+                                await user.send(
+                                    f"🪙 **Token Balance Increased!**\n"
+                                    f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                                    f"Token: `{token_name}`\n"
+                                    f"Received: `{change:,}`\n"
+                                    f"New Balance: `{amount:,}`"
                                 )
-                                embed.add_field(
-                                    name="Amount",
-                                    value=f"`{ada_change / 1_000_000:,.6f} ADA`",
-                                    inline=False
+                            elif amount < previous_tokens[token_id]:
+                                token_name = token_id.encode('utf-8').hex()[-8:]
+                                change = previous_tokens[token_id] - amount
+                                await user.send(
+                                    f"🪙 **Token Balance Decreased!**\n"
+                                    f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                                    f"Token: `{token_name}`\n"
+                                    f"Sent: `{change:,}`\n"
+                                    f"New Balance: `{amount:,}`"
                                 )
-                                embed.add_field(
-                                    name="Transaction Hash",
-                                    value=f"`{tx_hash}`",
-                                    inline=False
-                                )
-                                if await self.should_notify(int(user_id), "ada_transactions"):
-                                    await user.send(embed=embed)
-                    
-                    except Exception as e:
-                        logger.error(f"Error processing transaction {tx_hash}: {str(e)}")
-                        continue
-                
-                # 2. Check for New Tokens (excluding NFTs)
-                current_tokens = set()
-                current_nfts = set()
-                total_ada = 0
-                
-                for utxo in current_utxos:
-                    for amount in utxo.amount:
-                        if amount.unit == "lovelace":
-                            total_ada += int(amount.quantity)
-                        elif amount.unit != "lovelace":
-                            # Check if it's an NFT
-                            try:
-                                asset_details = await self.rate_limited_request(
-                                    self.blockfrost_client.asset,
-                                    amount.unit
-                                )
-                                if hasattr(asset_details, 'onchain_metadata'):
-                                    current_nfts.add(amount.unit)
-                                else:
-                                    current_tokens.add(amount.unit)
-                            except Exception:
-                                # If we can't get metadata, treat as regular token
-                                current_tokens.add(amount.unit)
-                
-                prev_tokens = set()
-                prev_nfts = set()
-                for utxo_data in prev_state.values():
-                    for unit in utxo_data.keys():
-                        if unit != "lovelace":
-                            if unit in current_nfts:
-                                prev_nfts.add(unit)
-                            else:
-                                prev_tokens.add(unit)
-                
-                # Check for new tokens
-                new_tokens = await get_new_tokens(address, prev_tokens, current_tokens)
-                if new_tokens:
-                    for token in new_tokens:
-                        try:
-                            # Skip if already processed
-                            curr_bal = current_state.get(token, 0)
-                            prev_bal = prev_state.get(token, 0)
-                            
-                            if await is_token_change_processed(address, token, prev_bal, curr_bal):
-                                continue
-                                
-                            # Get token details
-                            asset_details = await self.rate_limited_request(
-                                self.blockfrost_client.asset,
-                                token
-                            )
-                            
-                            # Get token name and metadata
-                            token_name = "Unknown Token"
-                            if hasattr(asset_details, 'onchain_metadata') and asset_details.onchain_metadata:
-                                token_name = asset_details.onchain_metadata.get('name', 'Unknown Token')
-                            elif hasattr(asset_details, 'metadata') and asset_details.metadata:
-                                token_name = asset_details.metadata.get('name', 'Unknown Token')
-                            
-                            # Create notification
-                            embed = discord.Embed(
-                                title="🪙 Token Balance Change",
-                                description=f"Your {token_name} balance has changed.",
-                                color=discord.Color.blue()
-                            )
-                            embed.add_field(
-                                name="Wallet",
-                                value=f"`{address}`",
-                                inline=False
-                            )
-                            embed.add_field(
-                                name="Token",
-                                value=f"`{token_name}`",
-                                inline=True
-                            )
-                            embed.add_field(
-                                name="Previous Balance",
-                                value=f"`{prev_bal:,}`",
-                                inline=True
-                            )
-                            embed.add_field(
-                                name="New Balance",
-                                value=f"`{curr_bal:,}`",
-                                inline=True
-                            )
-                            embed.add_field(
-                                name="Change",
-                                value=f"`{curr_bal - prev_bal:+,}`",
-                                inline=True
-                            )
-                            
-                            # Record this change
-                            await add_processed_token_change(address, token, prev_bal, curr_bal)
-                            
-                            if await self.should_notify(int(user_id), "token_changes"):
-                                await user.send(embed=embed)
-                                
-                        except Exception as e:
-                            logger.error(f"Error processing token change for {token}: {str(e)}")
-                            continue
-                
-                # Check for removed NFTs
-                removed_nfts = await get_removed_nfts(address, prev_nfts, current_nfts)
-                if removed_nfts:
-                    embed = discord.Embed(
-                        title="🎨 NFT Removed",
-                        description="NFT(s) have been removed from your wallet.",
-                        color=discord.Color.red()
-                    )
-                    embed.add_field(
-                        name="Wallet",
-                        value=f"`{address}`",
-                        inline=False
-                    )
-                    for nft in removed_nfts:
-                        try:
-                            asset_details = await self.rate_limited_request(
-                                self.blockfrost_client.asset,
-                                nft
-                            )
-                            name = asset_details.onchain_metadata.get('name', 'Unknown NFT')
-                            embed.add_field(
-                                name=name,
-                                value=f"Policy: `{nft[:56]}`",
-                                inline=False
-                            )
-                        except Exception:
-                            continue
-                    if await self.should_notify(int(user_id), "nft_updates"):
-                        await user.send(embed=embed)
-                
-                # Check for low ADA balance
-                is_low, balance_ada = await check_ada_balance(address, total_ada)
-                if is_low:
-                    embed = discord.Embed(
-                        title="⚠️ Low ADA Balance",
-                        description="Your wallet's ADA balance is below the minimum threshold!",
-                        color=discord.Color.red()
-                    )
-                    embed.add_field(
-                        name="Wallet",
-                        value=f"`{address}`",
-                        inline=False
-                    )
-                    embed.add_field(
-                        name="Current Balance",
-                        value=f"`{balance_ada:,.6f} ADA`",
-                        inline=True
-                    )
-                    embed.add_field(
-                        name="Minimum Required",
-                        value=f"`{MIN_ADA_BALANCE:,.6f} ADA`",
-                        inline=True
-                    )
-                    if await self.should_notify(int(user_id), "low_balance"):
-                        await user.send(embed=embed)
-                
-                # Continue with other checks (staking rewards, stake key changes)
-                await self._check_staking_and_stake_key(address, user)
-                
+
+                # Update stored balances
+                await update_ada_balance(address, current_balance)
+                await update_token_balances(address, current_tokens)
+
         except Exception as e:
-            logger.error(f"Error checking wallet {address}: {str(e)}")
-            
+            logger.error(f"Error checking wallet: {str(e)}")
+
     async def should_notify(self, user_id: int, notification_type: str):
         """Check if we should send a notification to the user
         
@@ -827,15 +691,27 @@ class WalletBud(commands.Bot):
                 await interaction.response.send_message("❌ Invalid wallet address! Address must start with 'addr1'.", ephemeral=True)
                 return
                 
-            # Check if wallet exists
+            # Check if wallet exists and get UTXOs
             try:
-                address_info = await self.rate_limited_request(
-                    self.blockfrost_client.address,
+                utxos = await self.rate_limited_request(
+                    self.blockfrost_client.address_utxos,
                     address
                 )
-                if not address_info:
+                if not utxos:
                     await interaction.response.send_message("❌ Invalid wallet address! Could not find wallet on blockchain.", ephemeral=True)
                     return
+
+                # Check YUMMI token requirement (25,000 minimum)
+                yummi_amount = 0
+                for utxo in utxos:
+                    for amount in utxo.amount:
+                        if amount.unit == '29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49':  # YUMMI
+                            yummi_amount += int(amount.quantity)
+
+                if yummi_amount < 25000:
+                    await interaction.response.send_message("❌ Wallet must hold at least 25,000 YUMMI tokens!", ephemeral=True)
+                    return
+
             except Exception as e:
                 logger.error(f"Error validating address: {str(e)}")
                 await interaction.response.send_message("❌ Invalid wallet address! Could not verify wallet on blockchain.", ephemeral=True)
@@ -894,7 +770,7 @@ class WalletBud(commands.Bot):
             )
             
             # Add each wallet with its details
-            for address in addresses:
+            for i, address in enumerate(addresses, 1):
                 try:
                     # Get wallet info
                     utxos = await self.rate_limited_request(
@@ -902,35 +778,49 @@ class WalletBud(commands.Bot):
                         address
                     )
                     
-                    # Calculate balance
-                    ada_balance = sum(
-                        int(utxo.amount[0].quantity) / 1_000_000 
-                        for utxo in utxos 
-                        if utxo.amount and utxo.amount[0].unit == 'lovelace'
-                    )
-                    
-                    # Get transaction count
-                    tx_info = await self.rate_limited_request(
-                        self.blockfrost_client.address_total,
-                        address
-                    )
-                    tx_count = tx_info.tx_count if tx_info else 0
-                    
-                    # Add wallet field
-                    embed.add_field(
-                        name=f"Wallet `{address[:20]}...`",
-                        value=(
-                            f"Balance: `{ada_balance:,.6f} ADA`\n"
-                            f"Transactions: `{tx_count}`\n"
-                            f"Full Address: `{address}`"
-                        ),
-                        inline=False
-                    )
-                    
+                    if utxos:
+                        # Calculate ADA balance
+                        ada_balance = sum(
+                            int(utxo.amount[0].quantity) / 1_000_000 
+                            for utxo in utxos 
+                            if utxo.amount and utxo.amount[0].unit == 'lovelace'
+                        )
+                        
+                        # Calculate YUMMI balance
+                        yummi_balance = sum(
+                            int(amount.quantity)
+                            for utxo in utxos
+                            for amount in utxo.amount
+                            if amount.unit == '29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49'
+                        )
+                        
+                        # Get transaction count
+                        tx_info = await self.rate_limited_request(
+                            self.blockfrost_client.address_total,
+                            address
+                        )
+                        tx_count = tx_info.tx_count if tx_info else 0
+                        
+                        # Format address for display
+                        short_address = f"{address[:8]}...{address[-8:]}"
+                        
+                        # Add wallet field
+                        embed.add_field(
+                            name=f"🏦 Wallet #{i}",
+                            value=(
+                                f"**Address:** `{short_address}`\n"
+                                f"**Balance:** `{ada_balance:,.2f} ADA`\n"
+                                f"**YUMMI:** `{yummi_balance:,}`\n"
+                                f"**Transactions:** `{tx_count}`\n"
+                                f"**Full Address:**\n`{address}`"
+                            ),
+                            inline=False
+                        )
+                        
                 except Exception as e:
                     logger.error(f"Error getting wallet info: {str(e)}")
                     embed.add_field(
-                        name=f"Wallet `{address[:20]}...`",
+                        name=f"Wallet #{i}",
                         value="❌ Failed to get wallet info",
                         inline=False
                     )

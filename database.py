@@ -40,6 +40,7 @@ DROP TABLE IF EXISTS removed_nfts;
 DROP TABLE IF EXISTS new_tokens;
 DROP TABLE IF EXISTS balance_alerts;
 DROP TABLE IF EXISTS processed_token_changes;
+DROP TABLE IF EXISTS yummi_requirements;
 
 -- Users table
 CREATE TABLE IF NOT EXISTS users (
@@ -54,6 +55,8 @@ CREATE TABLE IF NOT EXISTS wallets (
     user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
     address TEXT NOT NULL,
     last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_yummi_check TIMESTAMP,
+    yummi_warnings INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, address)
 );
@@ -120,6 +123,13 @@ CREATE TABLE IF NOT EXISTS processed_token_changes (
     new_balance BIGINT NOT NULL,
     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (address, policy_id, processed_at)
+);
+
+-- YUMMI requirements table
+CREATE TABLE IF NOT EXISTS yummi_requirements (
+    address TEXT PRIMARY KEY,
+    requirement TEXT NOT NULL,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 
@@ -848,6 +858,96 @@ async def get_wallet_for_user(user_id: str, address: str = None):
     except Exception as e:
         logger.error(f"Error getting wallet for user: {str(e)}")
         return None
+
+async def get_last_yummi_check(address: str):
+    """Get the last time YUMMI requirement was checked for a wallet
+    
+    Args:
+        address (str): Wallet address
+        
+    Returns:
+        datetime: Last check time or None if never checked
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                'SELECT last_yummi_check FROM wallets WHERE address = $1',
+                address
+            )
+    except Exception as e:
+        logger.error(f"Error getting last YUMMI check: {str(e)}")
+        return None
+
+async def update_last_yummi_check(address: str):
+    """Update the last YUMMI check time for a wallet
+    
+    Args:
+        address (str): Wallet address
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE wallets SET last_yummi_check = $1 WHERE address = $2',
+                datetime.now(),
+                address
+            )
+    except Exception as e:
+        logger.error(f"Error updating last YUMMI check: {str(e)}")
+
+async def get_yummi_warning_count(address: str):
+    """Get the number of YUMMI requirement warnings for a wallet
+    
+    Args:
+        address (str): Wallet address
+        
+    Returns:
+        int: Warning count or 0 if no warnings
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                'SELECT yummi_warnings FROM wallets WHERE address = $1',
+                address
+            )
+            return count or 0
+    except Exception as e:
+        logger.error(f"Error getting YUMMI warning count: {str(e)}")
+        return 0
+
+async def increment_yummi_warning(address: str):
+    """Increment the YUMMI warning count for a wallet
+    
+    Args:
+        address (str): Wallet address
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE wallets SET yummi_warnings = COALESCE(yummi_warnings, 0) + 1 WHERE address = $1',
+                address
+            )
+    except Exception as e:
+        logger.error(f"Error incrementing YUMMI warning count: {str(e)}")
+
+async def reset_yummi_warning(address: str):
+    """Reset the YUMMI warning count for a wallet
+    
+    Args:
+        address (str): Wallet address
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                'UPDATE wallets SET yummi_warnings = 0 WHERE address = $1',
+                address
+            )
+    except Exception as e:
+        logger.error(f"Error resetting YUMMI warning count: {str(e)}")
 
 async def main():
     # Example usage
