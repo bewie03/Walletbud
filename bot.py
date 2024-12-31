@@ -3,16 +3,23 @@ import logging
 import sys
 from datetime import datetime
 import time
+import json
+import hmac
+import hashlib
 import asyncio
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import hmac
-import hashlib
-from aiohttp import web
+
 from blockfrost import BlockFrostApi
-from config import *
-from db import *
+from database import (
+    get_user_id_for_wallet,
+    get_user_id_for_stake_address,
+    get_all_wallets_for_user,
+    get_addresses_for_stake,
+    update_pool_for_stake
+)
 
 import uuid
 import random
@@ -351,7 +358,6 @@ class WalletBud(commands.Bot):
             logger.info(f"Loaded {len(stake_addresses)} stake addresses")
             
             # Set up webhook routes with retry mechanism
-            self.app.router.add_post('/webhooks/blockfrost', self.handle_webhook_with_retry)
             self.app.router.add_post('/webhooks/blockfrost', self.handle_webhook_with_retry)
             
             # Start webhook server
@@ -957,6 +963,8 @@ class WalletBud(commands.Bot):
         try:
             # Get user's wallets
             addresses = await get_all_wallets_for_user(str(interaction.user.id))
+            
+            # Check if user has any wallets
             if not addresses:
                 await self.safe_send(
                     interaction,
@@ -1304,22 +1312,33 @@ class WalletBud(commands.Bot):
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
 
-    async def handle_webhook_with_retry(self, request: web.Request, max_retries: int = 3) -> web.Response:
+    async def handle_webhook_with_retry(self, request: web.Request) -> web.Response:
         """Handle webhook with exponential backoff retry"""
         retry_count = 0
-        while retry_count < max_retries:
+        last_error = None
+        
+        while retry_count < 3:  # Max 3 retries
             try:
                 return await self.handle_webhook(request)
             except Exception as e:
                 retry_count += 1
-                if retry_count == max_retries:
+                last_error = e
+                
+                if retry_count == 3:
                     logger.error(f"Final webhook handling attempt failed: {str(e)}")
-                    raise
+                    await self.send_admin_alert(
+                        f"Webhook processing failed after 3 retries:\n"
+                        f"Error: {str(e)}"
+                    )
+                    return web.Response(status=500, text=str(e))
                 
                 # Exponential backoff: 2^retry_count seconds
                 wait_time = 2 ** retry_count
-                logger.warning(f"Webhook handling attempt {retry_count} failed. Retrying in {wait_time}s")
+                logger.warning(f"Webhook handling attempt {retry_count} failed. Retrying in {wait_time}s. Error: {str(e)}")
                 await asyncio.sleep(wait_time)
+        
+        # This should never happen due to the return in the last retry
+        return web.Response(status=500, text=str(last_error))
 
     async def handle_webhook(self, request: web.Request) -> web.Response:
         """Handle incoming webhooks from Blockfrost"""
@@ -1329,19 +1348,15 @@ class WalletBud(commands.Bot):
             auth_token = request.headers.get('Auth-Token')
             signature = request.headers.get('Signature')
             
-            # Validate webhook ID and auth token
-            webhook_config = None
-            for config in WEBHOOKS.values():
-                if config['id'] == webhook_id and config['auth_token'] == auth_token:
-                    webhook_config = config
-                    break
-                    
-            if not webhook_config:
-                logger.error(f"Invalid webhook ID or auth token: {webhook_id}")
-                return web.Response(status=401, text="Invalid webhook ID or auth token")
+            if not all([webhook_id, auth_token, signature]):
+                logger.error("Missing required headers in webhook request")
+                return web.Response(status=400, text="Missing required headers")
             
             # Get request body
             body = await request.text()
+            if not body:
+                logger.error("Empty webhook payload")
+                return web.Response(status=400, text="Empty payload")
             
             # Validate signature
             expected_signature = hmac.new(
@@ -1350,28 +1365,26 @@ class WalletBud(commands.Bot):
                 hashlib.sha256
             ).hexdigest()
             
-            if signature != expected_signature:
+            if not hmac.compare_digest(signature, expected_signature):
                 logger.error(f"Invalid signature for webhook {webhook_id}")
                 return web.Response(status=401, text="Invalid signature")
             
             # Parse payload
-            payload = await request.json()
+            try:
+                payload = await request.json()
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON payload: {str(e)}")
+                return web.Response(status=400, text="Invalid JSON payload")
             
             # Validate event type
             event_type = payload.get('event_type')
             if not event_type:
                 logger.error("Missing event_type in webhook payload")
                 return web.Response(status=400, text="Missing event_type")
-                
-            if event_type not in WEBHOOKS:
+            
+            if event_type not in ['transaction', 'delegation']:
                 logger.error(f"Invalid event_type: {event_type}")
                 return web.Response(status=400, text="Invalid event_type")
-            
-            # Check confirmations
-            confirmations = payload.get('confirmations', 0)
-            if confirmations < webhook_config['confirmations']:
-                logger.info(f"Waiting for more confirmations. Current: {confirmations}, Required: {webhook_config['confirmations']}")
-                return web.Response(status=202, text="Waiting for more confirmations")
             
             # Process webhook based on event type
             if event_type == 'transaction':
@@ -1385,6 +1398,7 @@ class WalletBud(commands.Bot):
             logger.error(f"Error handling webhook: {str(e)}")
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
+            await self.send_admin_alert(f"Error in webhook handler: {str(e)}")
             return web.Response(status=500, text="Internal server error")
 
     async def handle_transaction_webhook(self, payload: dict):
