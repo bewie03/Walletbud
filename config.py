@@ -29,7 +29,7 @@ def validate_hex(value, length, name):
     """Validate hexadecimal string of a specific length"""
     if not value or not re.fullmatch(rf"(?i)[a-f0-9]{{{length}}}", value):
         raise ValueError(f"Invalid {name} format: {value}. Must be a {length}-character hexadecimal string.")
-    return value
+    return value.lower()  # Always return lowercase
 
 # Discord Bot Configuration
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
