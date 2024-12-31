@@ -352,6 +352,7 @@ class WalletBud(commands.Bot):
             
             # Set up webhook routes with retry mechanism
             self.app.router.add_post('/webhooks/blockfrost', self.handle_webhook_with_retry)
+            self.app.router.add_post('/webhooks/blockfrost', self.handle_webhook_with_retry)
             
             # Start webhook server
             await self.runner.setup()
@@ -396,8 +397,13 @@ class WalletBud(commands.Bot):
             # Test connection with health endpoint
             logger.info("Testing Blockfrost connection...")
             try:
-                health = await self.rate_limited_request(self.blockfrost_client.root)
+                # Test health endpoint
+                health = await self.rate_limited_request(self.blockfrost_client.health)
                 logger.info(f"Health check response: {health}")
+                
+                # Test network info
+                network = await self.rate_limited_request(self.blockfrost_client.network)
+                logger.info(f"Network info: {network}")
                 
                 # Test address lookup
                 test_address = os.getenv('TEST_ADDRESS', 'addr1qxqs59lphg8g6qnplr8q6kw2hyzn8c8e3r5jlnwjqppn8k2vllp6xf5qvjgclau0t2q5jz7c7vyvs3x4u2xqm7gaex0s6dd9ay')
@@ -408,7 +414,6 @@ class WalletBud(commands.Bot):
                     address=test_address
                 )
                 logger.info("Address lookup successful")
-                
                 logger.info("✅ Connection test passed")
                 return True
                 
@@ -1385,8 +1390,16 @@ class WalletBud(commands.Bot):
     async def handle_transaction_webhook(self, payload: dict):
         """Handle transaction webhook"""
         try:
-            addresses = payload.get('addresses', [])
-            tx_hash = payload.get('tx_hash')
+            # Validate required fields
+            if not all(key in payload for key in ['addresses', 'tx_hash', 'block_height']):
+                logger.error(f"Missing required fields in transaction webhook payload: {payload}")
+                return
+                
+            addresses = payload['addresses']
+            tx_hash = payload['tx_hash']
+            block_height = payload['block_height']
+            
+            logger.info(f"Processing transaction webhook for tx {tx_hash} at block {block_height}")
             
             for address in addresses:
                 # Check if we're monitoring this address
@@ -1396,88 +1409,172 @@ class WalletBud(commands.Bot):
                 # Get user ID for this address
                 user_id = await get_user_id_for_wallet(address)
                 if not user_id:
+                    logger.warning(f"No user found for monitored address {address}")
                     continue
-                    
-                # Get transaction details
-                tx = await self.rate_limited_request(
-                    self.blockfrost_client.transaction,
-                    hash=tx_hash
-                )
                 
-                # Check if user wants transaction notifications
-                if not await should_notify(user_id, 'ada_transactions'):
+                try:
+                    # Get transaction details from Blockfrost
+                    tx_details = await self.rate_limited_request(
+                        self.blockfrost_client.transaction,
+                        tx_hash
+                    )
+                    
+                    # Get transaction UTXOs
+                    tx_utxos = await self.rate_limited_request(
+                        self.blockfrost_client.transaction_utxos,
+                        tx_hash
+                    )
+                    
+                    # Process ADA changes
+                    if await self.should_notify(user_id, "ada_transactions"):
+                        ada_change = self._calculate_ada_change(tx_utxos, address)
+                        if ada_change != 0:
+                            change_type = "received" if ada_change > 0 else "sent"
+                            await self.send_dm(
+                                user_id,
+                                f"🔔 ADA Transaction: {change_type.capitalize()} {abs(ada_change/1000000):.6f} ADA\n"
+                                f"Transaction: {tx_hash}\n"
+                                f"Block: {block_height}"
+                            )
+                    
+                    # Process token changes
+                    if await self.should_notify(user_id, "token_changes"):
+                        token_changes = self._calculate_token_changes(tx_utxos, address)
+                        for token_id, amount in token_changes.items():
+                            if amount != 0:
+                                change_type = "received" if amount > 0 else "sent"
+                                await self._notify_token_change(
+                                    address, user_id, token_id, 
+                                    abs(amount), change_type
+                                )
+                    
+                    # Check for DApp interactions
+                    if await self.should_notify(user_id, "dapp_interactions"):
+                        dapp_name = self._identify_dapp_interaction(tx_details)
+                        if dapp_name:
+                            await self.send_dm(
+                                user_id,
+                                f"🔔 DApp Interaction Detected: {dapp_name}\n"
+                                f"Transaction: {tx_hash}\n"
+                                f"Block: {block_height}"
+                            )
+                    
+                    # Check for failed transactions
+                    if await self.should_notify(user_id, "failed_transactions"):
+                        if not tx_details.get('valid', True):
+                            await self.send_dm(
+                                user_id,
+                                f"⚠️ Failed Transaction Detected\n"
+                                f"Transaction: {tx_hash}\n"
+                                f"Block: {block_height}"
+                            )
+                
+                except Exception as e:
+                    logger.error(f"Error processing transaction {tx_hash} for address {address}: {str(e)}")
+                    await self.send_admin_alert(
+                        f"Error processing transaction webhook:\n"
+                        f"TX Hash: {tx_hash}\n"
+                        f"Address: {address}\n"
+                        f"Error: {str(e)}"
+                    )
                     continue
-                    
-                # Create notification message
-                message = (
-                    f"🔔 **New Transaction**\n"
-                    f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                    f"Transaction: `{tx_hash}`\n"
-                    f"Block: `{payload['block']}`\n"
-                    f"Confirmations: `{payload['confirmations']}`"
-                )
-                
-                # Send notification
-                await self.send_dm(int(user_id), message)
-                
+            
         except Exception as e:
-            logger.error(f"Error handling transaction webhook: {str(e)}")
+            logger.error(f"Error in handle_transaction_webhook: {str(e)}")
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
+            await self.send_admin_alert(f"Error in transaction webhook handler: {str(e)}")
 
     async def handle_delegation_webhook(self, payload: dict):
         """Handle delegation webhook"""
         try:
-            stake_address = payload.get('stake_address')
-            pool_id = payload.get('pool_id')
-            action = payload.get('action')
+            # Validate required fields
+            if not all(key in payload for key in ['stake_address', 'pool_id', 'block_height']):
+                logger.error(f"Missing required fields in delegation webhook payload: {payload}")
+                return
+                
+            stake_address = payload['stake_address']
+            pool_id = payload['pool_id']
+            block_height = payload['block_height']
             
+            logger.info(f"Processing delegation webhook for stake address {stake_address} at block {block_height}")
+            
+            # Check if we're monitoring this stake address
             if stake_address not in self.monitored_stake_addresses:
                 return
                 
-            # Get all addresses for this stake address
-            addresses = await get_addresses_for_stake(stake_address)
-            if not addresses:
+            # Get user ID for this stake address
+            user_id = await get_user_id_for_stake_address(stake_address)
+            if not user_id:
+                logger.warning(f"No user found for monitored stake address {stake_address}")
                 return
                 
-            # Update pool for stake address
-            if action == 'registered':
-                await update_pool_for_stake(stake_address, pool_id)
-            elif action == 'deregistered':
-                await update_pool_for_stake(stake_address, None)
-            
-            for address in addresses:
-                # Get user ID for this address
-                user_id = await get_user_id_for_wallet(address)
-                if not user_id:
-                    continue
-                    
-                # Check if user wants delegation notifications
-                if not await should_notify(user_id, 'delegation_status'):
-                    continue
-                    
+            # Check if user wants delegation notifications
+            if not await self.should_notify(user_id, "delegation_status"):
+                return
+                
+            try:
+                # Get pool details from Blockfrost
+                pool_details = await self.rate_limited_request(
+                    self.blockfrost_client.pool,
+                    pool_id
+                )
+                
+                # Get pool metadata
+                pool_metadata = await self.rate_limited_request(
+                    self.blockfrost_client.pool_metadata,
+                    pool_id
+                )
+                
                 # Create notification message
-                if action == 'registered':
-                    message = (
-                        f"🎯 **Delegation Update**\n"
-                        f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                        f"Action: Delegated to pool\n"
-                        f"Pool ID: `{pool_id[:8]}...{pool_id[-8:]}`"
-                    )
-                else:
-                    message = (
-                        f"🎯 **Delegation Update**\n"
-                        f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                        f"Action: Stake key deregistered"
-                    )
+                pool_name = pool_metadata.get('name', pool_id[:8])
+                ticker = pool_metadata.get('ticker', '')
+                description = pool_metadata.get('description', 'No description available')
+                
+                message = (
+                    f"🔄 Delegation Change Detected\n"
+                    f"Stake Address: `{stake_address[:8]}...{stake_address[-8:]}`\n"
+                    f"New Pool: {pool_name} [{ticker}]\n"
+                    f"Pool ID: `{pool_id[:8]}...{pool_id[-8:]}`\n"
+                    f"Description: {description[:100]}...\n"
+                    f"Block: {block_height}"
+                )
                 
                 # Send notification
-                await self.send_dm(int(user_id), message)
+                await self.send_dm(user_id, message)
+                
+                # Check for staking rewards if enabled
+                if await self.should_notify(user_id, "staking_rewards"):
+                    rewards = await self.rate_limited_request(
+                        self.blockfrost_client.account_rewards,
+                        stake_address,
+                        params={"count": 1}
+                    )
+                    
+                    if rewards and rewards[0].get('amount', 0) > 0:
+                        reward_amount = rewards[0]['amount'] / 1000000  # Convert lovelace to ADA
+                        reward_message = (
+                            f"💰 Staking Reward Received\n"
+                            f"Amount: {reward_amount:.6f} ADA\n"
+                            f"Pool: {pool_name} [{ticker}]\n"
+                            f"Block: {block_height}"
+                        )
+                        await self.send_dm(user_id, reward_message)
+                
+            except Exception as e:
+                logger.error(f"Error processing delegation for stake address {stake_address}: {str(e)}")
+                await self.send_admin_alert(
+                    f"Error processing delegation webhook:\n"
+                    f"Stake Address: {stake_address}\n"
+                    f"Pool ID: {pool_id}\n"
+                    f"Error: {str(e)}"
+                )
                 
         except Exception as e:
-            logger.error(f"Error handling delegation webhook: {str(e)}")
+            logger.error(f"Error in handle_delegation_webhook: {str(e)}")
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
+            await self.send_admin_alert(f"Error in delegation webhook handler: {str(e)}")
 
 if __name__ == "__main__":
     try:
