@@ -291,15 +291,45 @@ class WalletBud(commands.Bot):
         """Check a single wallet's balance and transactions"""
         try:
             async with self.wallet_task_lock:
-                # Get user for notifications
+                # Get user ID for this wallet
                 user_id = await get_user_id_for_wallet(address)
                 if not user_id:
-                    return
-                    
-                user = await self.fetch_user(int(user_id))
-                if not user:
+                    logger.error(f"No user found for wallet {address}")
                     return
 
+                # Get current wallet state
+                current_balance = 0
+                current_tokens = {}
+                try:
+                    current_balance, current_tokens = await self.rate_limited_request(
+                        self.blockfrost_client.address_total,
+                        address
+                    )
+                except Exception as e:
+                    logger.error(f"Error getting wallet state: {str(e)}")
+                    return
+
+                # Get user for notifications
+                try:
+                    user = await self.fetch_user(int(user_id))
+                    if not user:
+                        logger.error(f"Could not find user {user_id}")
+                        return
+                except Exception as e:
+                    logger.error(f"Error getting user: {str(e)}")
+                    return
+
+                # Get wallet ID
+                wallet = await get_wallet(str(user_id), address)
+                if not wallet:
+                    logger.error(f"Could not find wallet {address} for user {user_id}")
+                    return
+                    
+                wallet_id = wallet['wallet_id']
+
+                # Update last checked timestamp
+                await update_last_checked(wallet_id)
+                
                 # Get current UTXOs
                 current_utxos = await self.rate_limited_request(
                     self.blockfrost_client.address_utxos,
@@ -361,7 +391,7 @@ class WalletBud(commands.Bot):
                         value=f"`{MAX_TX_PER_HOUR}`",
                         inline=True
                     )
-                    if await self.should_notify(user_id, "unusual_activity"):
+                    if await self.should_notify(int(user_id), "unusual_activity"):
                         await user.send(embed=embed)
                 
                 for tx in txs:
@@ -415,7 +445,7 @@ class WalletBud(commands.Bot):
                                     value=f"`{tx_hash}`",
                                     inline=False
                                 )
-                                if await self.should_notify(user_id, "ada_transactions"):
+                                if await self.should_notify(int(user_id), "ada_transactions"):
                                     await user.send(embed=embed)
                     
                     except Exception as e:
@@ -516,7 +546,7 @@ class WalletBud(commands.Bot):
                             # Record this change
                             await add_processed_token_change(address, token, prev_bal, curr_bal)
                             
-                            if await self.should_notify(user_id, "token_changes"):
+                            if await self.should_notify(int(user_id), "token_changes"):
                                 await user.send(embed=embed)
                                 
                         except Exception as e:
@@ -550,7 +580,7 @@ class WalletBud(commands.Bot):
                             )
                         except Exception:
                             continue
-                    if await self.should_notify(user_id, "nft_updates"):
+                    if await self.should_notify(int(user_id), "nft_updates"):
                         await user.send(embed=embed)
                 
                 # Check for low ADA balance
@@ -576,7 +606,7 @@ class WalletBud(commands.Bot):
                         value=f"`{MIN_ADA_BALANCE:,.6f} ADA`",
                         inline=True
                     )
-                    if await self.should_notify(user_id, "low_balance"):
+                    if await self.should_notify(int(user_id), "low_balance"):
                         await user.send(embed=embed)
                 
                 # Continue with other checks (staking rewards, stake key changes)
@@ -585,7 +615,7 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Error checking wallet {address}: {str(e)}")
             
-    async def should_notify(self, user_id: int, notification_type: str) -> bool:
+    async def should_notify(self, user_id: int, notification_type: str):
         """Check if we should send a notification to the user
         
         Args:
@@ -597,11 +627,15 @@ class WalletBud(commands.Bot):
         """
         try:
             settings = await get_notification_settings(str(user_id))
-            return settings.get(notification_type, True)  # Default to True if setting doesn't exist
+            if not settings:
+                # Default to True if no settings exist
+                return True
+            return settings.get(notification_type, True)
             
         except Exception as e:
             logger.error(f"Error checking notification settings: {str(e)}")
-            return True  # Default to sending notification if error occurs
+            # Default to True on error
+            return True
 
     async def _check_staking_and_stake_key(self, address: str, user: discord.User):
         """Helper method to check staking rewards and stake key changes"""
@@ -638,7 +672,7 @@ class WalletBud(commands.Bot):
                         value=f"`{reward.epoch}`",
                         inline=True
                     )
-                    if await self.should_notify(user.id, "staking_rewards"):
+                    if await self.should_notify(int(user.id), "staking_rewards"):
                         await user.send(embed=embed)
             
             # Check Stake Key Changes
@@ -669,7 +703,7 @@ class WalletBud(commands.Bot):
                         value=f"`{current_stake}`",
                         inline=False
                     )
-                    if await self.should_notify(user.id, "stake_changes"):
+                    if await self.should_notify(int(user.id), "stake_changes"):
                         await user.send(embed=embed)
                     
         except Exception as e:
@@ -920,7 +954,7 @@ class WalletBud(commands.Bot):
             # Get user's wallet
             address = await get_wallet_for_user(interaction.user.id)
             if not address:
-                await interaction.response.send_message("❌ You don't have a registered wallet! Use `/register` first.", ephemeral=True)
+                await interaction.response.send_message("❌ You don't have a registered wallet! Use `/addwallet` first.", ephemeral=True)
                 return
                         
             # Get current balance
@@ -969,9 +1003,9 @@ class WalletBud(commands.Bot):
     async def _notifications(self, interaction: discord.Interaction):
         """View your notification settings"""
         try:
-            settings = await get_notification_settings(interaction.user.id)
+            settings = await get_notification_settings(str(interaction.user.id))
             if not settings:
-                await interaction.response.send_message("❌ You don't have any notification settings! Use `/register` first.", ephemeral=True)
+                await interaction.response.send_message("❌ You don't have any notification settings! Use `/addwallet` first.", ephemeral=True)
                 return
                         
             # Create embed

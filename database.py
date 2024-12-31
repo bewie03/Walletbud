@@ -196,14 +196,24 @@ async def remove_wallet(user_id: str, address: str) -> bool:
         return False
 
 async def get_wallet(user_id: str, address: str):
-    """Get a specific wallet"""
+    """Get a specific wallet
+    
+    Args:
+        user_id (str): Discord user ID
+        address (str): Wallet address
+        
+    Returns:
+        dict: Wallet info or None if not found
+    """
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            return await conn.fetchrow(
+            row = await conn.fetchrow(
                 'SELECT * FROM wallets WHERE user_id = $1 AND address = $2',
-                user_id, address
+                user_id,
+                address
             )
+            return dict(row) if row else None
             
     except Exception as e:
         logger.error(f"Error getting wallet: {str(e)}")
@@ -224,19 +234,23 @@ async def get_all_wallets():
         return []
 
 async def update_last_checked(wallet_id: int, timestamp: datetime = None):
-    """Update last checked timestamp for a wallet"""
+    """Update last checked timestamp for a wallet
+    
+    Args:
+        wallet_id (int): Wallet ID
+        timestamp (datetime, optional): Timestamp to set. Defaults to current time.
+    """
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
                 'UPDATE wallets SET last_checked = $1 WHERE wallet_id = $2',
-                timestamp or datetime.utcnow(), wallet_id
+                timestamp or datetime.now(),
+                wallet_id
             )
-            return True
             
     except Exception as e:
         logger.error(f"Error updating last checked: {str(e)}")
-        return False
 
 async def add_transaction(wallet_id: int, tx_hash: str, timestamp: datetime = None):
     """Add a transaction"""
