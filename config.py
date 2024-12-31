@@ -56,8 +56,16 @@ def validate_discord_token(value: str, name: str) -> str:
 
 def validate_blockfrost_id(value: str, name: str) -> str:
     """Validate Blockfrost project ID format"""
-    if not value or not re.match(r'^(mainnet|preprod|preview)[0-9a-zA-Z]{32}$', value):
-        raise ValueError(f"{name} must be a valid Blockfrost project ID (should start with network type followed by 32 characters)")
+    if not value:
+        raise ValueError(f"{name} cannot be empty")
+    # Log the project ID format for debugging
+    logger.info(f"Validating Blockfrost project ID: {value[:8]}...")
+    return value
+
+def validate_blockfrost_webhook_id(value: str, name: str) -> str:
+    """Validate Blockfrost webhook ID format"""
+    if not value or not re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', value):
+        raise ValueError(f"{name} must be a valid Blockfrost webhook ID, got: {value}")
     return value
 
 # Define required environment variables
@@ -90,10 +98,12 @@ ENV_VARS = {
     ),
     'BLOCKFROST_TX_WEBHOOK_ID': EnvVar(
         name="Blockfrost Transaction Webhook ID",
+        validator=validate_blockfrost_webhook_id,
         description="Transaction webhook ID from Blockfrost dashboard"
     ),
     'BLOCKFROST_DEL_WEBHOOK_ID': EnvVar(
         name="Blockfrost Delegation Webhook ID",
+        validator=validate_blockfrost_webhook_id,
         description="Delegation webhook ID from Blockfrost dashboard"
     ),
     'BLOCKFROST_WEBHOOK_SECRET': EnvVar(
@@ -111,6 +121,11 @@ ENV_VARS = {
         name="YUMMI Token Name",
         validator=lambda x, n: validate_hex(x, 9, n),
         description="YUMMI token name (9-character hexadecimal string)"
+    ),
+    'ASSET_ID': EnvVar(
+        name="Asset ID",
+        validator=lambda x, n: validate_hex(x, 56+9, n),  # policy_id (56) + token_name (9)
+        description="Full asset ID (policy_id + hex-encoded token name)"
     ),
     
     # API Rate Limiting
@@ -220,6 +235,16 @@ try:
     # YUMMI Token Configuration
     YUMMI_POLICY_ID = env['YUMMI_POLICY_ID']
     YUMMI_TOKEN_NAME = env['YUMMI_TOKEN_NAME']
+    ASSET_ID = env['ASSET_ID']
+    
+    # Verify ASSET_ID is correctly formed
+    if ASSET_ID != YUMMI_POLICY_ID + YUMMI_TOKEN_NAME:
+        raise ValueError(
+            f"ASSET_ID must be POLICY_ID + TOKEN_NAME\n"
+            f"Expected: {YUMMI_POLICY_ID + YUMMI_TOKEN_NAME}\n"
+            f"Got: {ASSET_ID}"
+        )
+    
     MINIMUM_YUMMI = 25000  # Minimum YUMMI tokens required
     WEBHOOK_IDENTIFIER = "WalletBud"
     WEBHOOK_AUTH_TOKEN = env['BLOCKFROST_WEBHOOK_SECRET']

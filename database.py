@@ -25,12 +25,26 @@ async def get_pool():
     global _pool
     if _pool is None:
         try:
-            _pool = await asyncpg.create_pool(DATABASE_URL)
+            _pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=5,  # Reduced from 10
+                max_inactive_connection_lifetime=60.0,  # Reduced from 300 to 1 minute
+                command_timeout=30.0  # Added timeout
+            )
             logger.info("Created database connection pool")
         except Exception as e:
             logger.error(f"Failed to create connection pool: {str(e)}")
             raise
     return _pool
+
+async def cleanup_pool():
+    """Close the database connection pool"""
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None
+        logger.info("Closed database connection pool")
 
 # Database initialization SQL
 INIT_SQL = """
@@ -1859,6 +1873,85 @@ async def update_stake_pool(stake_address: str, pool_id: str) -> bool:
             return True
     except Exception as e:
         logger.error(f"Error updating stake pool: {str(e)}")
+        return False
+
+async def add_wallet_for_user(user_id: str, address: str, stake_address: str = None):
+    """Add a wallet to monitor
+    
+    Args:
+        user_id (str): Discord user ID
+        address (str): Wallet address to monitor
+        stake_address (str): Stake address
+        
+    Returns:
+        bool: Success status
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO wallets (user_id, address, stake_address)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id, address) DO NOTHING
+                """,
+                user_id, address, stake_address
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Failed to add wallet: {str(e)}")
+        return False
+
+async def remove_wallet_for_user(user_id: str, address: str):
+    """Remove a wallet from monitoring
+    
+    Args:
+        user_id (str): Discord user ID
+        address (str): Wallet address to remove
+        
+    Returns:
+        bool: Success status
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM wallets
+                WHERE user_id = $1 AND address = $2
+                """,
+                user_id, address
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Failed to remove wallet: {str(e)}")
+        return False
+
+async def update_notification_settings(user_id: str, setting: str, enabled: bool):
+    """Update a specific notification setting
+    
+    Args:
+        user_id (str): Discord user ID
+        setting (str): Setting name
+        enabled (bool): Whether to enable or disable
+        
+    Returns:
+        bool: Success status
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                f"""
+                UPDATE notification_settings
+                SET {setting} = $1
+                WHERE user_id = $2
+                """,
+                enabled, user_id
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Failed to update notification setting: {str(e)}")
         return False
 
 async def main():
