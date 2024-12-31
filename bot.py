@@ -106,58 +106,43 @@ class RateLimiter:
             f"Initialized RateLimiter with: max_requests={max_requests}, "
             f"burst_limit={burst_limit}, cooldown_seconds={cooldown_seconds}"
         )
-
+        
     async def acquire(self):
         """Acquire a rate limit token, implementing Blockfrost's burst behavior"""
         async with self.lock:
             now = time.time()
             
-            # Remove requests older than 1 second
-            cutoff = now - 1
-            old_count = len(self.requests)
-            self.requests = [t for t in self.requests if t > cutoff]
-            if old_count - len(self.requests) > 0:
-                logger.debug(f"Cleaned up {old_count - len(self.requests)} old requests")
-            
-            # Replenish burst tokens at base rate
+            # Update burst tokens
             time_passed = now - self.last_burst_update
-            tokens_to_add = min(
-                self.burst_limit - self.burst_tokens,  # Don't exceed burst limit
-                int(time_passed * self.max_requests)   # Add tokens at base rate
-            )
-            
-            if tokens_to_add > 0:
-                logger.debug(f"Replenishing {tokens_to_add} burst tokens")
-                
+            tokens_to_add = int(time_passed * self.max_requests)
             self.burst_tokens = min(self.burst_limit, self.burst_tokens + tokens_to_add)
             self.last_burst_update = now
-
-            # Check if we can proceed
-            if len(self.requests) >= self.max_requests and self.burst_tokens <= 0:
-                # We're at base rate limit and no burst tokens available
-                wait_time = self.requests[0] - now + 1
-                if wait_time > 0:
-                    logger.debug(f"Rate limited, waiting {wait_time:.2f}s (requests={len(self.requests)}, burst_tokens={self.burst_tokens})")
-                    await asyncio.sleep(wait_time)
-                    return await self.acquire()
             
-            # Use a burst token if we're over base rate
+            # Clean old requests
+            cutoff = now - self.cooldown_seconds
+            self.requests = [t for t in self.requests if t > cutoff]
+            
+            # Check if we can make a request
+            if len(self.requests) >= self.max_requests and self.burst_tokens <= 0:
+                wait_time = self.requests[0] - cutoff
+                logger.warning(f"Rate limit hit, waiting {wait_time:.2f}s")
+                await asyncio.sleep(wait_time)
+                return await self.acquire()
+            
+            # Use burst token if needed
             if len(self.requests) >= self.max_requests:
                 self.burst_tokens -= 1
-                logger.debug(f"Using burst token, {self.burst_tokens} remaining")
-            
+                
+            # Record request
             self.requests.append(now)
-            
-            # Log current state periodically
-            if len(self.requests) % 100 == 0:
-                logger.info(
-                    f"Rate limiter status: requests_in_window={len(self.requests)}, "
-                    f"burst_tokens={self.burst_tokens}"
-                )
+            logger.debug(f"Rate limit request granted (burst tokens: {self.burst_tokens})")
             
     async def release(self):
-        """Release is a no-op since we use time-based windowing"""
-        pass
+        """Release the rate limit token"""
+        # This is now a proper async method
+        async with self.lock:
+            if self.requests:
+                self.requests.pop()
 
 class WalletBud(commands.Bot):
     """WalletBud Discord bot"""
@@ -422,25 +407,32 @@ class WalletBud(commands.Bot):
                 # Acquire rate limit token
                 await self.rate_limiter.acquire()
                 
-                # Make request
-                response = await asyncio.to_thread(func, *args, **kwargs)
-                logger.info(f"[{request_id}] Request successful")
-                return response
-                
+                try:
+                    # Make request
+                    response = await asyncio.to_thread(func, *args, **kwargs)
+                    logger.info(f"[{request_id}] Request successful")
+                    return response
+                    
+                finally:
+                    # Always release the rate limit token
+                    await self.rate_limiter.release()
+                    
             except Exception as e:
                 logger.error(f"[{request_id}] Request failed (attempt {attempt + 1}/{API_RETRY_ATTEMPTS}): {str(e)}")
                 if hasattr(e, 'response') and hasattr(e.response, 'text'):
                     logger.error(f"[{request_id}] Response details: {e.response.text}")
-                
+                    
+                    # Check for specific API errors
+                    if "Invalid path" in str(e):
+                        logger.error(f"[{request_id}] Invalid API path. Please check the Blockfrost API documentation.")
+                        raise ValueError(f"Invalid API path for {func.__name__}. Please check the documentation.")
+                    
                 if attempt < API_RETRY_ATTEMPTS - 1:
                     logger.info(f"[{request_id}] Retrying in {API_RETRY_DELAY} seconds...")
                     await asyncio.sleep(API_RETRY_DELAY)
                 else:
                     logger.error(f"[{request_id}] All retry attempts failed")
                     raise
-            finally:
-                # Always release the rate limit token
-                self.rate_limiter.release()
 
     async def send_admin_alert(self, message: str, is_error: bool = True):
         """Send alert to admin channel
@@ -473,7 +465,7 @@ class WalletBud(commands.Bot):
             tuple: (bool, int) - (meets requirement, current balance)
         """
         try:
-            # First check UTXOs
+            # First check UTXOs using the correct endpoint
             utxos = await self.rate_limited_request(
                 self.blockfrost_client.address_utxos,
                 address
@@ -489,29 +481,34 @@ class WalletBud(commands.Bot):
             # If UTXOs show 0, try getting address details directly
             if yummi_amount == 0:
                 logger.info(f"UTXOs showed 0 balance for {address}, checking address details...")
-                details = await self.rate_limited_request(
-                    self.blockfrost_client.address_details,
-                    address
-                )
-                
-                # Log all amounts found
-                if hasattr(details, 'amount'):
-                    for amount in details.amount:
-                        logger.info(f"Found token in details for {address}: {amount.unit} = {amount.quantity}")
-                    
-                    yummi_amount = sum(
-                        int(amount.quantity)
-                        for amount in details.amount
-                        if amount.unit == f"{YUMMI_POLICY_ID}{YUMMI_ASSET_NAME}"
+                try:
+                    # Use the correct endpoint for address details
+                    details = await self.rate_limited_request(
+                        self.blockfrost_client.address,  # This is the correct endpoint
+                        address
                     )
+                    
+                    # Log all amounts found
+                    if hasattr(details, 'amount'):
+                        for amount in details.amount:
+                            logger.info(f"Found token in details for {address}: {amount.unit} = {amount.quantity}")
+                            if amount.unit == f"{YUMMI_POLICY_ID}{YUMMI_ASSET_NAME}":
+                                yummi_amount = int(amount.quantity)
+                                break
+                                
+                except Exception as e:
+                    logger.error(f"Failed to get address details: {str(e)}")
+                    if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                        logger.error(f"Response details: {e.response.text}")
+                    # Continue with the amount we found from UTXOs
             
-            logger.info(f"Found YUMMI amount for {address}: {yummi_amount}")
-            logger.info(f"Required amount: {YUMMI_REQUIREMENT}")
-            
-            return yummi_amount >= YUMMI_REQUIREMENT, yummi_amount
+            meets_requirement = yummi_amount >= YUMMI_REQUIREMENT
+            return meets_requirement, yummi_amount
             
         except Exception as e:
             logger.error(f"Error checking YUMMI requirement: {str(e)}")
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                logger.error(f"Response details: {e.response.text}")
             return False, 0
 
     @tasks.loop(seconds=WALLET_CHECK_INTERVAL)
@@ -799,16 +796,16 @@ class WalletBud(commands.Bot):
     async def _check_delegation_status(self, address: str, user_id: int):
         """Check for delegation status changes"""
         try:
-            # Get stake address
+            # Get address details
             addr_details = await self.rate_limited_request(
-                self.blockfrost_client.address_details,
+                self.blockfrost_client.address,
                 address
             )
             
             if addr_details and addr_details.stake_address:
                 # Get delegation info
                 delegation = await self.rate_limited_request(
-                    self.blockfrost_client.account_delegation_history,
+                    self.blockfrost_client.account_delegations,
                     addr_details.stake_address,
                     count=1,
                     page=1
@@ -838,6 +835,8 @@ class WalletBud(commands.Bot):
                             
         except Exception as e:
             logger.error(f"Error checking delegation status: {str(e)}")
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                logger.error(f"Response details: {e.response.text}")
 
     async def _check_dapp_interactions(self, address: str, user_id: int):
         """Check for DApp interactions"""
@@ -896,6 +895,8 @@ class WalletBud(commands.Bot):
                 
         except Exception as e:
             logger.error(f"Error checking DApp interactions: {str(e)}")
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                logger.error(f"Response details: {e.response.text}")
 
     async def should_notify(self, user_id: int, notification_type: str) -> bool:
         """Check if we should send a notification to the user
@@ -1398,7 +1399,7 @@ class WalletBud(commands.Bot):
                     ephemeral=True
                 )
                 return
-
+            
             # Create embed
             embed = discord.Embed(
                 title="💰 Wallet Balances",
