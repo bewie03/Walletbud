@@ -72,37 +72,35 @@ The YUMMI token can be represented in different formats across different platfor
 These are different representations of the same token. The bot uses the Blockfrost API format since it interacts with the Blockfrost API. When viewing the token on pool.pm or other blockchain explorers, you might see the Asset ID format instead.
 
 ### Environment Variables
-```env
-# Discord Configuration
-DISCORD_TOKEN=your_discord_bot_token
-ADMIN_CHANNEL_ID=your_admin_channel_id
-COMMAND_PREFIX=!
 
-# Blockfrost API Configuration
-BLOCKFROST_PROJECT_ID=your_blockfrost_project_id
-BLOCKFROST_BASE_URL=https://cardano-mainnet.blockfrost.io/api/v0
+### Database Configuration
+- `DATABASE_URL`: PostgreSQL connection string
+- `BLOCKFROST_PROJECT_ID`: Blockfrost API project ID
+- `BLOCKFROST_BASE_URL`: Blockfrost API base URL
+- `ADMIN_CHANNEL_ID`: Discord channel ID for admin notifications
 
-# YUMMI Token Configuration (Blockfrost API Format)
-YUMMI_POLICY_ID=078eafce5cd7edafdf63900edef2c1ea759e77f30ca81d6bbdeec924
-YUMMI_TOKEN_NAME=9756d6d69
+### Webhook Security
+- `BLOCKFROST_IP_RANGES`: Allowed IP ranges for Blockfrost webhooks
+- `WEBHOOK_RATE_LIMIT`: Maximum webhooks per minute
+- `MAX_WEBHOOK_SIZE`: Maximum webhook payload size in bytes
+- `RATE_LIMIT_WINDOW`: Rate limit window in seconds (default: 60)
+- `RATE_LIMIT_MAX_REQUESTS`: Maximum requests per window per IP (default: 100)
 
-# Database Configuration
-DATABASE_URL=your_postgresql_url
+### Database Maintenance
+- `ARCHIVE_AFTER_DAYS`: Days before archiving transactions (default: 90)
+- `DELETE_AFTER_DAYS`: Days before deleting archived transactions (default: 180)
+- `MAINTENANCE_BATCH_SIZE`: Number of records to process in each batch (default: 1000)
+- `MAINTENANCE_MAX_RETRIES`: Maximum retries for failed maintenance operations (default: 3)
+- `MAINTENANCE_HOUR`: Hour to run maintenance in 24-hour format (default: 2)
+- `MAINTENANCE_MINUTE`: Minute to run maintenance (default: 0)
 
-# Logging Configuration
-LOG_LEVEL=DEBUG
-
-# Rate Limiting Settings
-MAX_REQUESTS_PER_SECOND=10
-BURST_LIMIT=500
-RATE_LIMIT_COOLDOWN=60
-
-# Wallet Monitoring Settings
-WALLET_CHECK_INTERVAL=60
-MIN_ADA_BALANCE=5
-MAX_TX_PER_HOUR=10
-MONITORING_INTERVAL=60
-```
+### Queue Configuration
+- `MAX_QUEUE_SIZE`: Maximum events in queue (default: 10000)
+- `MAX_RETRIES`: Maximum retry attempts per event (default: 5)
+- `MAX_EVENT_AGE`: Maximum age of event in seconds (default: 3600)
+- `BATCH_SIZE`: Number of events to process in each batch (default: 10)
+- `PROCESS_INTERVAL`: Process queue interval in seconds (default: 1)
+- `MAX_ERROR_HISTORY`: Maximum number of errors to keep in history (default: 1000)
 
 ### Database Setup
 1. Create a PostgreSQL database

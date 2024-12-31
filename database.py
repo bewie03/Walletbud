@@ -19,32 +19,50 @@ if not DATABASE_URL:
 
 # Global connection pool
 _pool = None
+_pool_lock = asyncio.Lock()
 
-async def get_pool():
-    """Get or create database connection pool"""
+async def init_db():
+    """Initialize database connection pool"""
     global _pool
+    async with _pool_lock:
+        if _pool is None:
+            try:
+                _pool = await asyncpg.create_pool(
+                    dsn=os.getenv('DATABASE_URL'),
+                    min_size=1,
+                    max_size=20,
+                    command_timeout=60,
+                    server_settings={
+                        'timezone': 'UTC',
+                        'application_name': 'WalletBud'
+                    }
+                )
+                logger.info("Database connection pool initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize database pool: {str(e)}")
+                raise
+
+async def close_db():
+    """Close database connection pool"""
+    global _pool
+    async with _pool_lock:
+        if _pool is not None:
+            await _pool.close()
+            _pool = None
+            logger.info("Database connection pool closed")
+
+async def get_pool() -> asyncpg.Pool:
+    """Get database connection pool
+    
+    Returns:
+        asyncpg.Pool: Database connection pool
+    
+    Raises:
+        RuntimeError: If pool is not initialized
+    """
     if _pool is None:
-        try:
-            _pool = await asyncpg.create_pool(
-                DATABASE_URL,
-                min_size=1,
-                max_size=5,  # Reduced from 10
-                max_inactive_connection_lifetime=60.0,  # Reduced from 300 to 1 minute
-                command_timeout=30.0  # Added timeout
-            )
-            logger.info("Created database connection pool")
-        except Exception as e:
-            logger.error(f"Failed to create connection pool: {str(e)}")
-            raise
+        await init_db()
     return _pool
-
-async def cleanup_pool():
-    """Close the database connection pool"""
-    global _pool
-    if _pool:
-        await _pool.close()
-        _pool = None
-        logger.info("Closed database connection pool")
 
 # Database initialization SQL
 INIT_SQL = """
@@ -94,7 +112,9 @@ CREATE TABLE IF NOT EXISTS transactions (
     wallet_id INTEGER REFERENCES wallets(id),
     tx_hash TEXT NOT NULL,
     metadata JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    archived BOOLEAN DEFAULT FALSE,
+    archived_at TIMESTAMP WITH TIME ZONE,
     UNIQUE(wallet_id, tx_hash)
 );
 
@@ -160,6 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
 CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
 CREATE INDEX IF NOT EXISTS idx_transactions_wallet_id ON transactions(wallet_id);
 CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at);
+CREATE INDEX IF NOT EXISTS idx_transactions_archived ON transactions(archived, archived_at);
 CREATE INDEX IF NOT EXISTS idx_token_balances_address ON token_balances(address);
 CREATE INDEX IF NOT EXISTS idx_delegation_status_address ON delegation_status(address);
 CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewards(stake_address);
@@ -1959,6 +1980,31 @@ async def update_notification_settings(user_id: str, setting: str, enabled: bool
     except Exception as e:
         logger.error(f"Failed to update notification setting: {str(e)}")
         return False
+
+async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
+    """Get user ID associated with a stake address
+    
+    Args:
+        stake_address (str): Stake address to look up
+        
+    Returns:
+        Optional[str]: Discord user ID or None if not found
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                '''
+                SELECT DISTINCT user_id 
+                FROM wallets 
+                WHERE stake_address = $1
+                ''',
+                stake_address
+            )
+            return str(row['user_id']) if row else None
+    except Exception as e:
+        logger.error(f"Error getting user ID for stake address {stake_address}: {str(e)}")
+        return None
 
 async def main():
     """Example usage of database functions"""

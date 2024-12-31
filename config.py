@@ -182,6 +182,28 @@ ENV_VARS = {
         validator=lambda x, n: validate_positive_int(x, n),
         description="Check wallets every X seconds"
     ),
+    
+    # Webhook Security
+    'BLOCKFROST_IP_RANGES': EnvVar(
+        name="Blockfrost IP Ranges",
+        required=False,
+        default="",  # Comma-separated list of allowed IPs/ranges
+        description="Allowed IP ranges for Blockfrost webhooks"
+    ),
+    'WEBHOOK_RATE_LIMIT': EnvVar(
+        name="Webhook Rate Limit",
+        required=False,
+        default="100",  # Max webhooks per minute
+        validator=lambda x, n: validate_positive_int(x, n),
+        description="Maximum webhooks per minute"
+    ),
+    'MAX_WEBHOOK_SIZE': EnvVar(
+        name="Maximum Webhook Size",
+        required=False,
+        default="1048576",  # 1MB in bytes
+        validator=lambda x, n: validate_positive_int(x, n),
+        description="Maximum webhook payload size in bytes"
+    ),
 }
 
 def validate_env_vars() -> dict:
@@ -261,6 +283,11 @@ try:
     MAX_TX_PER_HOUR = int(env['MAX_TX_PER_HOUR'])
     MONITORING_INTERVAL = int(env['MONITORING_INTERVAL'])
 
+    # Webhook Security
+    BLOCKFROST_IP_RANGES = env['BLOCKFROST_IP_RANGES']
+    WEBHOOK_RATE_LIMIT = int(env['WEBHOOK_RATE_LIMIT'])
+    MAX_WEBHOOK_SIZE = int(env['MAX_WEBHOOK_SIZE'])
+
 except Exception as e:
     logger.error(f"Environment validation failed:\n{str(e)}")
     raise
@@ -308,4 +335,7 @@ logger.info(
     f"  MIN_ADA_BALANCE: {MIN_ADA_BALANCE}\n"
     f"  MAX_TX_PER_HOUR: {MAX_TX_PER_HOUR}\n"
     f"  MONITORING_INTERVAL: {MONITORING_INTERVAL}s\n"
+    f"  BLOCKFROST_IP_RANGES: {BLOCKFROST_IP_RANGES}\n"
+    f"  WEBHOOK_RATE_LIMIT: {WEBHOOK_RATE_LIMIT}\n"
+    f"  MAX_WEBHOOK_SIZE: {MAX_WEBHOOK_SIZE}\n"
 )
