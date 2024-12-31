@@ -52,6 +52,14 @@ async def close_db():
             _pool = None
             logger.info("Database connection pool closed")
 
+async def cleanup_pool():
+    """Clean up the database connection pool"""
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None
+        logger.info("Database connection pool closed")
+
 async def get_pool() -> asyncpg.Pool:
     """Get database connection pool
     
