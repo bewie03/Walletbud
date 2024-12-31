@@ -596,7 +596,7 @@ class WalletBud(commands.Bot):
             bool: Whether to send the notification
         """
         try:
-            settings = await get_notification_settings(user_id)
+            settings = await get_notification_settings(str(user_id))
             return settings.get(notification_type, True)  # Default to True if setting doesn't exist
             
         except Exception as e:
@@ -772,8 +772,7 @@ class WalletBud(commands.Bot):
                 app_commands.Choice(name="NFT Updates", value="nft"),
                 app_commands.Choice(name="Staking Rewards", value="staking"),
                 app_commands.Choice(name="Stake Key Changes", value="stake"),
-                app_commands.Choice(name="Low Balance Alerts", value="balance"),
-                app_commands.Choice(name="Unusual Activity", value="activity")
+                app_commands.Choice(name="Low Balance Alerts", value="balance")
             ])
             async def toggle(interaction: discord.Interaction, notification_type: str):
                 await self._toggle_notification(interaction, notification_type)
@@ -790,12 +789,13 @@ class WalletBud(commands.Bot):
         """Add a wallet to monitor"""
         try:
             # Check if wallet is already registered
-            if await get_wallet(address):
+            existing_wallet = await get_wallet_for_user(str(interaction.user.id), address)
+            if existing_wallet:
                 await interaction.response.send_message("❌ Wallet already registered!", ephemeral=True)
                 return
             
             # Add wallet to database
-            await add_wallet(address, interaction.user.id)
+            await add_wallet(str(interaction.user.id), address)
             
             # Update last checked timestamp
             await update_last_checked(address)
@@ -827,9 +827,10 @@ class WalletBud(commands.Bot):
         """List all registered wallets"""
         try:
             # Get all wallets for user
-            wallets = await get_all_wallets(interaction.user.id)
+            wallets = await get_all_wallets()
+            user_wallets = [w for w in wallets if w['user_id'] == str(interaction.user.id)]
             
-            if not wallets:
+            if not user_wallets:
                 await interaction.response.send_message("❌ No wallets registered!", ephemeral=True)
                 return
             
@@ -841,7 +842,7 @@ class WalletBud(commands.Bot):
             )
             
             # Add each wallet
-            for wallet in wallets:
+            for wallet in user_wallets:
                 embed.add_field(
                     name="Wallet",
                     value=f"`{wallet['address']}`",
@@ -987,8 +988,7 @@ class WalletBud(commands.Bot):
                 "nft_updates": "NFT Updates",
                 "staking_rewards": "Staking Rewards",
                 "stake_changes": "Stake Key Changes",
-                "low_balance": "Low Balance Alerts",
-                "unusual_activity": "Unusual Activity"
+                "low_balance": "Low Balance Alerts"
             }
             
             for setting, display_name in settings_display.items():
@@ -1021,8 +1021,7 @@ class WalletBud(commands.Bot):
                 "nft": "nft_updates",
                 "staking": "staking_rewards",
                 "stake": "stake_changes",
-                "balance": "low_balance",
-                "activity": "unusual_activity"
+                "balance": "low_balance"
             }
             
             if notification_type not in valid_types:
@@ -1031,15 +1030,24 @@ class WalletBud(commands.Bot):
                 return
                         
             setting_key = valid_types[notification_type]
-            settings = await get_notification_settings(interaction.user.id)
+            settings = await get_notification_settings(str(interaction.user.id))
             
             if not settings:
-                await interaction.response.send_message("❌ You don't have any notification settings! Use `/register` first.", ephemeral=True)
-                return
-                        
+                # Initialize settings if they don't exist
+                default_settings = {
+                    "ada_transactions": True,
+                    "token_changes": True,
+                    "nft_updates": True,
+                    "staking_rewards": True,
+                    "stake_changes": True,
+                    "low_balance": True
+                }
+                await update_notification_setting(str(interaction.user.id), setting_key, True)
+                settings = default_settings
+            
             # Toggle the setting
             new_status = not settings.get(setting_key, True)
-            success = await update_notification_setting(interaction.user.id, setting_key, new_status)
+            success = await update_notification_setting(str(interaction.user.id), setting_key, new_status)
             
             if success:
                 status = "enabled" if new_status else "disabled"

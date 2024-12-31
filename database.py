@@ -147,8 +147,20 @@ async def add_wallet(user_id: str, address: str) -> bool:
         async with pool.acquire() as conn:
             # First ensure user exists
             await conn.execute(
-                'INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING',
-                user_id
+                '''
+                INSERT INTO users (user_id, notification_settings)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO NOTHING
+                ''',
+                user_id,
+                json.dumps({
+                    "ada_transactions": True,
+                    "token_changes": True,
+                    "nft_updates": True,
+                    "staking_rewards": True,
+                    "stake_changes": True,
+                    "low_balance": True
+                })
             )
             
             # Then add wallet and check if it was actually added
@@ -590,11 +602,11 @@ async def get_wallet_balance(address: str) -> tuple[int, dict]:
         logger.error(f"Error getting wallet balance: {str(e)}")
         return 0, {}
 
-async def get_notification_settings(user_id: int) -> dict:
+async def get_notification_settings(user_id: str):
     """Get user's notification settings
     
     Args:
-        user_id (int): Discord user ID
+        user_id (str): Discord user ID
         
     Returns:
         dict: Dictionary of notification settings
@@ -602,46 +614,40 @@ async def get_notification_settings(user_id: int) -> dict:
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            settings = await conn.fetchval(
-                'SELECT notification_settings FROM users WHERE user_id = $1',
-                str(user_id)
-            )
-            
-            if settings:
-                return json.loads(settings)
-            
-            # Default settings if none exist
-            default_settings = {
-                "ada_transactions": True,
-                "token_changes": True,
-                "nft_updates": True,
-                "staking_rewards": True,
-                "stake_changes": True,
-                "low_balance": True,
-                "unusual_activity": True
-            }
-            
+            # First ensure user exists with default settings
             await conn.execute(
                 '''
-                UPDATE users 
-                SET notification_settings = $1 
-                WHERE user_id = $2
+                INSERT INTO users (user_id, notification_settings)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO NOTHING
                 ''',
-                json.dumps(default_settings),
-                str(user_id)
+                user_id,
+                json.dumps({
+                    "ada_transactions": True,
+                    "token_changes": True,
+                    "nft_updates": True,
+                    "staking_rewards": True,
+                    "stake_changes": True,
+                    "low_balance": True
+                })
             )
             
-            return default_settings
+            # Get settings
+            row = await conn.fetchrow(
+                'SELECT notification_settings FROM users WHERE user_id = $1',
+                user_id
+            )
+            return json.loads(row['notification_settings']) if row else None
             
     except Exception as e:
         logger.error(f"Error getting notification settings: {str(e)}")
-        return {}
+        return None
 
-async def update_notification_setting(user_id: int, setting: str, enabled: bool) -> bool:
+async def update_notification_setting(user_id: str, setting: str, enabled: bool):
     """Update a specific notification setting
     
     Args:
-        user_id (int): Discord user ID
+        user_id (str): Discord user ID
         setting (str): Setting name
         enabled (bool): Whether to enable or disable
         
@@ -649,25 +655,44 @@ async def update_notification_setting(user_id: int, setting: str, enabled: bool)
         bool: Success status
     """
     try:
-        settings = await get_notification_settings(user_id)
-        if setting not in settings:
-            return False
-            
-        settings[setting] = enabled
-        
         pool = await get_pool()
         async with pool.acquire() as conn:
+            # First ensure user exists with default settings
+            await conn.execute(
+                '''
+                INSERT INTO users (user_id, notification_settings)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO NOTHING
+                ''',
+                user_id,
+                json.dumps({
+                    "ada_transactions": True,
+                    "token_changes": True,
+                    "nft_updates": True,
+                    "staking_rewards": True,
+                    "stake_changes": True,
+                    "low_balance": True
+                })
+            )
+            
+            # Update specific setting
             await conn.execute(
                 '''
                 UPDATE users 
-                SET notification_settings = $1 
-                WHERE user_id = $2
+                SET notification_settings = jsonb_set(
+                    COALESCE(notification_settings, '{}'::jsonb),
+                    ARRAY[$2],
+                    $3::jsonb,
+                    true
+                )
+                WHERE user_id = $1
                 ''',
-                json.dumps(settings),
-                str(user_id)
+                user_id, 
+                setting,
+                json.dumps(enabled)
             )
-        return True
-        
+            return True
+            
     except Exception as e:
         logger.error(f"Error updating notification setting: {str(e)}")
         return False
@@ -731,11 +756,11 @@ async def add_processed_token_change(address: str, policy_id: str, old_balance: 
     except Exception as e:
         logger.error(f"Error adding processed token change: {str(e)}")
 
-async def get_wallet_for_user(user_id: int) -> str:
+async def get_wallet_for_user(user_id: str) -> str:
     """Get the wallet address for a user
     
     Args:
-        user_id (int): Discord user ID
+        user_id (str): Discord user ID
         
     Returns:
         str: Wallet address or None if not found
@@ -752,7 +777,7 @@ async def get_wallet_for_user(user_id: int) -> str:
                 )
                 LIMIT 1
                 ''',
-                str(user_id)
+                user_id
             )
             return result
             
