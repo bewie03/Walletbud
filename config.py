@@ -54,7 +54,7 @@ try:
         "YUMMI_POLICY_ID"
     )
     YUMMI_ASSET_NAME = validate_hex(
-        os.getenv('YUMMI_ASSET_NAME', "59554D4D49"),  # hex for "YUMMI"
+        os.getenv('YUMMI_ASSET_NAME', "59554d4d49"),  # hex for "YUMMI" in lowercase
         10,  # "YUMMI" in hex is 10 characters
         "YUMMI_ASSET_NAME"
     )
