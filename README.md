@@ -1,6 +1,6 @@
 # WalletBud Discord Bot
 
-A Discord bot for monitoring Cardano wallets with YUMMI token validation and comprehensive transaction tracking.
+A Discord bot for monitoring Cardano wallets with comprehensive transaction tracking and database maintenance.
 
 ## Key Features
 
@@ -25,10 +25,11 @@ A Discord bot for monitoring Cardano wallets with YUMMI token validation and com
 
 ### Security & Reliability
 - DM-only sensitive commands
-- YUMMI token validation (25,000 minimum)
 - Rate-limited API requests
 - Automatic retry with exponential backoff
 - Admin channel error reporting
+- IP-based rate limiting for webhooks
+- Configurable webhook queue size
 
 ### Database Optimization
 - Automated schema migrations
@@ -37,10 +38,15 @@ A Discord bot for monitoring Cardano wallets with YUMMI token validation and com
 - Connection pooling for better performance
 - Parallel query execution support
 - Configurable PostgreSQL settings
+- Automated maintenance tasks:
+  - Transaction archiving
+  - Old data cleanup
+  - Index optimization
+  - Table vacuuming
 
 ## Commands
 
-- `/addwallet <address>` - Register a wallet (DM only, requires YUMMI tokens)
+- `/addwallet <address>` - Register a wallet (DM only)
 - `/removewallet <address>` - Unregister a wallet
 - `/listwallets` - View your registered wallets
 - `/balance` - Check wallet balances
@@ -49,122 +55,101 @@ A Discord bot for monitoring Cardano wallets with YUMMI token validation and com
 - `/health` - Check bot status
 - `/help` - Show all commands
 
-## Setup
+## Environment Variables
 
-### Requirements
-- Python 3.11.7+
-- PostgreSQL 13+
-- Discord Bot Token
-- Blockfrost API Key
-- Heroku account (for deployment)
+### Required
+- `DISCORD_TOKEN` - Discord bot token
+- `BLOCKFROST_PROJECT_ID` - Blockfrost API project ID
+- `DATABASE_URL` - PostgreSQL connection string
 
-### YUMMI Token Details
-The YUMMI token can be represented in different formats across different platforms:
+### Optional
+- `ADMIN_CHANNEL_ID` - Channel for admin notifications
+- `BLOCKFROST_BASE_URL` - Custom Blockfrost API URL
+- `MAX_REQUESTS_PER_SECOND` - API rate limit (default: 10)
+- `BURST_LIMIT` - API burst limit (default: 500)
+- `RATE_LIMIT_COOLDOWN` - Rate limit cooldown in seconds (default: 60)
+- `MAX_QUEUE_SIZE` - Maximum webhook queue size (default: 10000)
+- `MAX_RETRIES` - Maximum retry attempts (default: 5)
+- `MAX_EVENT_AGE` - Maximum event age in seconds (default: 3600)
+- `BATCH_SIZE` - Process batch size (default: 10)
+- `MAX_WEBHOOK_SIZE` - Maximum webhook size in bytes (default: 1MB)
+- `WEBHOOK_RATE_LIMIT` - Maximum webhooks per minute (default: 100)
+- `PROCESS_INTERVAL` - Queue process interval in seconds (default: 1)
+- `MAX_ERROR_HISTORY` - Maximum errors to keep in history (default: 1000)
+- `WALLET_CHECK_INTERVAL` - Wallet check interval in seconds (default: 300)
+- `MIN_ADA_BALANCE` - Minimum ADA balance for alerts (default: 5)
+- `MAX_TX_PER_HOUR` - Maximum transactions per hour (default: 10)
+- `MAINTENANCE_HOUR` - Hour to run maintenance (default: 2)
+- `MAINTENANCE_MINUTE` - Minute to run maintenance (default: 0)
+- `ARCHIVE_AFTER_DAYS` - Days before archiving transactions (default: 90)
+- `DELETE_AFTER_DAYS` - Days before deleting archived data (default: 180)
 
-1. **Blockfrost API Format** (Used by the bot):
-   - Policy ID: `078eafce5cd7edafdf63900edef2c1ea759e77f30ca81d6bbdeec924`
-   - Token Name (hex): `9756d6d69`
-   - Full Token ID: `078eafce5cd7edafdf63900edef2c1ea759e77f30ca81d6bbdeec9249756d6d69`
+## Installation
 
-2. **Pool.pm Format**:
-   - Asset ID: `asset1jhsvtq7uaz0npx5vryc5um3r34tmz576qe3kkj`
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/walletbud.git
+cd walletbud
+```
 
-These are different representations of the same token. The bot uses the Blockfrost API format since it interacts with the Blockfrost API. When viewing the token on pool.pm or other blockchain explorers, you might see the Asset ID format instead.
+2. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
-### Environment Variables
+3. Create a .env file with required environment variables:
+```env
+DISCORD_TOKEN=your_discord_token
+BLOCKFROST_PROJECT_ID=your_blockfrost_project_id
+DATABASE_URL=postgresql://user:password@localhost:5432/walletbud
+```
 
-### Database Configuration
-- `DATABASE_URL`: PostgreSQL connection string
-- `BLOCKFROST_PROJECT_ID`: Blockfrost API project ID
-- `BLOCKFROST_BASE_URL`: Blockfrost API base URL
-- `ADMIN_CHANNEL_ID`: Discord channel ID for admin notifications
+4. Initialize the database:
+```bash
+python -c "from database import init_db; import asyncio; asyncio.run(init_db())"
+```
 
-### Webhook Security
-- `BLOCKFROST_IP_RANGES`: Allowed IP ranges for Blockfrost webhooks
-- `WEBHOOK_RATE_LIMIT`: Maximum webhooks per minute
-- `MAX_WEBHOOK_SIZE`: Maximum webhook payload size in bytes
-- `RATE_LIMIT_WINDOW`: Rate limit window in seconds (default: 60)
-- `RATE_LIMIT_MAX_REQUESTS`: Maximum requests per window per IP (default: 100)
-
-### Database Maintenance
-- `ARCHIVE_AFTER_DAYS`: Days before archiving transactions (default: 90)
-- `DELETE_AFTER_DAYS`: Days before deleting archived transactions (default: 180)
-- `MAINTENANCE_BATCH_SIZE`: Number of records to process in each batch (default: 1000)
-- `MAINTENANCE_MAX_RETRIES`: Maximum retries for failed maintenance operations (default: 3)
-- `MAINTENANCE_HOUR`: Hour to run maintenance in 24-hour format (default: 2)
-- `MAINTENANCE_MINUTE`: Minute to run maintenance (default: 0)
-
-### Queue Configuration
-- `MAX_QUEUE_SIZE`: Maximum events in queue (default: 10000)
-- `MAX_RETRIES`: Maximum retry attempts per event (default: 5)
-- `MAX_EVENT_AGE`: Maximum age of event in seconds (default: 3600)
-- `BATCH_SIZE`: Number of events to process in each batch (default: 10)
-- `PROCESS_INTERVAL`: Process queue interval in seconds (default: 1)
-- `MAX_ERROR_HISTORY`: Maximum number of errors to keep in history (default: 1000)
-
-### Database Setup
-1. Create a PostgreSQL database
-2. Set `DATABASE_URL` environment variable
-3. Run migrations: `python database.py`
-
-The bot uses an automated migration system to manage database schema changes. Migrations are versioned and run automatically during startup. The system includes:
-
-- Version tracking table
-- Automated schema updates
-- Table partitioning for transactions
-- Index creation for performance
-- Connection pool optimization
-
-### Performance Tuning
-The database is optimized for high performance with:
-
-- Monthly partitioning for transaction history
-- Indexes on frequently queried columns
-- Connection pooling (max 200 connections)
-- Parallel query execution (4-8 workers)
-- Optimized PostgreSQL settings for SSD storage
-
-### Local Development
-1. Clone the repository
-2. Install dependencies: `pip install -r requirements.txt`
-3. Set up PostgreSQL database
-4. Configure `.env` file with required variables
-5. Run: `python bot.py`
-
-### Heroku Deployment
-1. Create new Heroku app
-2. Add PostgreSQL addon
-3. Configure environment variables in Heroku dashboard
-4. Deploy using Heroku Git or GitHub integration
-5. Ensure worker dyno is enabled
+5. Start the bot:
+```bash
+python bot.py
+```
 
 ## Architecture
 
-### Database Schema
-- Wallet tracking
-- User settings
-- Transaction history
-- Token balances
-- Notification preferences
+### Components
+- `bot.py` - Main Discord bot implementation
+- `database.py` - Database operations and connection management
+- `database_maintenance.py` - Database maintenance and optimization
+- `webhook_queue.py` - Webhook processing and rate limiting
+- `config.py` - Configuration management
 
-### API Integration
-- Blockfrost for Cardano blockchain data
-- Discord for bot commands and notifications
-- PostgreSQL for persistent storage
+### Data Flow
+1. Discord interactions trigger bot commands
+2. Commands interact with Blockfrost API for blockchain data
+3. Data is stored in PostgreSQL database
+4. Webhooks notify of blockchain events
+5. Events are queued and processed with rate limiting
+6. Database maintenance runs periodically to optimize performance
 
-### Rate Limiting
-- 10 requests/second base rate
-- 500 request burst limit
-- 60-second cooldown period
-- Automatic request queuing
+### Security Measures
+- All sensitive commands are DM-only
+- Rate limiting on API requests and webhooks
+- IP-based rate limiting for webhook endpoints
+- Configurable queue sizes and timeouts
+- Error tracking and admin notifications
 
-## Support
+## Contributing
 
-For issues, questions, or contributions:
-1. Open an issue for bugs/features
-2. Submit pull requests for improvements
-3. Contact admin through Discord for urgent issues
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run tests (if available)
+5. Submit a pull request
 
 ## License
 
-This project is licensed under the MIT License. See LICENSE file for details.
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Support
+
+For support, please open an issue on GitHub or contact the maintainers.

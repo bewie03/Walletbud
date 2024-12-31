@@ -18,7 +18,8 @@ from config import (
     MAX_QUEUE_SIZE,
     MAX_RETRIES,
     MAX_EVENT_AGE,
-    BATCH_SIZE
+    BATCH_SIZE,
+    MAX_WEBHOOK_SIZE
 )
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,7 @@ class WebhookQueue:
         try:
             # Check payload size
             payload_size = len(json.dumps(payload).encode('utf-8'))
-            if payload_size > 1048576:  # 1MB
+            if payload_size > MAX_WEBHOOK_SIZE:  # 1MB
                 logger.error(f"Event payload too large: {payload_size} bytes")
                 self.stats['total_oversized'] += 1
                 return False

@@ -20,6 +20,8 @@ from database import (
     get_addresses_for_stake,
     update_pool_for_stake
 )
+from database_maintenance import DatabaseMaintenance
+from webhook_queue import WebhookQueue
 
 import uuid
 import random
@@ -73,9 +75,6 @@ from database import (
     update_pool_for_stake,
     cleanup_pool  # Import cleanup_pool function
 )
-
-from database_maintenance import DatabaseMaintenance
-from webhook_queue import WebhookQueue
 
 def get_request_id():
     """Generate a unique request ID for logging"""

@@ -74,135 +74,147 @@ ENV_VARS = {
     'DISCORD_TOKEN': EnvVar(
         name="Discord Bot Token",
         validator=validate_discord_token,
-        description="Discord bot token from Discord Developer Portal"
+        description="Discord bot token"
     ),
-    'COMMAND_PREFIX': EnvVar(
-        name="Command Prefix",
+    'ADMIN_CHANNEL_ID': EnvVar(
+        name='ADMIN_CHANNEL_ID',
         required=False,
-        default="!",
-        description="Prefix for bot commands"
+        description="Discord channel ID for admin notifications"
     ),
-    
+
     # Blockfrost Configuration
     'BLOCKFROST_PROJECT_ID': EnvVar(
-        name="Blockfrost Project ID",
+        name='BLOCKFROST_PROJECT_ID',
         validator=validate_blockfrost_id,
-        description="Project ID from Blockfrost dashboard"
+        description="Blockfrost API project ID"
     ),
     'BLOCKFROST_BASE_URL': EnvVar(
-        name="Blockfrost Base URL",
-        required=False,
+        name='BLOCKFROST_BASE_URL',
         default="https://cardano-mainnet.blockfrost.io/api/v0",
         validator=validate_url,
         description="Blockfrost API base URL"
     ),
-    'BLOCKFROST_TX_WEBHOOK_ID': EnvVar(
-        name="Blockfrost Transaction Webhook ID",
-        validator=validate_blockfrost_webhook_id,
-        description="Transaction webhook ID from Blockfrost dashboard"
+
+    # Database Configuration
+    'DATABASE_URL': EnvVar(
+        name='DATABASE_URL',
+        description="PostgreSQL connection string"
     ),
-    'BLOCKFROST_DEL_WEBHOOK_ID': EnvVar(
-        name="Blockfrost Delegation Webhook ID",
-        validator=validate_blockfrost_webhook_id,
-        description="Delegation webhook ID from Blockfrost dashboard"
-    ),
-    'BLOCKFROST_WEBHOOK_SECRET': EnvVar(
-        name="Blockfrost Webhook Secret",
-        description="Webhook secret from Blockfrost dashboard"
-    ),
-    
-    # YUMMI Token Configuration
-    'YUMMI_POLICY_ID': EnvVar(
-        name="YUMMI Policy ID",
-        validator=lambda x, n: validate_hex(x, 56, n),
-        description="YUMMI token policy ID (56-character hexadecimal string)"
-    ),
-    'YUMMI_TOKEN_NAME': EnvVar(
-        name="YUMMI Token Name",
-        validator=lambda x, n: validate_hex(x, 9, n),
-        description="YUMMI token name (9-character hexadecimal string)"
-    ),
-    'ASSET_ID': EnvVar(
-        name="Asset ID",
-        validator=lambda x, n: validate_hex(x, 56+9, n),  # policy_id (56) + token_name (9)
-        description="Full asset ID (policy_id + hex-encoded token name)"
-    ),
-    
-    # API Rate Limiting
+
+    # Rate Limiting Configuration
     'MAX_REQUESTS_PER_SECOND': EnvVar(
-        name="Max Requests Per Second",
-        required=False,
+        name='MAX_REQUESTS_PER_SECOND',
         default="10",
-        validator=lambda x, n: validate_positive_int(x, n),
+        validator=validate_positive_int,
         description="Maximum API requests per second"
     ),
     'BURST_LIMIT': EnvVar(
-        name="Burst Limit",
-        required=False,
+        name='BURST_LIMIT',
         default="500",
-        validator=lambda x, n: validate_positive_int(x, n),
+        validator=validate_positive_int,
         description="Maximum burst requests allowed"
     ),
     'RATE_LIMIT_COOLDOWN': EnvVar(
-        name="Rate Limit Cooldown",
-        required=False,
+        name='RATE_LIMIT_COOLDOWN',
         default="60",
-        validator=lambda x, n: validate_positive_int(x, n),
+        validator=validate_positive_int,
         description="Rate limit cooldown in seconds"
     ),
-    
-    # Wallet Monitoring
-    'WALLET_CHECK_INTERVAL': EnvVar(
-        name="Wallet Check Interval",
-        required=False,
+    'RATE_LIMIT_WINDOW': EnvVar(
+        name='RATE_LIMIT_WINDOW',
         default="60",
-        validator=lambda x, n: validate_positive_int(x, n),
-        description="Interval to check wallets in seconds"
+        validator=validate_positive_int,
+        description="Rate limit window in seconds"
     ),
-    
-    # Wallet Monitoring Configuration
-    'MIN_ADA_BALANCE': EnvVar(
-        name="Minimum ADA Balance",
-        required=False,
+    'RATE_LIMIT_MAX_REQUESTS': EnvVar(
+        name='RATE_LIMIT_MAX_REQUESTS',
+        default="100",
+        validator=validate_positive_int,
+        description="Maximum requests per window"
+    ),
+
+    # Queue Configuration
+    'MAX_QUEUE_SIZE': EnvVar(
+        name='MAX_QUEUE_SIZE',
+        default="10000",
+        validator=validate_positive_int,
+        description="Maximum events in queue"
+    ),
+    'MAX_RETRIES': EnvVar(
+        name='MAX_RETRIES',
         default="5",
-        validator=lambda x, n: validate_positive_int(x, n),
-        description="Minimum ADA balance threshold"
+        validator=validate_positive_int,
+        description="Maximum retry attempts per event"
     ),
-    'MAX_TX_PER_HOUR': EnvVar(
-        name="Maximum Transactions Per Hour",
-        required=False,
+    'MAX_EVENT_AGE': EnvVar(
+        name='MAX_EVENT_AGE',
+        default="3600",
+        validator=validate_positive_int,
+        description="Maximum age of event in seconds"
+    ),
+    'BATCH_SIZE': EnvVar(
+        name='BATCH_SIZE',
         default="10",
-        validator=lambda x, n: validate_positive_int(x, n),
-        description="Maximum transactions per hour before alerting"
-    ),
-    'MONITORING_INTERVAL': EnvVar(
-        name="Monitoring Interval",
-        required=False,
-        default="60",
-        validator=lambda x, n: validate_positive_int(x, n),
-        description="Check wallets every X seconds"
-    ),
-    
-    # Webhook Security
-    'BLOCKFROST_IP_RANGES': EnvVar(
-        name="Blockfrost IP Ranges",
-        required=False,
-        default="",  # Comma-separated list of allowed IPs/ranges
-        description="Allowed IP ranges for Blockfrost webhooks"
-    ),
-    'WEBHOOK_RATE_LIMIT': EnvVar(
-        name="Webhook Rate Limit",
-        required=False,
-        default="100",  # Max webhooks per minute
-        validator=lambda x, n: validate_positive_int(x, n),
-        description="Maximum webhooks per minute"
+        validator=validate_positive_int,
+        description="Process this many events at once"
     ),
     'MAX_WEBHOOK_SIZE': EnvVar(
-        name="Maximum Webhook Size",
-        required=False,
-        default="1048576",  # 1MB in bytes
-        validator=lambda x, n: validate_positive_int(x, n),
+        name='MAX_WEBHOOK_SIZE',
+        default="1048576",  # 1MB
+        validator=validate_positive_int,
         description="Maximum webhook payload size in bytes"
+    ),
+    'WEBHOOK_RATE_LIMIT': EnvVar(
+        name='WEBHOOK_RATE_LIMIT',
+        default="100",
+        validator=validate_positive_int,
+        description="Maximum webhooks per minute"
+    ),
+    'PROCESS_INTERVAL': EnvVar(
+        name='PROCESS_INTERVAL',
+        default="1",
+        validator=validate_positive_int,
+        description="Process queue every N seconds"
+    ),
+    'MAX_ERROR_HISTORY': EnvVar(
+        name='MAX_ERROR_HISTORY',
+        default="1000",
+        validator=validate_positive_int,
+        description="Maximum number of errors to keep in history"
+    ),
+
+    # Wallet Monitoring Configuration
+    'WALLET_CHECK_INTERVAL': EnvVar(
+        name='WALLET_CHECK_INTERVAL',
+        default="300",
+        validator=validate_positive_int,
+        description="Interval to check wallets in seconds"
+    ),
+    'MIN_ADA_BALANCE': EnvVar(
+        name='MIN_ADA_BALANCE',
+        default="5",
+        validator=validate_positive_int,
+        description="Minimum ADA balance for alerts"
+    ),
+    'MAX_TX_PER_HOUR': EnvVar(
+        name='MAX_TX_PER_HOUR',
+        default="10",
+        validator=validate_positive_int,
+        description="Maximum transactions per hour"
+    ),
+
+    # Maintenance Configuration
+    'MAINTENANCE_HOUR': EnvVar(
+        name='MAINTENANCE_HOUR',
+        default="2",
+        validator=validate_positive_int,
+        description="Hour to run maintenance (24-hour format)"
+    ),
+    'MAINTENANCE_MINUTE': EnvVar(
+        name='MAINTENANCE_MINUTE',
+        default="0",
+        validator=validate_positive_int,
+        description="Minute to run maintenance"
     ),
 }
 
@@ -245,48 +257,40 @@ try:
     
     # Discord Configuration
     DISCORD_TOKEN = env['DISCORD_TOKEN']
-    COMMAND_PREFIX = env['COMMAND_PREFIX']
+    ADMIN_CHANNEL_ID = env['ADMIN_CHANNEL_ID']
     
     # Blockfrost Configuration
     BLOCKFROST_PROJECT_ID = env['BLOCKFROST_PROJECT_ID']
     BLOCKFROST_BASE_URL = env['BLOCKFROST_BASE_URL']
-    BLOCKFROST_TX_WEBHOOK_ID = env['BLOCKFROST_TX_WEBHOOK_ID']
-    BLOCKFROST_DEL_WEBHOOK_ID = env['BLOCKFROST_DEL_WEBHOOK_ID']
-    BLOCKFROST_WEBHOOK_SECRET = env['BLOCKFROST_WEBHOOK_SECRET']
 
-    # YUMMI Token Configuration
-    YUMMI_POLICY_ID = env['YUMMI_POLICY_ID']
-    YUMMI_TOKEN_NAME = env['YUMMI_TOKEN_NAME']
-    ASSET_ID = env['ASSET_ID']
-    
-    # Verify ASSET_ID is correctly formed
-    if ASSET_ID != YUMMI_POLICY_ID + YUMMI_TOKEN_NAME:
-        raise ValueError(
-            f"ASSET_ID must be POLICY_ID + TOKEN_NAME\n"
-            f"Expected: {YUMMI_POLICY_ID + YUMMI_TOKEN_NAME}\n"
-            f"Got: {ASSET_ID}"
-        )
-    
-    MINIMUM_YUMMI = 25000  # Minimum YUMMI tokens required
-    WEBHOOK_IDENTIFIER = "WalletBud"
-    WEBHOOK_AUTH_TOKEN = env['BLOCKFROST_WEBHOOK_SECRET']
-    WEBHOOK_CONFIRMATIONS = 3
+    # Database Configuration
+    DATABASE_URL = env['DATABASE_URL']
 
-    # Rate Limiting
+    # Rate Limiting Configuration
     MAX_REQUESTS_PER_SECOND = int(env['MAX_REQUESTS_PER_SECOND'])
     BURST_LIMIT = int(env['BURST_LIMIT'])
     RATE_LIMIT_COOLDOWN = int(env['RATE_LIMIT_COOLDOWN'])
+    RATE_LIMIT_WINDOW = int(env['RATE_LIMIT_WINDOW'])
+    RATE_LIMIT_MAX_REQUESTS = int(env['RATE_LIMIT_MAX_REQUESTS'])
 
-    # Wallet Monitoring
+    # Queue Configuration
+    MAX_QUEUE_SIZE = int(env['MAX_QUEUE_SIZE'])
+    MAX_RETRIES = int(env['MAX_RETRIES'])
+    MAX_EVENT_AGE = int(env['MAX_EVENT_AGE'])
+    BATCH_SIZE = int(env['BATCH_SIZE'])
+    MAX_WEBHOOK_SIZE = int(env['MAX_WEBHOOK_SIZE'])
+    WEBHOOK_RATE_LIMIT = int(env['WEBHOOK_RATE_LIMIT'])
+    PROCESS_INTERVAL = int(env['PROCESS_INTERVAL'])
+    MAX_ERROR_HISTORY = int(env['MAX_ERROR_HISTORY'])
+
+    # Wallet Monitoring Configuration
     WALLET_CHECK_INTERVAL = int(env['WALLET_CHECK_INTERVAL'])
     MIN_ADA_BALANCE = int(env['MIN_ADA_BALANCE'])
     MAX_TX_PER_HOUR = int(env['MAX_TX_PER_HOUR'])
-    MONITORING_INTERVAL = int(env['MONITORING_INTERVAL'])
 
-    # Webhook Security
-    BLOCKFROST_IP_RANGES = env['BLOCKFROST_IP_RANGES']
-    WEBHOOK_RATE_LIMIT = int(env['WEBHOOK_RATE_LIMIT'])
-    MAX_WEBHOOK_SIZE = int(env['MAX_WEBHOOK_SIZE'])
+    # Maintenance Configuration
+    MAINTENANCE_HOUR = int(env['MAINTENANCE_HOUR'])
+    MAINTENANCE_MINUTE = int(env['MAINTENANCE_MINUTE'])
 
 except Exception as e:
     logger.error(f"Environment validation failed:\n{str(e)}")
@@ -298,13 +302,13 @@ TEST_ADDRESS = "addr1qxqs59lphg8g6qnplr8q6kw2hyzn8c8e3r5jlnwjqppn8k2vllp6xf5qvjg
 # Webhook Configuration
 WEBHOOKS = {
     "transaction": {
-        "id": BLOCKFROST_TX_WEBHOOK_ID,
-        "auth_token": BLOCKFROST_WEBHOOK_SECRET,
+        "id": BLOCKFROST_PROJECT_ID,
+        "auth_token": BLOCKFROST_PROJECT_ID,
         "confirmations": 2  # Wait for 2 confirmations to avoid rollbacks
     },
     "delegation": {
-        "id": BLOCKFROST_DEL_WEBHOOK_ID,
-        "auth_token": BLOCKFROST_WEBHOOK_SECRET,
+        "id": BLOCKFROST_PROJECT_ID,
+        "auth_token": BLOCKFROST_PROJECT_ID,
         "confirmations": 1  # Delegation changes need only 1 confirmation
     }
 }
@@ -327,15 +331,22 @@ ERROR_MESSAGES = {
 # Load configuration
 logger.info(
     "Loaded configuration:\n"
-    f"  MINIMUM_YUMMI: {MINIMUM_YUMMI}\n"
     f"  MAX_REQUESTS_PER_SECOND: {MAX_REQUESTS_PER_SECOND}\n"
     f"  BURST_LIMIT: {BURST_LIMIT}\n"
     f"  RATE_LIMIT_COOLDOWN: {RATE_LIMIT_COOLDOWN}\n"
+    f"  RATE_LIMIT_WINDOW: {RATE_LIMIT_WINDOW}\n"
+    f"  RATE_LIMIT_MAX_REQUESTS: {RATE_LIMIT_MAX_REQUESTS}\n"
+    f"  MAX_QUEUE_SIZE: {MAX_QUEUE_SIZE}\n"
+    f"  MAX_RETRIES: {MAX_RETRIES}\n"
+    f"  MAX_EVENT_AGE: {MAX_EVENT_AGE}\n"
+    f"  BATCH_SIZE: {BATCH_SIZE}\n"
+    f"  MAX_WEBHOOK_SIZE: {MAX_WEBHOOK_SIZE}\n"
+    f"  WEBHOOK_RATE_LIMIT: {WEBHOOK_RATE_LIMIT}\n"
+    f"  PROCESS_INTERVAL: {PROCESS_INTERVAL}\n"
+    f"  MAX_ERROR_HISTORY: {MAX_ERROR_HISTORY}\n"
     f"  WALLET_CHECK_INTERVAL: {WALLET_CHECK_INTERVAL}\n"
     f"  MIN_ADA_BALANCE: {MIN_ADA_BALANCE}\n"
     f"  MAX_TX_PER_HOUR: {MAX_TX_PER_HOUR}\n"
-    f"  MONITORING_INTERVAL: {MONITORING_INTERVAL}s\n"
-    f"  BLOCKFROST_IP_RANGES: {BLOCKFROST_IP_RANGES}\n"
-    f"  WEBHOOK_RATE_LIMIT: {WEBHOOK_RATE_LIMIT}\n"
-    f"  MAX_WEBHOOK_SIZE: {MAX_WEBHOOK_SIZE}\n"
+    f"  MAINTENANCE_HOUR: {MAINTENANCE_HOUR}\n"
+    f"  MAINTENANCE_MINUTE: {MAINTENANCE_MINUTE}\n"
 )
