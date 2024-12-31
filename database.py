@@ -756,11 +756,12 @@ async def add_processed_token_change(address: str, policy_id: str, old_balance: 
     except Exception as e:
         logger.error(f"Error adding processed token change: {str(e)}")
 
-async def get_wallet_for_user(user_id: str) -> str:
+async def get_wallet_for_user(user_id: str, address: str = None):
     """Get the wallet address for a user
     
     Args:
         user_id (str): Discord user ID
+        address (str, optional): Specific wallet address to check for. Defaults to None.
         
     Returns:
         str: Wallet address or None if not found
@@ -768,18 +769,22 @@ async def get_wallet_for_user(user_id: str) -> str:
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            result = await conn.fetchval(
-                '''
-                SELECT address FROM wallets
-                WHERE user_id = (
-                    SELECT user_id FROM users
-                    WHERE user_id = $1
+            if address:
+                result = await conn.fetchrow(
+                    'SELECT * FROM wallets WHERE user_id = $1 AND address = $2',
+                    user_id, address
                 )
-                LIMIT 1
-                ''',
-                user_id
-            )
-            return result
+            else:
+                result = await conn.fetchrow(
+                    '''
+                    SELECT address FROM wallets 
+                    WHERE user_id = $1 
+                    ORDER BY created_at DESC 
+                    LIMIT 1
+                    ''',
+                    user_id
+                )
+            return result['address'] if result else None
             
     except Exception as e:
         logger.error(f"Error getting wallet for user: {str(e)}")
