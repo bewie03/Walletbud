@@ -123,6 +123,7 @@ class RateLimiter:
         pass
 
 class WalletBud(commands.Bot):
+    """WalletBud Discord bot"""
     def __init__(self):
         """Initialize the bot"""
         super().__init__(
@@ -145,7 +146,7 @@ class WalletBud(commands.Bot):
         self.monitoring_paused = False
         self.wallet_task_lock = asyncio.Lock()
         self.processing_wallets = False
-
+        
     async def setup_hook(self):
         """Setup hook called before the bot starts"""
         try:
@@ -157,7 +158,8 @@ class WalletBud(commands.Bot):
             await self.init_blockfrost()
             logger.info("Blockfrost client initialized")
             
-            # Setup commands
+            # Set up commands
+            logger.info("Setting up commands...")
             await self.setup_commands()
             logger.info("Commands setup complete")
             
@@ -170,452 +172,7 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Error in setup: {str(e)}")
             raise
-
-    async def setup_commands(self):
-        """Set up bot commands using app_commands"""
-        try:
-            logger.info("Setting up commands...")
             
-            # Add commands using app_commands.CommandTree
-            @self.tree.command(name='addwallet', description='Add a wallet to monitor')
-            @dm_only()
-            @has_blockfrost()
-            async def addwallet(interaction: discord.Interaction, address: str):
-                try:
-                    # Defer response FIRST before any processing
-                    await interaction.response.defer(ephemeral=True)
-                    logger.info(f"Adding wallet {address} for user {interaction.user.id}")
-                    
-                    # Basic address validation
-                    if not address or len(address) < 10 or not address.startswith('addr1'):
-                        await interaction.followup.send(
-                            "❌ Invalid Cardano wallet address format. Please check and try again.",
-                            ephemeral=True
-                        )
-                        return
-
-                    # Verify address with Blockfrost
-                    try:
-                        logger.info(f"Verifying address {address} exists...")
-                        await self.rate_limited_request(
-                            self.blockfrost_client.address,
-                            address
-                        )
-                        
-                        # Check YUMMI token balance
-                        has_enough, balance = await self.verify_yummi_balance(address)
-                        if not has_enough:
-                            await interaction.followup.send(
-                                f"❌ This wallet does not have the required {REQUIRED_YUMMI_TOKENS:,} YUMMI tokens. Current balance: {balance:,}",
-                                ephemeral=True
-                            )
-                            return
-                            
-                        # Add wallet to database
-                        try:
-                            await add_wallet(str(interaction.user.id), address)
-                            await interaction.followup.send(
-                                "✅ Successfully added wallet to monitoring!",
-                                ephemeral=True
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to add wallet to database: {str(e)}")
-                            await interaction.followup.send(
-                                "❌ Failed to add wallet. Please try again later.",
-                                ephemeral=True
-                            )
-                            
-                    except Exception as e:
-                        logger.error(f"Failed to verify address {address}: {str(e)}")
-                        await interaction.followup.send(
-                            "❌ Invalid wallet address or API error. Please check the address and try again.",
-                            ephemeral=True
-                        )
-                        
-                except Exception as e:
-                    logger.error(f"Error in addwallet command: {str(e)}")
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message(
-                            "❌ An error occurred. Please try again later.",
-                            ephemeral=True
-                        )
-                    else:
-                        await interaction.followup.send(
-                            "❌ An error occurred. Please try again later.",
-                            ephemeral=True
-                        )
-
-            @self.tree.command(name='removewallet', description='Remove a wallet from monitoring')
-            @dm_only()
-            async def removewallet(interaction: discord.Interaction, address: str):
-                try:
-                    # Defer response FIRST before any processing
-                    await interaction.response.defer(ephemeral=True)
-                    logger.info(f"Removing wallet {address} for user {interaction.user.id}")
-                    
-                    # Remove from database
-                    success = await remove_wallet(str(interaction.user.id), address)
-                    if success:
-                        await interaction.followup.send(
-                            f"✅ Successfully removed wallet `{address}` from monitoring.",
-                            ephemeral=True
-                        )
-                    else:
-                        await interaction.followup.send(
-                            f"❌ Wallet `{address}` was not found in your monitored wallets.",
-                            ephemeral=True
-                        )
-                        
-                except Exception as e:
-                    logger.error(f"Error in removewallet command: {str(e)}")
-                    await interaction.followup.send(
-                        "❌ An error occurred. Please try again later.",
-                        ephemeral=True
-                    )
-            
-            @self.tree.command(name='listwallets', description='List your monitored wallets')
-            @dm_only()
-            async def listwallets(interaction: discord.Interaction):
-                try:
-                    # Defer response FIRST before any processing
-                    await interaction.response.defer(ephemeral=True)
-                    logger.info(f"Listing wallets for user {interaction.user.id}")
-                    
-                    # Get wallets
-                    all_wallets = await get_all_wallets()
-                    wallets = [w['address'] for w in all_wallets if w['user_id'] == str(interaction.user.id)]
-                    
-                    if not wallets:
-                        await interaction.followup.send(
-                            "You don't have any wallets being monitored.",
-                            ephemeral=True
-                        )
-                        return
-                    
-                    # Create embed
-                    embed = discord.Embed(
-                        title="🔍 Your Monitored Wallets",
-                        color=discord.Color.blue()
-                    )
-                    
-                    for wallet in wallets:
-                        embed.add_field(
-                            name="Wallet Address",
-                            value=f"`{wallet}`",
-                            inline=False
-                        )
-                    
-                    await interaction.followup.send(embed=embed, ephemeral=True)
-                    
-                except Exception as e:
-                    logger.error(f"Error in listwallets command: {str(e)}")
-                    await interaction.followup.send(
-                        "❌ An error occurred. Please try again later.",
-                        ephemeral=True
-                    )
-
-            @self.tree.command(name="help", description="Show help information")
-            async def help(interaction: discord.Interaction):
-                try:
-                    await self.process_interaction(interaction, ephemeral=True)
-                    
-                    embed = discord.Embed(
-                        title="📚 WalletBud Help",
-                        description="Monitor your Cardano wallets for YUMMI tokens and ADA balance",
-                        color=discord.Color.blue()
-                    )
-                    
-                    embed.add_field(
-                        name="/addwallet <address>",
-                        value="Add a wallet to monitor (DM only)",
-                        inline=False
-                    )
-                    embed.add_field(
-                        name="/removewallet <address>",
-                        value="Remove a wallet from monitoring (DM only)",
-                        inline=False
-                    )
-                    embed.add_field(
-                        name="/listwallets",
-                        value="List your monitored wallets (DM only)",
-                        inline=False
-                    )
-                    embed.add_field(
-                        name="/balance <address>",
-                        value="Check total ADA balance in a wallet",
-                        inline=False
-                    )
-                    embed.add_field(
-                        name="/health",
-                        value="Check bot and API status",
-                        inline=False
-                    )
-                    
-                    embed.set_footer(text="For support, please contact the bot owner")
-                    
-                    await interaction.followup.send(embed=embed)
-                    
-                except Exception as e:
-                    logger.error(f"Error in help command: {str(e)}")
-                    await interaction.followup.send(
-                        "❌ Failed to show help. Please try again later.",
-                        ephemeral=True
-                    )
-
-            @self.tree.command(name="balance", description="Check total ADA balance in a wallet")
-            @has_blockfrost
-            async def balance(interaction: discord.Interaction, address: str):
-                try:
-                    await self.process_interaction(interaction, ephemeral=True)
-                    
-                    # Get total balance using address/total endpoint
-                    balance_info = await self.rate_limited_request(
-                        self.blockfrost_client.address_total,
-                        address
-                    )
-                    
-                    if not balance_info or not balance_info.received_sum:
-                        await interaction.followup.send("❌ Could not fetch wallet balance.")
-                        return
-                    
-                    # Find lovelace amount (native ADA)
-                    lovelace_amount = 0
-                    for token in balance_info.received_sum:
-                        if token.unit == "lovelace":
-                            lovelace_amount = int(token.quantity)
-                            break
-                    
-                    # Convert lovelace to ADA (1 ADA = 1,000,000 lovelace)
-                    total_ada = lovelace_amount / 1_000_000
-                    
-                    embed = discord.Embed(
-                        title="💰 Wallet Balance",
-                        description=f"Address: `{address}`",
-                        color=discord.Color.green()
-                    )
-                    
-                    embed.add_field(
-                        name="Total ADA",
-                        value=f"₳ {total_ada:,.2f}",
-                        inline=False
-                    )
-                    
-                    await interaction.followup.send(embed=embed)
-                    
-                except Exception as e:
-                    logger.error(f"Error checking balance for {address}: {str(e)}")
-                    await interaction.followup.send(
-                        "❌ An error occurred while checking the wallet balance.",
-                        ephemeral=True
-                    )
-            
-            @self.tree.command(name='health', description='Check bot and API status')
-            async def health(interaction: discord.Interaction):
-                try:
-                    # Check Blockfrost connection
-                    blockfrost_status = "✅ Connected" if self.blockfrost_client else "❌ Not Connected"
-                    try:
-                        if self.blockfrost_client:
-                            health = await asyncio.wait_for(
-                                asyncio.to_thread(self.blockfrost_client.health),
-                                timeout=5.0
-                            )
-                            if not health:
-                                blockfrost_status = "❌ Not Connected"
-                    except Exception:
-                        blockfrost_status = "❌ Not Connected"
-                    
-                    # Create embed
-                    embed = discord.Embed(
-                        title="🔍 Bot Status",
-                        color=discord.Color.blue()
-                    )
-                    
-                    # Add fields
-                    embed.add_field(
-                        name="Bot Status",
-                        value="✅ Online",
-                        inline=True
-                    )
-                    embed.add_field(
-                        name="Blockfrost API",
-                        value=blockfrost_status,
-                        inline=True
-                    )
-                    embed.add_field(
-                        name="Monitoring",
-                        value="✅ Active" if not self.monitoring_paused else "❌ Paused",
-                        inline=True
-                    )
-                    
-                    # Add timestamp
-                    embed.timestamp = discord.utils.utcnow()
-                    
-                    await interaction.response.send_message(embed=embed)
-                    
-                except Exception as e:
-                    logger.error(f"Error in health command: {str(e)}")
-                    await interaction.response.send_message(
-                        "❌ Failed to get bot status. Please try again later.",
-                        ephemeral=True
-                    )
-
-            @self.tree.command(name="balance", description="Get your wallet's current balance")
-            async def balance_cmd(self, ctx: commands.Context):
-                """Get current balance of your registered wallet"""
-                try:
-                    # Get user's wallet
-                    address = await get_wallet_for_user(ctx.author.id)
-                    if not address:
-                        await ctx.send("❌ You don't have a registered wallet! Use `/register` first.")
-                        return
-                        
-                    # Get current balance
-                    ada_balance, token_balances = await get_wallet_balance(address)
-                    
-                    # Create embed
-                    embed = discord.Embed(
-                        title="💰 Wallet Balance",
-                        description=f"Current balance for wallet `{address}`",
-                        color=discord.Color.blue()
-                    )
-                    
-                    # Add ADA balance
-                    embed.add_field(
-                        name="ADA Balance",
-                        value=f"`{ada_balance / 1_000_000:,.6f} ADA`",
-                        inline=False
-                    )
-                    
-                    # Add token balances
-                    if token_balances:
-                        token_list = []
-                        for policy_id, amount in token_balances.items():
-                            try:
-                                asset_details = await self.rate_limited_request(
-                                    self.blockfrost_client.asset,
-                                    policy_id
-                                )
-                                name = asset_details.onchain_metadata.get('name', 'Unknown Token')
-                                token_list.append(f"{name}: `{amount:,}`")
-                            except Exception:
-                                token_list.append(f"Policy {policy_id[:8]}...{policy_id[-8:]}: `{amount:,}`")
-                        
-                        embed.add_field(
-                            name="Token Balances",
-                            value="\n".join(token_list) if token_list else "No tokens",
-                            inline=False
-                        )
-                    
-                    await ctx.send(embed=embed)
-                    
-                except Exception as e:
-                    logger.error(f"Error getting balance: {str(e)}")
-                    await ctx.send("❌ An error occurred while getting your balance.")
-
-            @self.tree.command(name="notifications", description="View and manage your notification settings")
-            async def notifications_cmd(self, ctx: commands.Context):
-                """View and manage notification settings"""
-                try:
-                    settings = await get_notification_settings(ctx.author.id)
-                    if not settings:
-                        await ctx.send("❌ You don't have any notification settings! Use `/register` first.")
-                        return
-                        
-                    # Create embed
-                    embed = discord.Embed(
-                        title="🔔 Notification Settings",
-                        description="Your current notification settings:",
-                        color=discord.Color.blue()
-                    )
-                    
-                    # Add each setting
-                    settings_display = {
-                        "ada_transactions": "ADA Transactions",
-                        "token_changes": "Token Changes",
-                        "nft_updates": "NFT Updates",
-                        "staking_rewards": "Staking Rewards",
-                        "stake_changes": "Stake Key Changes",
-                        "low_balance": "Low Balance Alerts",
-                        "unusual_activity": "Unusual Activity"
-                    }
-                    
-                    for setting, display_name in settings_display.items():
-                        status = settings.get(setting, False)
-                        embed.add_field(
-                            name=display_name,
-                            value=f"{'✅ Enabled' if status else '❌ Disabled'}",
-                            inline=True
-                        )
-                    
-                    # Add instructions
-                    embed.add_field(
-                        name="How to Change",
-                        value="Use `/toggle_notification [type]` to enable/disable notifications",
-                        inline=False
-                    )
-                    
-                    await ctx.send(embed=embed)
-                    
-                except Exception as e:
-                    logger.error(f"Error getting notification settings: {str(e)}")
-                    await ctx.send("❌ An error occurred while getting your notification settings.")
-
-            @self.tree.command(name="toggle_notification", description="Toggle a specific notification type")
-            async def toggle_notification_cmd(
-                self,
-                ctx: commands.Context,
-                notification_type: str = commands.parameter(
-                    description="Type of notification to toggle"
-                )
-            ):
-                """Toggle a specific notification type on/off"""
-                try:
-                    valid_types = {
-                        "ada": "ada_transactions",
-                        "token": "token_changes",
-                        "nft": "nft_updates",
-                        "staking": "staking_rewards",
-                        "stake": "stake_changes",
-                        "balance": "low_balance",
-                        "activity": "unusual_activity"
-                    }
-                    
-                    if notification_type not in valid_types:
-                        type_list = ", ".join(f"`{t}`" for t in valid_types.keys())
-                        await ctx.send(f"❌ Invalid notification type! Valid types are: {type_list}")
-                        return
-                        
-                    setting_key = valid_types[notification_type]
-                    settings = await get_notification_settings(ctx.author.id)
-                    
-                    if not settings:
-                        await ctx.send("❌ You don't have any notification settings! Use `/register` first.")
-                        return
-                        
-                    # Toggle the setting
-                    new_status = not settings.get(setting_key, True)
-                    success = await update_notification_setting(ctx.author.id, setting_key, new_status)
-                    
-                    if success:
-                        status = "enabled" if new_status else "disabled"
-                        await ctx.send(f"✅ Successfully {status} {notification_type} notifications!")
-                    else:
-                        await ctx.send("❌ Failed to update notification setting.")
-                    
-                except Exception as e:
-                    logger.error(f"Error toggling notification: {str(e)}")
-                    await ctx.send("❌ An error occurred while updating your notification settings.")
-
-            # Sync commands with Discord
-            logger.info("Syncing commands with Discord...")
-            await self.tree.sync()
-            logger.info("Commands synced successfully")
-
-        except Exception as e:
-            logger.error(f"Failed to set up commands: {str(e)}")
-            raise
-
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
         try:
@@ -1118,65 +675,6 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Error checking staking and stake key: {str(e)}")
 
-    async def verify_yummi_balance(self, address: str) -> tuple[bool, int]:
-        """Verify YUMMI token balance with robust asset parsing
-        
-        Args:
-            address (str): Wallet address to check
-            
-        Returns:
-            tuple[bool, int]: (has_enough_tokens, current_balance)
-        """
-        try:
-            # First check if address has any UTXOs with YUMMI tokens
-            utxos = await self.rate_limited_request(
-                self.blockfrost_client.address_utxos,
-                address
-            )
-            
-            # Check if any UTXO contains YUMMI token
-            asset = f"{YUMMI_POLICY_ID}{'79756d6d69'}"  # 79756d6d69 is hex for "yummi"
-            has_yummi = False
-            for utxo in utxos:
-                for amount in utxo.amount:
-                    if amount.unit == asset:
-                        has_yummi = True
-                        break
-                if has_yummi:
-                    break
-            
-            if not has_yummi:
-                logger.info(f"No YUMMI tokens found in address {address}")
-                return False, 0
-                
-            # Now get specific asset UTXOs to calculate total
-            try:
-                asset_utxos = await self.rate_limited_request(
-                    self.blockfrost_client.address_utxos_asset,
-                    address=address,
-                    asset=asset
-                )
-                
-                # Calculate total YUMMI tokens across all UTXOs
-                total_tokens = 0
-                for utxo in asset_utxos:
-                    for amount in utxo.amount:
-                        if amount.unit == asset:
-                            total_tokens += int(amount.quantity)
-                
-                logger.info(f"Found {total_tokens} YUMMI tokens for address {address}")
-                return total_tokens >= 25000, total_tokens
-                
-            except Exception as e:
-                if hasattr(e, 'status_code') and e.status_code == 404:
-                    logger.info(f"No YUMMI tokens found in address {address} (404 response)")
-                    return False, 0
-                raise
-            
-        except Exception as e:
-            logger.error(f"Failed to verify YUMMI balance: {str(e)}")
-            return False, 0
-
     async def process_interaction(self, interaction: discord.Interaction, ephemeral: bool = True):
         """Process interaction with proper error handling"""
         try:
@@ -1230,6 +728,328 @@ class WalletBud(commands.Bot):
     async def on_guild_join(self, guild):
         """Called when bot joins a guild"""
         logger.info(f"Joined guild {guild.name} ({guild.id})")
+
+    async def setup_commands(self):
+        """Set up bot commands"""
+        try:
+            # Wallet management commands
+            @self.tree.command(name="addwallet", description="Register a wallet to monitor")
+            @app_commands.describe(address="The wallet address to monitor")
+            async def addwallet(interaction: discord.Interaction, address: str):
+                await self._add_wallet(interaction, address)
+
+            @self.tree.command(name="removewallet", description="Stop monitoring a wallet")
+            @app_commands.describe(address="The wallet address to remove")
+            async def removewallet(interaction: discord.Interaction, address: str):
+                await self._remove_wallet(interaction, address)
+
+            @self.tree.command(name="listwallets", description="List your registered wallets")
+            async def listwallets(interaction: discord.Interaction):
+                await self._list_wallets(interaction)
+
+            @self.tree.command(name="help", description="Show bot help and commands")
+            async def help(interaction: discord.Interaction):
+                await self._help(interaction)
+
+            @self.tree.command(name="health", description="Check bot and API status")
+            async def health(interaction: discord.Interaction):
+                await self._health(interaction)
+
+            # Balance and notification commands
+            @self.tree.command(name="balance", description="Get your wallet's current balance")
+            async def balance(interaction: discord.Interaction):
+                await self._balance(interaction)
+
+            @self.tree.command(name="notifications", description="View your notification settings")
+            async def notifications(interaction: discord.Interaction):
+                await self._notifications(interaction)
+
+            @self.tree.command(name="toggle", description="Toggle a notification type")
+            @app_commands.describe(notification_type="Type of notification to toggle")
+            @app_commands.choices(notification_type=[
+                app_commands.Choice(name="ADA Transactions", value="ada"),
+                app_commands.Choice(name="Token Changes", value="token"),
+                app_commands.Choice(name="NFT Updates", value="nft"),
+                app_commands.Choice(name="Staking Rewards", value="staking"),
+                app_commands.Choice(name="Stake Key Changes", value="stake"),
+                app_commands.Choice(name="Low Balance Alerts", value="balance"),
+                app_commands.Choice(name="Unusual Activity", value="activity")
+            ])
+            async def toggle(interaction: discord.Interaction, notification_type: str):
+                await self._toggle_notification(interaction, notification_type)
+
+            # Sync the commands
+            await self.tree.sync()
+            logger.info("Commands synced successfully")
+
+        except Exception as e:
+            logger.error(f"Failed to set up commands: {str(e)}")
+            raise
+
+    async def _add_wallet(self, interaction: discord.Interaction, address: str):
+        """Add a wallet to monitor"""
+        try:
+            # Check if wallet is already registered
+            if await get_wallet(address):
+                await interaction.response.send_message("❌ Wallet already registered!", ephemeral=True)
+                return
+            
+            # Add wallet to database
+            await add_wallet(address, interaction.user.id)
+            
+            # Update last checked timestamp
+            await update_last_checked(address)
+            
+            await interaction.response.send_message("✅ Wallet added successfully!", ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"Error adding wallet: {str(e)}")
+            await interaction.response.send_message("❌ An error occurred while adding your wallet.", ephemeral=True)
+
+    async def _remove_wallet(self, interaction: discord.Interaction, address: str):
+        """Remove a wallet from monitoring"""
+        try:
+            # Check if wallet is registered
+            if not await get_wallet(address):
+                await interaction.response.send_message("❌ Wallet not registered!", ephemeral=True)
+                return
+            
+            # Remove wallet from database
+            await remove_wallet(address)
+            
+            await interaction.response.send_message("✅ Wallet removed successfully!", ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"Error removing wallet: {str(e)}")
+            await interaction.response.send_message("❌ An error occurred while removing your wallet.", ephemeral=True)
+
+    async def _list_wallets(self, interaction: discord.Interaction):
+        """List all registered wallets"""
+        try:
+            # Get all wallets for user
+            wallets = await get_all_wallets(interaction.user.id)
+            
+            if not wallets:
+                await interaction.response.send_message("❌ No wallets registered!", ephemeral=True)
+                return
+            
+            # Create embed
+            embed = discord.Embed(
+                title="📝 Registered Wallets",
+                description="Your registered wallets:",
+                color=discord.Color.blue()
+            )
+            
+            # Add each wallet
+            for wallet in wallets:
+                embed.add_field(
+                    name="Wallet",
+                    value=f"`{wallet['address']}`",
+                    inline=False
+                )
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"Error listing wallets: {str(e)}")
+            await interaction.response.send_message("❌ An error occurred while listing your wallets.", ephemeral=True)
+
+    async def _help(self, interaction: discord.Interaction):
+        """Show bot help and commands"""
+        try:
+            # Create embed
+            embed = discord.Embed(
+                title="🤔 Help and Commands",
+                description="Available commands:",
+                color=discord.Color.blue()
+            )
+            
+            # Add each command
+            for command in self.tree.get_commands():
+                embed.add_field(
+                    name=f"/{command.name}",
+                    value=command.description,
+                    inline=False
+                )
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"Error showing help: {str(e)}")
+            await interaction.response.send_message("❌ An error occurred while showing help.", ephemeral=True)
+
+    async def _health(self, interaction: discord.Interaction):
+        """Check bot and API status"""
+        try:
+            # Check Blockfrost API status
+            blockfrost_status = await self.rate_limited_request(
+                self.blockfrost_client.health
+            )
+            
+            # Create embed
+            embed = discord.Embed(
+                title="🏥 Bot and API Status",
+                description="Current status:",
+                color=discord.Color.blue()
+            )
+            
+            # Add Blockfrost API status
+            embed.add_field(
+                name="Blockfrost API",
+                value=f"`{blockfrost_status.is_healthy}`",
+                inline=False
+            )
+            
+            # Add bot status
+            embed.add_field(
+                name="Bot",
+                value="✅ Online",
+                inline=False
+            )
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"Error checking health: {str(e)}")
+            await interaction.response.send_message("❌ An error occurred while checking status.", ephemeral=True)
+
+    async def _balance(self, interaction: discord.Interaction):
+        """Get your wallet's current balance"""
+        try:
+            # Get user's wallet
+            address = await get_wallet_for_user(interaction.user.id)
+            if not address:
+                await interaction.response.send_message("❌ You don't have a registered wallet! Use `/register` first.", ephemeral=True)
+                return
+                        
+            # Get current balance
+            ada_balance, token_balances = await get_wallet_balance(address)
+            
+            # Create embed
+            embed = discord.Embed(
+                title="💰 Wallet Balance",
+                description=f"Current balance for wallet `{address}`",
+                color=discord.Color.blue()
+            )
+            
+            # Add ADA balance
+            embed.add_field(
+                name="ADA Balance",
+                value=f"`{ada_balance / 1_000_000:,.6f} ADA`",
+                inline=False
+            )
+            
+            # Add token balances
+            if token_balances:
+                token_list = []
+                for policy_id, amount in token_balances.items():
+                    try:
+                        asset_details = await self.rate_limited_request(
+                            self.blockfrost_client.asset,
+                            policy_id
+                        )
+                        name = asset_details.onchain_metadata.get('name', 'Unknown Token')
+                        token_list.append(f"{name}: `{amount:,}`")
+                    except Exception:
+                        token_list.append(f"Policy {policy_id[:8]}...{policy_id[-8:]}: `{amount:,}`")
+                
+                embed.add_field(
+                    name="Token Balances",
+                    value="\n".join(token_list) if token_list else "No tokens",
+                    inline=False
+                )
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+                    
+        except Exception as e:
+            logger.error(f"Error getting balance: {str(e)}")
+            await interaction.response.send_message("❌ An error occurred while getting your balance.", ephemeral=True)
+
+    async def _notifications(self, interaction: discord.Interaction):
+        """View your notification settings"""
+        try:
+            settings = await get_notification_settings(interaction.user.id)
+            if not settings:
+                await interaction.response.send_message("❌ You don't have any notification settings! Use `/register` first.", ephemeral=True)
+                return
+                        
+            # Create embed
+            embed = discord.Embed(
+                title="🔔 Notification Settings",
+                description="Your current notification settings:",
+                color=discord.Color.blue()
+            )
+            
+            # Add each setting
+            settings_display = {
+                "ada_transactions": "ADA Transactions",
+                "token_changes": "Token Changes",
+                "nft_updates": "NFT Updates",
+                "staking_rewards": "Staking Rewards",
+                "stake_changes": "Stake Key Changes",
+                "low_balance": "Low Balance Alerts",
+                "unusual_activity": "Unusual Activity"
+            }
+            
+            for setting, display_name in settings_display.items():
+                status = settings.get(setting, False)
+                embed.add_field(
+                    name=display_name,
+                    value=f"{'✅ Enabled' if status else '❌ Disabled'}",
+                    inline=True
+                )
+            
+            # Add instructions
+            embed.add_field(
+                name="How to Change",
+                value="Use `/toggle_notification [type]` to enable/disable notifications",
+                inline=False
+            )
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+                    
+        except Exception as e:
+            logger.error(f"Error getting notification settings: {str(e)}")
+            await interaction.response.send_message("❌ An error occurred while getting your notification settings.", ephemeral=True)
+
+    async def _toggle_notification(self, interaction: discord.Interaction, notification_type: str):
+        """Toggle a specific notification type on/off"""
+        try:
+            valid_types = {
+                "ada": "ada_transactions",
+                "token": "token_changes",
+                "nft": "nft_updates",
+                "staking": "staking_rewards",
+                "stake": "stake_changes",
+                "balance": "low_balance",
+                "activity": "unusual_activity"
+            }
+            
+            if notification_type not in valid_types:
+                type_list = ", ".join(f"`{t}`" for t in valid_types.keys())
+                await interaction.response.send_message(f"❌ Invalid notification type! Valid types are: {type_list}", ephemeral=True)
+                return
+                        
+            setting_key = valid_types[notification_type]
+            settings = await get_notification_settings(interaction.user.id)
+            
+            if not settings:
+                await interaction.response.send_message("❌ You don't have any notification settings! Use `/register` first.", ephemeral=True)
+                return
+                        
+            # Toggle the setting
+            new_status = not settings.get(setting_key, True)
+            success = await update_notification_setting(interaction.user.id, setting_key, new_status)
+            
+            if success:
+                status = "enabled" if new_status else "disabled"
+                await interaction.response.send_message(f"✅ Successfully {status} {notification_type} notifications!", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ Failed to update notification setting.", ephemeral=True)
+                    
+        except Exception as e:
+            logger.error(f"Error toggling notification: {str(e)}")
+            await interaction.response.send_message("❌ An error occurred while updating your notification settings.", ephemeral=True)
 
 if __name__ == "__main__":
     try:
