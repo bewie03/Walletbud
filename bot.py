@@ -294,28 +294,27 @@ class WalletBud(commands.Bot):
     async def setup_hook(self):
         """Setup hook called before the bot starts"""
         try:
+            logger.info("Initializing bot...")
+            
             # Initialize database
-            logger.info("Initializing database...")
             await init_db()
-            logger.info("Database initialization complete")
+            logger.info("Database initialized")
             
             # Initialize Blockfrost client
-            logger.info("Initializing Blockfrost client...")
-            await self.init_blockfrost()
-            
-            # Set up commands
-            logger.info("Setting up commands...")
-            await self.setup_commands()
-            logger.info("Commands setup complete")
-            
+            if not await self.init_blockfrost():
+                logger.error("Failed to initialize Blockfrost client")
+                return
+                
             # Start wallet monitoring task
-            self.bg_task = self.loop.create_task(self.check_wallets())
+            self.check_wallets.start()
             logger.info("Started wallet monitoring task")
             
-            logger.info("Bot initialization complete!")
+            # Sync commands
+            await self.tree.sync()
+            logger.info("Synced commands")
             
         except Exception as e:
-            logger.error(f"Error in setup: {str(e)}")
+            logger.error(f"Error in setup_hook: {str(e)}")
             raise
             
     async def init_blockfrost(self):
@@ -392,115 +391,38 @@ class WalletBud(commands.Bot):
             Exception: If all retry attempts fail
         """
         if not self.blockfrost_client:
+            logger.error("Blockfrost client not initialized")
             raise RuntimeError("Blockfrost client not initialized")
             
-        last_error = None
-        for attempt in range(3):
-            try:
-                # First acquire rate limit token
-                await self.rate_limiter.acquire()
-                
-                # Make the API call
-                try:
-                    loop = asyncio.get_event_loop()
-                    if args and not kwargs:
-                        result = await loop.run_in_executor(None, func, *args)
-                    elif kwargs and not args:
-                        result = await loop.run_in_executor(None, lambda: func(**kwargs))
-                    else:
-                        result = await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-                    
-                    # If we get here, the call succeeded
-                    return result
-                    
-                except Exception as e:
-                    last_error = e
-                    # Check if error is retryable
-                    if hasattr(e, 'status_code'):
-                        # Don't retry auth errors or invalid requests
-                        if e.status_code in [401, 403, 400]:
-                            logger.error(f"Non-retryable API error: {str(e)}")
-                            raise
-                        # If rate limited, wait longer
-                        elif e.status_code == 429:
-                            retry_delay = 2 * (4 ** attempt)  # Wait even longer for rate limits
-                            logger.warning(f"Rate limit hit, backing off for {retry_delay:.2f}s")
-                        else:
-                            retry_delay = 2 * (2 ** attempt)
-                            logger.warning(f"API error (status={e.status_code}): {str(e)}")
-                    else:
-                        # For network errors, use standard backoff
-                        retry_delay = 2 * (2 ** attempt)
-                        logger.warning(f"Network error: {str(e)}")
-                    
-                    # Log retry attempt
-                    if attempt < 2:
-                        logger.info(f"Retrying in {retry_delay:.2f}s (attempt {attempt + 1}/3)")
-                        await asyncio.sleep(retry_delay)
-                    else:
-                        logger.error(f"All retry attempts failed: {str(last_error)}")
-                        raise last_error
-                        
-            finally:
-                await self.rate_limiter.release()
-
-    async def _rate_limited_request(self, func, *args, **kwargs):
-        """Make a rate-limited request with retry logic
+        request_id = get_request_id()
+        logger.debug(f"[{request_id}] Making rate-limited request to {func.__name__}")
         
-        Args:
-            func: The API function to call
-            *args: Positional arguments for the function
-            **kwargs: Keyword arguments for the function
-            
-        Returns:
-            The API response
-            
-        Raises:
-            Exception if all retries fail
-        """
-        if not self.blockfrost_client:
-            raise RuntimeError("Blockfrost client not initialized")
-            
-        last_error = None
         for attempt in range(API_RETRY_ATTEMPTS):
             try:
-                # First acquire rate limit token
+                # Acquire rate limit token
                 await self.rate_limiter.acquire()
                 
-                # Make the API call
-                return await func(*args, **kwargs)
+                # Make request
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+                
+                # Release token (no-op but good practice)
+                await self.rate_limiter.release()
+                
+                return result
                 
             except Exception as e:
-                last_error = e
-                
-                # Always release on error
-                self.rate_limiter.release()
-                
-                # Handle different error types
-                if hasattr(e, 'status_code'):
-                    # API error
-                    if e.status_code in [400, 404]:
-                        # Don't retry client errors
-                        raise
-                    # If rate limited, wait longer
-                    elif e.status_code == 429:
-                        retry_delay = API_RETRY_DELAY * (4 ** attempt)  # Wait even longer for rate limits
-                        logger.warning(f"Rate limit hit, backing off for {retry_delay:.2f}s")
-                    else:
-                        retry_delay = API_RETRY_DELAY * (2 ** attempt)
-                        logger.warning(f"API error (status={e.status_code}): {str(e)}")
-                else:
-                    # For network errors, use standard backoff
-                    retry_delay = API_RETRY_DELAY * (2 ** attempt)
-                    logger.warning(f"Network error: {str(e)}")
-                
-                # Log retry attempt
                 if attempt < API_RETRY_ATTEMPTS - 1:
-                    logger.info(f"Retrying in {retry_delay:.2f}s (attempt {attempt + 1}/{API_RETRY_ATTEMPTS})")
-                    await asyncio.sleep(retry_delay)
+                    # Calculate backoff time
+                    backoff = (2 ** attempt) * API_RETRY_DELAY
+                    logger.warning(
+                        f"[{request_id}] Request failed (attempt {attempt + 1}/{API_RETRY_ATTEMPTS}), "
+                        f"retrying in {backoff}s: {str(e)}"
+                    )
+                    await asyncio.sleep(backoff)
                 else:
-                    logger.error(f"All retry attempts failed: {str(last_error)}")
-                    raise last_error
+                    logger.error(f"[{request_id}] All retry attempts failed: {str(e)}")
+                    raise
 
     async def send_admin_alert(self, message: str, is_error: bool = True):
         """Send alert to admin channel
