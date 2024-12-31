@@ -5,11 +5,22 @@ from datetime import datetime
 import time
 import uuid
 import asyncio
+from functools import wraps
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from blockfrost import BlockFrostApi
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 from config import (
     BLOCKFROST_PROJECT_ID,
@@ -29,61 +40,23 @@ from database import (
     add_wallet,
     remove_wallet,
     get_user_id_for_wallet,
-    get_wallet_for_user,
-    get_all_wallets_for_user,
-    get_last_yummi_check,
-    update_last_yummi_check,
-    update_last_checked,
-    get_wallet_balance,
-    add_transaction,
-    get_transaction_metadata,
+    get_all_wallets,
     get_notification_settings,
     update_notification_setting,
-    should_notify,
-    get_recent_transactions,
-    update_ada_balance,
-    update_token_balances,
-    update_utxo_state,
-    get_stake_address,
-    update_stake_address,
-    is_reward_processed,
-    add_processed_reward,
-    get_last_transactions,
-    get_utxo_state,
-    get_delegation_status,
-    update_delegation_status,
-    get_dapp_interactions,
-    update_dapp_interaction,
     initialize_notification_settings,
-    get_yummi_warning_count,
-    reset_yummi_warning,
-    increment_yummi_warning,
-    get_policy_expiry,
-    update_policy_expiry,
-    init_db,
-    get_all_wallets
+    init_db
 )
 
-# Configure logging
-log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
-logging.basicConfig(
-    level=getattr(logging, log_level, logging.INFO),
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-logger.info(f"Starting bot with log level: {log_level}")
-
-# Create request ID for logging
 def get_request_id():
-    return str(uuid.uuid4())[:8]
+    """Generate a unique request ID for logging"""
+    return str(uuid.uuid4())
 
 def dm_only():
-    """Check if command is being used in DMs"""
-    async def predicate(interaction: discord.Interaction) -> bool:
+    """Decorator to restrict commands to DMs only"""
+    async def predicate(interaction: discord.Interaction):
         if not isinstance(interaction.channel, discord.DMChannel):
             await interaction.response.send_message(
-                "❌ This command can only be used in DMs.",
+                "❌ This command can only be used in DMs for security reasons.",
                 ephemeral=True
             )
             return False
@@ -91,19 +64,19 @@ def dm_only():
     return app_commands.check(predicate)
 
 def has_blockfrost(func=None):
-    """Check if Blockfrost client is available"""
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if not interaction.client.blockfrost_client:
-            await interaction.response.send_message(
-                "❌ Blockfrost API is not available. Please try again later.",
-                ephemeral=True
-            )
-            return False
-        return True
-    
-    if func is None:
-        return app_commands.check(predicate)
-    return app_commands.check(predicate)(func)
+    """Decorator to check if Blockfrost client is available"""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(self, interaction: discord.Interaction, *args, **kwargs):
+            if not self.blockfrost_client:
+                await interaction.response.send_message(
+                    "❌ This command is currently unavailable due to API connectivity issues. Please try again later.",
+                    ephemeral=True
+                )
+                return
+            return await func(self, interaction, *args, **kwargs)
+        return wrapper
+    return decorator(func) if func else decorator
 
 class RateLimiter:
     """Rate limiter that implements Blockfrost's rate limiting rules:
@@ -294,105 +267,135 @@ class WalletBud(commands.Bot):
     async def setup_hook(self):
         """Setup hook called before the bot starts"""
         try:
-            logger.info("Initializing bot...")
+            logger.info("Starting bot initialization...")
             
-            # Initialize database
+            # Initialize database first
+            logger.info("Initializing database...")
             await init_db()
-            logger.info("Database initialized")
+            logger.info("Database initialized successfully")
             
-            # Initialize Blockfrost client
+            # Initialize Blockfrost client with retries
+            logger.info("Initializing Blockfrost client...")
             if not await self.init_blockfrost():
-                logger.error("Failed to initialize Blockfrost client")
-                return
-            
-            # Set up commands before syncing
-            await self.setup_commands()
-            logger.info("Commands set up")
-            
-            # Sync commands
-            await self.tree.sync()
-            logger.info("Synced commands")
-            
-            # Start wallet monitoring task only after successful initialization
-            if self.blockfrost_client:
-                self.check_wallets.start()
-                logger.info("Started wallet monitoring task")
+                logger.error("Failed to initialize Blockfrost client - bot may have limited functionality")
             else:
-                logger.error("Cannot start wallet monitoring - Blockfrost client not initialized")
+                logger.info("Blockfrost client initialized successfully")
+            
+            # Set up commands
+            logger.info("Setting up Discord commands...")
+            try:
+                await self.setup_commands()
+                logger.info("Commands set up successfully")
+                
+                # Sync commands with Discord
+                logger.info("Syncing commands with Discord...")
+                await self.tree.sync()
+                logger.info("Commands synced successfully")
+            except Exception as e:
+                logger.error(f"Failed to set up or sync commands: {str(e)}")
+                if hasattr(e, '__dict__'):
+                    logger.error(f"Error details: {e.__dict__}")
+                raise
+            
+            # Start wallet monitoring task only if Blockfrost is initialized
+            if self.blockfrost_client:
+                logger.info("Starting wallet monitoring task...")
+                self.check_wallets.start()
+                logger.info("Wallet monitoring task started")
+            else:
+                logger.error("Skipping wallet monitoring task - Blockfrost client not initialized")
+            
+            logger.info("Bot initialization completed")
             
         except Exception as e:
-            logger.error(f"Error in setup_hook: {str(e)}")
+            logger.error(f"Critical error during bot initialization: {str(e)}")
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
             raise
-            
+
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
-        try:
-            logger.info("Creating Blockfrost client...")
-            
-            # Check project ID
-            if not BLOCKFROST_PROJECT_ID:
-                logger.error("BLOCKFROST_PROJECT_ID not set")
-                return False
-                
-            # Log first few characters of project ID for debugging
-            logger.info(f"Using project ID starting with: {BLOCKFROST_PROJECT_ID[:8]}...")
-            logger.info(f"Using base URL: {BLOCKFROST_BASE_URL}")
-            
-            # Create client with correct project ID and base URL
-            self.blockfrost_client = BlockFrostApi(
-                project_id=BLOCKFROST_PROJECT_ID,
-                base_url=BLOCKFROST_BASE_URL
-            )
-            logger.info("BlockFrostApi client created successfully")
-            
-            # Test connection with address endpoint
+        MAX_RETRIES = 3
+        RETRY_DELAY = 5  # seconds
+        
+        for attempt in range(MAX_RETRIES):
             try:
-                logger.info("Testing Blockfrost connection...")
-                loop = asyncio.get_event_loop()
-                # Use a known valid address to test connection
-                test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
-                logger.info(f"Testing with address: {test_address[:20]}...")
+                logger.info(f"Creating Blockfrost client (attempt {attempt + 1}/{MAX_RETRIES})...")
                 
-                # Test basic address info
-                logger.info("Testing address info endpoint...")
-                address_info = await loop.run_in_executor(None, 
-                    lambda: self.blockfrost_client.address(test_address))
-                logger.info(f"Address info response received: {bool(address_info)}")
+                # Check project ID
+                if not BLOCKFROST_PROJECT_ID:
+                    logger.error("BLOCKFROST_PROJECT_ID not set")
+                    return False
+                    
+                # Log first few characters of project ID for debugging
+                logger.info(f"Using project ID starting with: {BLOCKFROST_PROJECT_ID[:8]}...")
+                logger.info(f"Using base URL: {BLOCKFROST_BASE_URL}")
                 
-                # Test address total
-                logger.info("Testing address total endpoint...")
-                total = await loop.run_in_executor(None,
-                    lambda: self.blockfrost_client.address_total(test_address))
-                logger.info(f"Address total response received: {bool(total)}")
+                # Create client with correct project ID and base URL
+                self.blockfrost_client = BlockFrostApi(
+                    project_id=BLOCKFROST_PROJECT_ID,
+                    base_url=BLOCKFROST_BASE_URL
+                )
+                logger.info("BlockFrostApi client created successfully")
                 
-                # Test UTXOs
-                logger.info("Testing UTXOs endpoint...")
-                utxos = await loop.run_in_executor(None,
-                    lambda: self.blockfrost_client.address_utxos(test_address))
-                logger.info(f"UTXOs response received: {bool(utxos)}")
-                
-                logger.info("Blockfrost connection test passed")
-                return True
+                # Test connection with address endpoint
+                try:
+                    logger.info("Testing Blockfrost connection...")
+                    # Use a known valid address to test connection
+                    test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
+                    logger.info(f"Testing with address: {test_address[:20]}...")
+                    
+                    # Test basic address info
+                    logger.info("Testing address info endpoint...")
+                    address_info = await self.rate_limited_request(
+                        self.blockfrost_client.address,
+                        test_address
+                    )
+                    if not address_info:
+                        raise Exception("Failed to get address info")
+                    logger.info("Address info test passed")
+                    
+                    # Test UTXOs
+                    logger.info("Testing UTXOs endpoint...")
+                    utxos = await self.rate_limited_request(
+                        self.blockfrost_client.address_utxos,
+                        test_address
+                    )
+                    if not utxos:
+                        raise Exception("Failed to get UTXOs")
+                    logger.info("UTXOs test passed")
+                    
+                    logger.info("All Blockfrost connection tests passed")
+                    return True
+                    
+                except Exception as e:
+                    logger.error(f"Failed to test Blockfrost connection: {str(e)}")
+                    if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                        logger.error(f"Response details: {e.response.text}")
+                    if hasattr(e, '__dict__'):
+                        logger.error(f"Error details: {e.__dict__}")
+                    self.blockfrost_client = None
+                    
+                    if attempt < MAX_RETRIES - 1:
+                        logger.info(f"Retrying in {RETRY_DELAY} seconds...")
+                        await asyncio.sleep(RETRY_DELAY)
+                    continue
                 
             except Exception as e:
-                logger.error(f"Failed to test Blockfrost connection: {str(e)}")
+                logger.error(f"Failed to create Blockfrost client: {str(e)}")
                 if hasattr(e, 'response') and hasattr(e.response, 'text'):
                     logger.error(f"Response details: {e.response.text}")
                 if hasattr(e, '__dict__'):
                     logger.error(f"Error details: {e.__dict__}")
                 self.blockfrost_client = None
-                return False
-            
-        except Exception as e:
-            logger.error(f"Failed to create Blockfrost client: {str(e)}")
-            if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                logger.error(f"Response details: {e.response.text}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            self.blockfrost_client = None
-            return False
+                
+                if attempt < MAX_RETRIES - 1:
+                    logger.info(f"Retrying in {RETRY_DELAY} seconds...")
+                    await asyncio.sleep(RETRY_DELAY)
+                continue
+        
+        logger.error(f"Failed to initialize Blockfrost client after {MAX_RETRIES} attempts")
+        return False
 
     async def rate_limited_request(self, func, *args, **kwargs):
         """Make a rate-limited request to the Blockfrost API with retry logic
@@ -406,14 +409,13 @@ class WalletBud(commands.Bot):
             The result of the API call
             
         Raises:
-            Exception: If all retry attempts fail
+            Exception: If all retry attempts fail or if client is not initialized
         """
         if not self.blockfrost_client:
-            logger.error("Blockfrost client not initialized")
-            raise RuntimeError("Blockfrost client not initialized")
+            raise Exception("Blockfrost client is not initialized")
             
         request_id = get_request_id()
-        logger.debug(f"[{request_id}] Making rate-limited request to {func.__name__}")
+        logger.info(f"[{request_id}] Making rate-limited request to {func.__name__}")
         
         for attempt in range(API_RETRY_ATTEMPTS):
             try:
@@ -421,26 +423,24 @@ class WalletBud(commands.Bot):
                 await self.rate_limiter.acquire()
                 
                 # Make request
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-                
-                # Release token (no-op but good practice)
-                await self.rate_limiter.release()
-                
-                return result
+                response = await asyncio.to_thread(func, *args, **kwargs)
+                logger.info(f"[{request_id}] Request successful")
+                return response
                 
             except Exception as e:
+                logger.error(f"[{request_id}] Request failed (attempt {attempt + 1}/{API_RETRY_ATTEMPTS}): {str(e)}")
+                if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                    logger.error(f"[{request_id}] Response details: {e.response.text}")
+                
                 if attempt < API_RETRY_ATTEMPTS - 1:
-                    # Calculate backoff time
-                    backoff = (2 ** attempt) * API_RETRY_DELAY
-                    logger.warning(
-                        f"[{request_id}] Request failed (attempt {attempt + 1}/{API_RETRY_ATTEMPTS}), "
-                        f"retrying in {backoff}s: {str(e)}"
-                    )
-                    await asyncio.sleep(backoff)
+                    logger.info(f"[{request_id}] Retrying in {API_RETRY_DELAY} seconds...")
+                    await asyncio.sleep(API_RETRY_DELAY)
                 else:
-                    logger.error(f"[{request_id}] All retry attempts failed: {str(e)}")
+                    logger.error(f"[{request_id}] All retry attempts failed")
                     raise
+            finally:
+                # Always release the rate limit token
+                self.rate_limiter.release()
 
     async def send_admin_alert(self, message: str, is_error: bool = True):
         """Send alert to admin channel
@@ -514,31 +514,53 @@ class WalletBud(commands.Bot):
             logger.error(f"Error checking YUMMI requirement: {str(e)}")
             return False, 0
 
-    @tasks.loop()
+    @tasks.loop(seconds=WALLET_CHECK_INTERVAL)
     async def check_wallets(self):
         """Background task to check all wallets periodically"""
-        while True:
-            try:
-                # Get all wallets to check
+        if self.monitoring_paused or self.processing_wallets:
+            logger.info("Skipping wallet check - monitoring paused or already processing")
+            return
+            
+        try:
+            async with self.wallet_task_lock:
+                self.processing_wallets = True
+                logger.info("Starting wallet check cycle...")
+                
+                # Verify Blockfrost client
+                if not self.blockfrost_client:
+                    logger.error("Cannot check wallets - Blockfrost client not initialized")
+                    # Try to reinitialize
+                    if not await self.init_blockfrost():
+                        logger.error("Failed to reinitialize Blockfrost client")
+                        return
+                
+                # Get all wallets
                 wallets = await get_all_wallets()
                 if not wallets:
-                    logger.debug("No wallets to check")
-                    await asyncio.sleep(WALLET_CHECK_INTERVAL)
-                    continue
-                
+                    logger.info("No wallets to check")
+                    return
+                    
                 logger.info(f"Checking {len(wallets)} wallets...")
                 
-                # Check each wallet
                 for wallet in wallets:
-                    if not self.monitoring_paused:
+                    try:
                         await self.check_wallet(wallet['address'])
-                    
-            except Exception as e:
-                logger.error(f"Error in wallet check loop: {str(e)}")
+                    except Exception as e:
+                        logger.error(f"Error checking wallet {wallet['address']}: {str(e)}")
+                        if hasattr(e, '__dict__'):
+                            logger.error(f"Error details: {e.__dict__}")
+                        continue
                 
-            finally:
-                # Always sleep between checks
-                await asyncio.sleep(WALLET_CHECK_INTERVAL)
+                logger.info("Wallet check cycle completed")
+                
+        except Exception as e:
+            logger.error(f"Critical error in wallet check task: {str(e)}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
+            await self.send_admin_alert(f"Critical error in wallet monitoring: {str(e)}")
+            
+        finally:
+            self.processing_wallets = False
 
     async def check_wallet(self, address: str):
         """Check a single wallet's balance and transactions"""
