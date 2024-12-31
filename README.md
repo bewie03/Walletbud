@@ -58,6 +58,19 @@ A Discord bot for monitoring Cardano wallets with YUMMI token validation and com
 - Blockfrost API Key
 - Heroku account (for deployment)
 
+### YUMMI Token Details
+The YUMMI token can be represented in different formats across different platforms:
+
+1. **Blockfrost API Format** (Used by the bot):
+   - Policy ID: `078eafce5cd7edafdf63900edef2c1ea759e77f30ca81d6bbdeec924`
+   - Token Name (hex): `9756d6d69`
+   - Full Token ID: `078eafce5cd7edafdf63900edef2c1ea759e77f30ca81d6bbdeec9249756d6d69`
+
+2. **Pool.pm Format**:
+   - Asset ID: `asset1jhsvtq7uaz0npx5vryc5um3r34tmz576qe3kkj`
+
+These are different representations of the same token. The bot uses the Blockfrost API format since it interacts with the Blockfrost API. When viewing the token on pool.pm or other blockchain explorers, you might see the Asset ID format instead.
+
 ### Environment Variables
 ```env
 # Discord Configuration
@@ -69,9 +82,9 @@ COMMAND_PREFIX=!
 BLOCKFROST_PROJECT_ID=your_blockfrost_project_id
 BLOCKFROST_BASE_URL=https://cardano-mainnet.blockfrost.io/api/v0
 
-# YUMMI Token Configuration
+# YUMMI Token Configuration (Blockfrost API Format)
 YUMMI_POLICY_ID=078eafce5cd7edafdf63900edef2c1ea759e77f30ca81d6bbdeec924
-YUMMI_TOKEN_NAME=59554d4d49
+YUMMI_TOKEN_NAME=9756d6d69
 
 # Database Configuration
 DATABASE_URL=your_postgresql_url
