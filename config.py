@@ -70,9 +70,6 @@ WALLET_PROCESS_DELAY = float(os.getenv('WALLET_PROCESS_DELAY', '0.2'))
 if not all([DISCORD_TOKEN, BLOCKFROST_PROJECT_ID]):
     raise ValueError("Missing required environment variables")
 
-# Rate Limiting Configuration
-BURST_COOLDOWN = BURST_LIMIT / MAX_REQUESTS_PER_SECOND  # 50 seconds
-
 # Wallet Monitoring Configuration
 MIN_ADA_BALANCE = 5  # Minimum ADA balance threshold (5 ADA)
 MAX_TX_PER_HOUR = 10  # Maximum transactions per hour before alerting

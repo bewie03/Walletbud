@@ -696,8 +696,9 @@ class WalletBud(commands.Bot):
                 await interaction.response.send_message("❌ Invalid wallet address! Address must start with 'addr1'", ephemeral=True)
                 return
 
-            # Check if wallet exists
-            if await wallet_exists(str(interaction.user.id), address):
+            # Check if wallet is already being monitored
+            existing_wallet = await get_wallet(str(interaction.user.id), address)
+            if existing_wallet:
                 await interaction.response.send_message("❌ This wallet is already being monitored!", ephemeral=True)
                 return
 
@@ -1134,11 +1135,6 @@ class WalletBud(commands.Bot):
 if __name__ == "__main__":
     try:
         logger.info("Starting WalletBud bot...")
-        
-        # Constants
-        WALLET_CHECK_INTERVAL = 60  # seconds
-        MAX_TX_PER_HOUR = 10
-        MIN_ADA_BALANCE = 2  # ADA
         
         # Create bot instance
         bot = WalletBud()
