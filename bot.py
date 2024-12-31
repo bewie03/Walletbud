@@ -329,12 +329,14 @@ class WalletBud(commands.Bot):
                 
             # Log first few characters of project ID for debugging
             logger.info(f"Using project ID starting with: {BLOCKFROST_PROJECT_ID[:8]}...")
+            logger.info(f"Using base URL: {BLOCKFROST_BASE_URL}")
             
             # Create client with correct project ID and base URL
             self.blockfrost_client = BlockFrostApi(
                 project_id=BLOCKFROST_PROJECT_ID,
                 base_url=BLOCKFROST_BASE_URL
             )
+            logger.info("BlockFrostApi client created successfully")
             
             # Test connection with address endpoint
             try:
@@ -345,19 +347,22 @@ class WalletBud(commands.Bot):
                 logger.info(f"Testing with address: {test_address[:20]}...")
                 
                 # Test basic address info
+                logger.info("Testing address info endpoint...")
                 address_info = await loop.run_in_executor(None, 
                     lambda: self.blockfrost_client.address(test_address))
-                logger.info(f"Address info: {address_info}")
+                logger.info(f"Address info response received: {bool(address_info)}")
                 
                 # Test address total
+                logger.info("Testing address total endpoint...")
                 total = await loop.run_in_executor(None,
                     lambda: self.blockfrost_client.address_total(test_address))
-                logger.info(f"Address total: {total}")
+                logger.info(f"Address total response received: {bool(total)}")
                 
                 # Test UTXOs
+                logger.info("Testing UTXOs endpoint...")
                 utxos = await loop.run_in_executor(None,
                     lambda: self.blockfrost_client.address_utxos(test_address))
-                logger.info(f"Address UTXOs: {utxos[:2]}")  # Show first 2 UTXOs
+                logger.info(f"UTXOs response received: {bool(utxos)}")
                 
                 logger.info("Blockfrost connection test passed")
                 return True
@@ -366,6 +371,8 @@ class WalletBud(commands.Bot):
                 logger.error(f"Failed to test Blockfrost connection: {str(e)}")
                 if hasattr(e, 'response') and hasattr(e.response, 'text'):
                     logger.error(f"Response details: {e.response.text}")
+                if hasattr(e, '__dict__'):
+                    logger.error(f"Error details: {e.__dict__}")
                 self.blockfrost_client = None
                 return False
             
@@ -373,6 +380,8 @@ class WalletBud(commands.Bot):
             logger.error(f"Failed to create Blockfrost client: {str(e)}")
             if hasattr(e, 'response') and hasattr(e.response, 'text'):
                 logger.error(f"Response details: {e.response.text}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
             self.blockfrost_client = None
             return False
 
@@ -461,13 +470,12 @@ class WalletBud(commands.Bot):
                 address
             )
             
-            # Calculate YUMMI balance from UTXOs
-            yummi_amount = sum(
-                int(amount.quantity)
-                for utxo in utxos
-                for amount in utxo.amount
-                if amount.unit.lower() == YUMMI_TOKEN_ID.lower()  # Case-insensitive comparison
-            )
+            # Calculate YUMMI amount from UTXOs
+            yummi_amount = 0
+            for utxo in utxos:
+                for amount in utxo.amount:
+                    if amount.unit == f"{YUMMI_POLICY_ID}{YUMMI_ASSET_NAME}":
+                        yummi_amount += int(amount.quantity)
             
             # If UTXOs show 0, try getting address details directly
             if yummi_amount == 0:
@@ -485,7 +493,7 @@ class WalletBud(commands.Bot):
                     yummi_amount = sum(
                         int(amount.quantity)
                         for amount in details.amount
-                        if amount.unit.lower() == YUMMI_TOKEN_ID.lower()
+                        if amount.unit == f"{YUMMI_POLICY_ID}{YUMMI_ASSET_NAME}"
                     )
             
             logger.info(f"Found YUMMI amount for {address}: {yummi_amount}")
@@ -1177,7 +1185,7 @@ class WalletBud(commands.Bot):
             for i, address in enumerate(addresses, 1):
                 try:
                     # Get wallet details
-                    wallet = await get_wallet_for_user(address)
+                    wallet = await get_wallet_for_user(str(interaction.user.id), address)
                     if not wallet:
                         logger.error(f"No wallet found for address {address}")
                         continue
