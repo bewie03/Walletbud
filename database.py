@@ -33,7 +33,7 @@ async def get_pool():
     return _pool
 
 # Update schema version
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.3.0"
 
 SCHEMA = """
 -- Drop tables in correct order
@@ -44,6 +44,7 @@ DROP TABLE IF EXISTS stake_addresses CASCADE;
 DROP TABLE IF EXISTS policy_expiry CASCADE;
 DROP TABLE IF EXISTS wallets CASCADE;
 DROP TABLE IF EXISTS users CASCADE;
+DROP TABLE IF EXISTS rate_limits CASCADE;
 
 -- Users table for storing Discord users
 CREATE TABLE IF NOT EXISTS users (
@@ -70,6 +71,7 @@ CREATE TABLE IF NOT EXISTS wallets (
     last_checked TIMESTAMP,
     last_yummi_check TIMESTAMP,
     last_balance BIGINT,
+    yummi_balance BIGINT,  -- Added YUMMI token balance
     utxo_state JSONB,
     delegation_pool_id TEXT,
     last_dapp_tx TEXT,
@@ -78,6 +80,20 @@ CREATE TABLE IF NOT EXISTS wallets (
 
 -- Create index on address for faster lookups
 CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
+
+-- Rate limits table for tracking API rate limits
+CREATE TABLE IF NOT EXISTS rate_limits (
+    id SERIAL PRIMARY KEY,
+    endpoint TEXT NOT NULL,
+    last_request TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    request_count INTEGER DEFAULT 0,
+    burst_tokens INTEGER DEFAULT 500,
+    last_burst_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(endpoint)
+);
+
+-- Create index on endpoint for faster lookups
+CREATE INDEX IF NOT EXISTS idx_rate_limits_endpoint ON rate_limits(endpoint);
 
 -- Stake addresses table for tracking stake addresses
 CREATE TABLE IF NOT EXISTS stake_addresses (
@@ -168,7 +184,7 @@ async def init_db():
                     # Verify all required tables exist
                     required_tables = [
                         'users', 'wallets', 'stake_addresses', 'processed_rewards',
-                        'yummi_warnings', 'policy_expiry', 'transactions'
+                        'yummi_warnings', 'policy_expiry', 'transactions', 'rate_limits'
                     ]
                     
                     for table in required_tables:

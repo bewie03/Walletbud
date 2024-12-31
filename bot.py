@@ -42,7 +42,7 @@ from database import (
     get_notification_settings,
     update_notification_setting,
     initialize_notification_settings,
-    get_wallet,
+    get_wallet_for_user,
     init_db
 )
 
@@ -96,62 +96,86 @@ class RateLimiter:
         self.max_requests = max_requests
         self.burst_limit = burst_limit
         self.cooldown_seconds = cooldown_seconds
-        self.requests = []
-        self.burst_tokens = burst_limit
-        self.last_burst_update = time.time()
-        self.lock = asyncio.Lock()
+        self.endpoint_locks = {}  # Locks per endpoint
+        self.endpoint_requests = {}  # Request tracking per endpoint
+        self.endpoint_burst_tokens = {}  # Burst tokens per endpoint
+        self.endpoint_last_update = {}  # Last update time per endpoint
+        self.lock = asyncio.Lock()  # Global lock for endpoint management
         
         logger.info(
             f"Initialized RateLimiter with: max_requests={max_requests}, "
             f"burst_limit={burst_limit}, cooldown_seconds={cooldown_seconds}"
         )
         
-    async def acquire(self):
-        """Acquire a rate limit token, implementing Blockfrost's burst behavior"""
+    async def get_endpoint_lock(self, endpoint: str) -> asyncio.Lock:
+        """Get or create a lock for a specific endpoint"""
         async with self.lock:
+            if endpoint not in self.endpoint_locks:
+                self.endpoint_locks[endpoint] = asyncio.Lock()
+                self.endpoint_requests[endpoint] = []
+                self.endpoint_burst_tokens[endpoint] = self.burst_limit
+                self.endpoint_last_update[endpoint] = time.time()
+            return self.endpoint_locks[endpoint]
+            
+    async def acquire(self, endpoint: str):
+        """Acquire a rate limit token for a specific endpoint"""
+        lock = await self.get_endpoint_lock(endpoint)
+        async with lock:
             now = time.time()
             
             # Update burst tokens
-            time_passed = now - self.last_burst_update
+            time_passed = now - self.endpoint_last_update[endpoint]
             tokens_to_add = int(time_passed * self.max_requests)
-            self.burst_tokens = min(self.burst_limit, self.burst_tokens + tokens_to_add)
-            self.last_burst_update = now
+            self.endpoint_burst_tokens[endpoint] = min(
+                self.burst_limit, 
+                self.endpoint_burst_tokens[endpoint] + tokens_to_add
+            )
+            self.endpoint_last_update[endpoint] = now
             
             # Clean old requests
             cutoff = now - self.cooldown_seconds
-            self.requests = [t for t in self.requests if t > cutoff]
+            self.endpoint_requests[endpoint] = [
+                t for t in self.endpoint_requests[endpoint] if t > cutoff
+            ]
             
             # Check if we can make a request
-            if len(self.requests) >= self.max_requests and self.burst_tokens <= 0:
-                wait_time = self.requests[0] - cutoff
-                logger.warning(f"Rate limit hit, waiting {wait_time:.2f}s")
+            if (len(self.endpoint_requests[endpoint]) >= self.max_requests and 
+                self.endpoint_burst_tokens[endpoint] <= 0):
+                wait_time = self.endpoint_requests[endpoint][0] - cutoff
+                logger.warning(
+                    f"Rate limit hit for endpoint {endpoint}, "
+                    f"waiting {wait_time:.2f}s"
+                )
                 await asyncio.sleep(wait_time)
-                return await self.acquire()
+                return await self.acquire(endpoint)
             
             # Use burst token if needed
-            if len(self.requests) >= self.max_requests:
-                self.burst_tokens -= 1
+            if len(self.endpoint_requests[endpoint]) >= self.max_requests:
+                self.endpoint_burst_tokens[endpoint] -= 1
                 
             # Record request
-            self.requests.append(now)
-            logger.debug(f"Rate limit request granted (burst tokens: {self.burst_tokens})")
+            self.endpoint_requests[endpoint].append(now)
+            logger.debug(
+                f"Rate limit request granted for {endpoint} "
+                f"(burst tokens: {self.endpoint_burst_tokens[endpoint]})"
+            )
             
-    async def release(self):
-        """Release the rate limit token"""
-        # This is now a proper async method
-        async with self.lock:
-            if self.requests:
-                self.requests.pop()
+    async def release(self, endpoint: str):
+        """Release the rate limit token for a specific endpoint"""
+        lock = await self.get_endpoint_lock(endpoint)
+        async with lock:
+            if self.endpoint_requests[endpoint]:
+                self.endpoint_requests[endpoint].pop()
 
     async def __aenter__(self):
         """Enter the async context manager"""
-        await self.acquire()
+        await self.acquire("default")  # Use default endpoint if none specified
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Exit the async context manager"""
-        await self.release()
-        
+        await self.release("default")
+
 class WalletBud(commands.Bot):
     """WalletBud Discord bot"""
     NOTIFICATION_TYPES = {
@@ -339,33 +363,37 @@ class WalletBud(commands.Bot):
                     # Test basic address info
                     logger.info("Testing address info endpoint...")
                     async with self.rate_limiter:
-                        address_info = await self.blockfrost_client.address(test_address)
+                        address_info = await asyncio.to_thread(self.blockfrost_client.address, test_address)
                         if not address_info:
                             raise Exception("Failed to get address info")
                         logger.info("Basic address info test passed")
-                        
-                        # Get extended address info
-                        extended_info = await self.blockfrost_client.address_extended(test_address)
+                    
+                    # Get extended address info
+                    async with self.rate_limiter:
+                        extended_info = await asyncio.to_thread(self.blockfrost_client.address_extended, test_address)
                         if not extended_info:
                             raise Exception("Failed to get extended address info")
                         logger.info("Extended address info test passed")
-                        
-                        # Get address total
-                        total_info = await self.blockfrost_client.address_total(test_address)
+                    
+                    # Get address total
+                    async with self.rate_limiter:
+                        total_info = await asyncio.to_thread(self.blockfrost_client.address_total, test_address)
                         if not total_info:
                             raise Exception("Failed to get address total")
                         logger.info("Address total test passed")
-                        
-                        # Test UTXOs
-                        logger.info("Testing UTXOs endpoint...")
-                        utxos = await self.blockfrost_client.address_utxos(test_address)
+                    
+                    # Test UTXOs
+                    logger.info("Testing UTXOs endpoint...")
+                    async with self.rate_limiter:
+                        utxos = await asyncio.to_thread(self.blockfrost_client.address_utxos, test_address)
                         if not utxos:
                             raise Exception("Failed to get UTXOs")
                         logger.info("UTXOs test passed")
-                        
-                        # Test transactions
-                        logger.info("Testing transactions endpoint...")
-                        txs = await self.blockfrost_client.address_transactions(test_address)
+                    
+                    # Test transactions
+                    logger.info("Testing transactions endpoint...")
+                    async with self.rate_limiter:
+                        txs = await asyncio.to_thread(self.blockfrost_client.address_transactions, test_address)
                         if txs is None:  # Can be empty list but shouldn't be None
                             raise Exception("Failed to get transactions")
                         logger.info("Transactions test passed")
@@ -411,7 +439,8 @@ class WalletBud(commands.Bot):
             raise Exception("Blockfrost client not initialized")
             
         request_id = get_request_id()
-        logger.info(f"[{request_id}] Making rate-limited request to {func.__name__}")
+        endpoint = func.__name__
+        logger.info(f"[{request_id}] Making rate-limited request to {endpoint}")
         
         # Exponential backoff settings
         max_retries = 3
@@ -421,8 +450,13 @@ class WalletBud(commands.Bot):
         for attempt in range(max_retries):
             try:
                 async with self.rate_limiter:
-                    result = await func(*args, **kwargs)
-                    return result
+                    # Use endpoint-specific rate limiting
+                    await self.rate_limiter.acquire(endpoint)
+                    try:
+                        result = await func(*args, **kwargs)
+                        return result
+                    finally:
+                        await self.rate_limiter.release(endpoint)
                     
             except Exception as e:
                 # Get status code if available
@@ -435,38 +469,54 @@ class WalletBud(commands.Bot):
                 # Handle specific error codes
                 if status_code:
                     if status_code == 400:
-                        logger.error(f"[{request_id}] Bad Request - Check parameters")
+                        logger.error(f"[{request_id}] Bad Request - Check parameters: {str(e)}")
                         raise  # Don't retry invalid requests
                     elif status_code == 403:
-                        logger.error(f"[{request_id}] Forbidden - Check API key")
+                        logger.error(f"[{request_id}] Forbidden - Check API key: {str(e)}")
                         raise  # Don't retry auth errors
                     elif status_code == 429:
                         # Rate limit hit - use exponential backoff with jitter
                         delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
                         jitter = random.uniform(-max_jitter * delay, max_jitter * delay)
                         delay = max(0.1, delay + jitter)  # Ensure minimum delay of 0.1s
-                        logger.warning(f"[{request_id}] Rate limit hit. Retrying in {delay:.2f} seconds...")
+                        logger.warning(
+                            f"[{request_id}] Rate limit hit for {endpoint}. "
+                            f"Retrying in {delay:.2f} seconds..."
+                        )
                     elif status_code == 500:
                         # Server error - use exponential backoff with jitter
                         delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
                         jitter = random.uniform(-max_jitter * delay, max_jitter * delay)
                         delay = max(0.1, delay + jitter)  # Ensure minimum delay of 0.1s
-                        logger.error(f"[{request_id}] Server error. Retrying in {delay:.2f} seconds...")
+                        logger.error(
+                            f"[{request_id}] Server error for {endpoint}. "
+                            f"Retrying in {delay:.2f} seconds..."
+                        )
                     else:
                         # Unknown error - use exponential backoff with jitter
                         delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
                         jitter = random.uniform(-max_jitter * delay, max_jitter * delay)
                         delay = max(0.1, delay + jitter)  # Ensure minimum delay of 0.1s
-                        logger.error(f"[{request_id}] Request failed with status {status_code}")
+                        logger.error(
+                            f"[{request_id}] Request failed for {endpoint} "
+                            f"with status {status_code}: {str(e)}"
+                        )
                 
-                # Log the error
-                logger.error(f"[{request_id}] Request failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                # Log the error with more detail
+                logger.error(
+                    f"[{request_id}] Request failed for {endpoint} "
+                    f"(attempt {attempt + 1}/{max_retries}): {str(e)}\n"
+                    f"Args: {args}\nKwargs: {kwargs}"
+                )
                 
                 if attempt < max_retries - 1:  # Don't sleep on last attempt
                     await asyncio.sleep(delay)
-                else:
-                    logger.error(f"[{request_id}] All retry attempts failed")
-                    raise
+                    
+        # All retries failed
+        raise Exception(
+            f"[{request_id}] All {max_retries} attempts failed for {endpoint}. "
+            f"Last error: {str(e)}"
+        )
 
     async def send_admin_alert(self, message: str, is_error: bool = True):
         """Send alert to admin channel
@@ -500,7 +550,8 @@ class WalletBud(commands.Bot):
         """
         try:
             # Get UTXOs for the specific token
-            utxos = await self.blockfrost_client.address_utxos_asset(
+            utxos = await self.rate_limited_request(
+                self.blockfrost_client.address_utxos_asset,
                 address=address,
                 asset=YUMMI_TOKEN_ID
             )
@@ -580,7 +631,7 @@ class WalletBud(commands.Bot):
                     return
                     
                 # Get wallet details
-                wallet = await get_wallet(address)
+                wallet = await get_wallet_for_user(user_id, address)
                 if not wallet:
                     logger.error(f"No wallet found for user {user_id} and address {address}")
                     return
@@ -599,26 +650,65 @@ class WalletBud(commands.Bot):
                         
                         # Remove wallet after 3 warnings
                         if warning_count >= 3:
-                            await remove_wallet(user_id, address)
-                            await self.send_dm(
-                                int(user_id),
-                                f"❌ Your wallet `{address[:8]}...{address[-8:]}` has been removed due to insufficient YUMMI balance.\n"
-                                f"Current balance: {balance:,} YUMMI\n"
-                                f"Required balance: {MIN_YUMMI_REQUIREMENT:,} YUMMI"
-                            )
+                            logger.warning(f"Removing wallet {address} due to insufficient YUMMI balance")
+                            await remove_wallet(wallet_id)
+                            
+                            if await should_notify(user_id, "low_balance"):
+                                await self.send_dm(
+                                    user_id,
+                                    f"❌ Your wallet `{address[:8]}...{address[-8:]}` has been removed from monitoring due to "
+                                    f"insufficient YUMMI token balance ({balance} < {MIN_YUMMI_REQUIREMENT})"
+                                )
                             return
                         
                         # Send warning
-                        await self.send_dm(
-                            int(user_id),
-                            f"⚠️ Warning ({warning_count}/3): Your wallet `{address[:8]}...{address[-8:]}` has insufficient YUMMI balance.\n"
-                            f"Current balance: {balance:,} YUMMI\n"
-                            f"Required balance: {MIN_YUMMI_REQUIREMENT:,} YUMMI\n\n"
-                            f"Your wallet will be removed after 3 warnings."
-                        )
-
+                        if await should_notify(user_id, "low_balance"):
+                            await self.send_dm(
+                                user_id,
+                                f"⚠️ Warning ({warning_count}/3): Your wallet `{address[:8]}...{address[-8:]}` has insufficient "
+                                f"YUMMI token balance ({balance} < {MIN_YUMMI_REQUIREMENT}). Please add more YUMMI tokens to "
+                                "continue monitoring."
+                            )
+                
+                # Get current wallet state
+                try:
+                    # Get current transactions
+                    current_txs = await self.rate_limited_request(
+                        self.blockfrost_client.address_transactions,
+                        address=address,
+                        count=50  # Limit to recent transactions
+                    )
+                    
+                    # Get current UTXOs
+                    current_utxos = await self.rate_limited_request(
+                        self.blockfrost_client.address_utxos,
+                        address=address
+                    )
+                    
+                    # Get extended info for delegation status
+                    extended_info = await self.rate_limited_request(
+                        self.blockfrost_client.address_extended,
+                        address=address
+                    )
+                    
+                    # Process each check in parallel
+                    await asyncio.gather(
+                        self._check_policy_expiry(address, user_id),
+                        self._check_delegation_status(address, user_id, extended_info),
+                        self._check_dapp_interactions(address, user_id, current_txs)
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error getting wallet state for {address}: {str(e)}")
+                    if hasattr(e, '__dict__'):
+                        logger.error(f"Error details: {e.__dict__}")
+                    return
+                
                 # Get and update stake address
-                stake_address = await get_stake_address(address)
+                stake_address = await self.rate_limited_request(
+                    self.blockfrost_client.address_stake,
+                    address
+                )
                 if stake_address:
                     await update_stake_address(address, stake_address)
 
@@ -707,7 +797,11 @@ class WalletBud(commands.Bot):
                 await update_ada_balance(address, ada_balance)
                 
                 # Get and process recent transactions
-                recent_txs = await get_recent_transactions(address)
+                recent_txs = await self.rate_limited_request(
+                    self.blockfrost_client.address_transactions,
+                    address=address,
+                    count=50  # Limit to recent transactions
+                )
                 if recent_txs:
                     last_known_txs = await get_last_transactions(address) or []
                     
@@ -803,65 +897,51 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Error checking policy expiry: {str(e)}")
 
-    async def _check_delegation_status(self, address: str, user_id: int):
+    async def _check_delegation_status(self, address: str, user_id: int, extended_info):
         """Check for delegation status changes"""
         try:
-            # Get address details
-            addr_details = await self.rate_limited_request(
-                self.blockfrost_client.address,
-                address
+            # Get delegation info
+            delegation = await self.rate_limited_request(
+                self.blockfrost_client.account_delegations,
+                extended_info.stake_address,
+                count=1,
+                page=1
             )
             
-            if addr_details and addr_details.stake_address:
-                # Get delegation info
-                delegation = await self.rate_limited_request(
-                    self.blockfrost_client.account_delegations,
-                    addr_details.stake_address,
-                    count=1,
-                    page=1
-                )
+            if delegation:
+                current_pool = delegation[0].pool_id
+                stored_pool = await get_delegation_status(address)
                 
-                if delegation:
-                    current_pool = delegation[0].pool_id
-                    stored_pool = await get_delegation_status(address)
+                if current_pool != stored_pool:
+                    await update_delegation_status(address, current_pool)
                     
-                    if current_pool != stored_pool:
-                        await update_delegation_status(address, current_pool)
+                    if await self.should_notify(int(user_id), "delegation_status"):
+                        pool_info = await self.rate_limited_request(
+                            self.blockfrost_client.pool,
+                            current_pool
+                        )
+                        pool_name = pool_info.metadata.name if pool_info.metadata else "Unknown Pool"
                         
-                        if await self.should_notify(int(user_id), "delegation_status"):
-                            pool_info = await self.rate_limited_request(
-                                self.blockfrost_client.pool,
-                                current_pool
-                            )
-                            pool_name = pool_info.metadata.name if pool_info.metadata else "Unknown Pool"
-                            
-                            await self.send_dm(
-                                int(user_id),
-                                f"🔄 **Delegation Status Changed**\n"
-                                f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                                f"New Pool: `{pool_name}`\n"
-                                f"Pool ID: `{current_pool}`"
-                            )
+                        await self.send_dm(
+                            int(user_id),
+                            f"🔄 **Delegation Status Changed**\n"
+                            f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                            f"New Pool: `{pool_name}`\n"
+                            f"Pool ID: `{current_pool}`"
+                        )
                             
         except Exception as e:
             logger.error(f"Error checking delegation status: {str(e)}")
             if hasattr(e, 'response') and hasattr(e.response, 'text'):
                 logger.error(f"Response details: {e.response.text}")
 
-    async def _check_dapp_interactions(self, address: str, user_id: int):
+    async def _check_dapp_interactions(self, address: str, user_id: int, current_txs):
         """Check for DApp interactions"""
         try:
-            # Get latest transactions
-            transactions = await self.rate_limited_request(
-                self.blockfrost_client.address_transactions,
-                address,
-                count=10
-            )
-            
             # Get last processed tx
             last_processed = await get_dapp_interactions(address)
             
-            for tx in transactions:
+            for tx in current_txs:
                 if last_processed and tx.hash == last_processed:
                     break
                     
@@ -1153,7 +1233,7 @@ class WalletBud(commands.Bot):
         """Add a wallet to monitor"""
         try:
             # Check if wallet is already being monitored
-            existing = await get_wallet(address)
+            existing = await get_wallet_for_user(str(interaction.user.id), address)
             if existing:
                 await interaction.response.send_message(
                     f"❌ Wallet `{address[:8]}...{address[-8:]}` is already being monitored.",
@@ -1192,8 +1272,8 @@ class WalletBud(commands.Bot):
         """Remove a wallet from monitoring"""
         try:
             # Check if wallet exists
-            wallet = await get_wallet(address)
-            if not wallet or wallet['user_id'] != str(interaction.user.id):
+            wallet = await get_wallet_for_user(str(interaction.user.id), address)
+            if not wallet:
                 await interaction.response.send_message("❌ Wallet not found!", ephemeral=True)
                 return
             
@@ -1235,7 +1315,7 @@ class WalletBud(commands.Bot):
             for i, address in enumerate(addresses, 1):
                 try:
                     # Get wallet details
-                    wallet = await get_wallet(address)
+                    wallet = await get_wallet_for_user(str(interaction.user.id), address)
                     if not wallet:
                         logger.error(f"No wallet found for address {address}")
                         continue
@@ -1355,7 +1435,7 @@ class WalletBud(commands.Bot):
                 # Test with a known address
                 test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
                 async with self.rate_limiter:
-                    await self.blockfrost_client.address(test_address)
+                    await asyncio.to_thread(self.blockfrost_client.address, test_address)
                 blockfrost_status = "✅ Connected"
             except Exception as e:
                 logger.error(f"Blockfrost health check failed: {str(e)}")
@@ -1419,7 +1499,7 @@ class WalletBud(commands.Bot):
             for i, address in enumerate(wallets, 1):
                 try:
                     # Get wallet details
-                    wallet = await get_wallet(address)
+                    wallet = await get_wallet_for_user(str(interaction.user.id), address)
                     if not wallet:
                         logger.error(f"No wallet found for address {address}")
                         continue
@@ -1427,7 +1507,10 @@ class WalletBud(commands.Bot):
                     wallet_id = wallet['id']
                     
                     # Get UTXOs for balance calculation
-                    utxos = await self.blockfrost_client.address_utxos(address)
+                    utxos = await self.rate_limited_request(
+                        self.blockfrost_client.address_utxos,
+                        address
+                    )
                     
                     if utxos:
                         # Calculate ADA balance
@@ -1446,7 +1529,10 @@ class WalletBud(commands.Bot):
                         )
                         
                         # Get transaction count
-                        tx_info = await self.blockfrost_client.address_total(address)
+                        tx_info = await self.rate_limited_request(
+                            self.blockfrost_client.address_total,
+                            address
+                        )
                         tx_count = tx_info.tx_count if tx_info else 0
                         
                         # Get warning count
