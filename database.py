@@ -29,17 +29,18 @@ async def get_pool():
     return _pool
 
 # Update schema version
-SCHEMA_VERSION = "1.1.0"
+SCHEMA_VERSION = "1.2.0"
 
 SCHEMA = """
--- Drop existing tables if they exist
-DROP TABLE IF EXISTS processed_rewards;
-DROP TABLE IF EXISTS notification_settings;
-DROP TABLE IF EXISTS yummi_warnings;
-DROP TABLE IF EXISTS wallets;
-DROP TABLE IF EXISTS users;
-DROP TABLE IF EXISTS policy_expiry;
-DROP TABLE IF EXISTS stake_addresses;
+-- Drop tables in correct order
+DROP TABLE IF EXISTS transactions CASCADE;
+DROP TABLE IF EXISTS processed_rewards CASCADE;
+DROP TABLE IF EXISTS notification_settings CASCADE;
+DROP TABLE IF EXISTS yummi_warnings CASCADE;
+DROP TABLE IF EXISTS stake_addresses CASCADE;
+DROP TABLE IF EXISTS policy_expiry CASCADE;
+DROP TABLE IF EXISTS wallets CASCADE;
+DROP TABLE IF EXISTS users CASCADE;
 
 -- Users table for storing Discord users
 CREATE TABLE IF NOT EXISTS users (
@@ -59,8 +60,12 @@ CREATE TABLE IF NOT EXISTS wallets (
     last_balance BIGINT,
     utxo_state JSONB,
     delegation_pool_id TEXT,
+    last_dapp_tx TEXT,
     UNIQUE(user_id, address)
 );
+
+-- Create index on address for faster lookups
+CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
 
 -- Stake addresses table for tracking stake addresses
 CREATE TABLE IF NOT EXISTS stake_addresses (
@@ -72,6 +77,9 @@ CREATE TABLE IF NOT EXISTS stake_addresses (
     UNIQUE(wallet_id, stake_address)
 );
 
+-- Create index on stake_address for faster lookups
+CREATE INDEX IF NOT EXISTS idx_stake_addresses_stake_address ON stake_addresses(stake_address);
+
 -- Notification settings table
 CREATE TABLE IF NOT EXISTS notification_settings (
     id SERIAL PRIMARY KEY,
@@ -82,6 +90,9 @@ CREATE TABLE IF NOT EXISTS notification_settings (
     UNIQUE(user_id, setting_key)
 );
 
+-- Create index on user_id and setting_key for faster lookups
+CREATE INDEX IF NOT EXISTS idx_notification_settings_user_setting ON notification_settings(user_id, setting_key);
+
 -- Processed rewards table
 CREATE TABLE IF NOT EXISTS processed_rewards (
     id SERIAL PRIMARY KEY,
@@ -91,6 +102,9 @@ CREATE TABLE IF NOT EXISTS processed_rewards (
     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(wallet_id, epoch)
 );
+
+-- Create index on wallet_id and epoch for faster lookups
+CREATE INDEX IF NOT EXISTS idx_processed_rewards_wallet_epoch ON processed_rewards(wallet_id, epoch);
 
 -- YUMMI warning table
 CREATE TABLE IF NOT EXISTS yummi_warnings (
@@ -109,30 +123,10 @@ CREATE TABLE IF NOT EXISTS policy_expiry (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Create index on expiry_slot for faster lookups
+CREATE INDEX IF NOT EXISTS idx_policy_expiry_expiry_slot ON policy_expiry(expiry_slot);
+
 -- Transactions table for storing transactions
-CREATE TABLE IF NOT EXISTS transactions (
-    id SERIAL PRIMARY KEY,
-    wallet_id INTEGER REFERENCES wallets(id) ON DELETE CASCADE,
-    tx_hash TEXT NOT NULL,
-    metadata JSONB,
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(wallet_id, tx_hash)
-);
-
--- Add last_dapp_tx column to wallets table if it doesn't exist
-DO $$ 
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 
-        FROM information_schema.columns 
-        WHERE table_name = 'wallets' 
-        AND column_name = 'last_dapp_tx'
-    ) THEN
-        ALTER TABLE wallets ADD COLUMN last_dapp_tx TEXT;
-    END IF;
-END $$;
-
--- Create transactions table if it doesn't exist
 CREATE TABLE IF NOT EXISTS transactions (
     id SERIAL PRIMARY KEY,
     wallet_id INTEGER REFERENCES wallets(id) ON DELETE CASCADE,
@@ -154,8 +148,45 @@ async def init_db():
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(SCHEMA)
-            logger.info("Database initialized successfully")
+            # Start transaction
+            async with conn.transaction():
+                # Check if tables exist
+                tables_exist = await conn.fetchval("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = 'public' 
+                        AND table_name = 'users'
+                    )
+                """)
+                
+                if not tables_exist:
+                    logger.info("Tables don't exist, creating schema...")
+                    await conn.execute(SCHEMA)
+                    logger.info("Database initialized successfully")
+                else:
+                    logger.info("Tables already exist, skipping initialization")
+                    
+                    # Verify all required tables exist
+                    required_tables = [
+                        'users', 'wallets', 'stake_addresses', 'notification_settings',
+                        'processed_rewards', 'yummi_warnings', 'policy_expiry', 'transactions'
+                    ]
+                    
+                    for table in required_tables:
+                        exists = await conn.fetchval(f"""
+                            SELECT EXISTS (
+                                SELECT FROM information_schema.tables 
+                                WHERE table_schema = 'public' 
+                                AND table_name = $1
+                            )
+                        """, table)
+                        
+                        if not exists:
+                            logger.error(f"Missing required table: {table}")
+                            raise Exception(f"Database schema is incomplete: missing {table} table")
+                    
+                    logger.info("All required tables verified")
+        
         return pool
     except Exception as e:
         logger.error(f"Failed to initialize database: {str(e)}")
@@ -174,25 +205,45 @@ async def add_wallet(user_id: str, address: str) -> bool:
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # First ensure user exists
-            await conn.execute(
-                """
-                INSERT INTO users (user_id)
-                VALUES ($1)
-                ON CONFLICT (user_id) DO NOTHING
-                """,
-                user_id
-            )
-            
-            # Then add wallet
-            await conn.execute(
-                """
-                INSERT INTO wallets (user_id, address)
-                VALUES ($1, $2)
-                """,
-                user_id, address
-            )
-            return True
+            # Start transaction
+            async with conn.transaction():
+                # First ensure user exists
+                await conn.execute(
+                    """
+                    INSERT INTO users (user_id)
+                    VALUES ($1)
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    user_id
+                )
+                
+                # Check if wallet already exists
+                exists = await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM wallets
+                        WHERE user_id = $1 AND address = $2
+                    )
+                    """,
+                    user_id, address
+                )
+                
+                if exists:
+                    logger.info(f"Wallet {address[:8]}...{address[-8:]} already exists for user {user_id}")
+                    return False
+                
+                # Add wallet
+                await conn.execute(
+                    """
+                    INSERT INTO wallets (user_id, address)
+                    VALUES ($1, $2)
+                    """,
+                    user_id, address
+                )
+                
+                logger.info(f"Added wallet {address[:8]}...{address[-8:]} for user {user_id}")
+                return True
+                
     except Exception as e:
         logger.error(f"Error adding wallet: {str(e)}")
         return False
@@ -399,15 +450,33 @@ async def add_transaction(wallet_id: int, tx_hash: str, metadata: dict = None) -
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            query = """
-                INSERT INTO transactions (wallet_id, tx_hash, metadata)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (wallet_id, tx_hash) DO UPDATE
-                SET metadata = EXCLUDED.metadata
-                RETURNING id
-            """
-            await conn.fetchval(query, wallet_id, tx_hash, json.dumps(metadata) if metadata else None)
-            return True
+            # Start transaction
+            async with conn.transaction():
+                # Add or update transaction
+                query = """
+                    INSERT INTO transactions (wallet_id, tx_hash, metadata)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (wallet_id, tx_hash) 
+                    DO UPDATE SET 
+                        metadata = EXCLUDED.metadata,
+                        timestamp = CURRENT_TIMESTAMP
+                    RETURNING id
+                """
+                
+                result = await conn.fetchval(
+                    query, 
+                    wallet_id, 
+                    tx_hash, 
+                    json.dumps(metadata) if metadata else None
+                )
+                
+                if result:
+                    logger.info(f"Added/updated transaction {tx_hash[:8]}... for wallet {wallet_id}")
+                    return True
+                else:
+                    logger.error(f"Failed to add transaction {tx_hash[:8]}... for wallet {wallet_id}")
+                    return False
+                    
     except Exception as e:
         logger.error(f"Error adding transaction: {str(e)}")
         return False
@@ -1317,6 +1386,36 @@ async def update_last_dapp_tx(address: str, tx_hash: str) -> bool:
     except Exception as e:
         logger.error(f"Error updating last DApp transaction: {str(e)}")
         return False
+
+async def initialize_notification_settings(user_id: str):
+    """Initialize default notification settings for a new user
+    
+    Args:
+        user_id (str): Discord user ID
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Default settings - all notifications enabled
+            default_settings = {
+                "balance_changes": True,
+                "token_changes": True,
+                "nft_changes": True,
+                "staking_rewards": True,
+                "dapp_interactions": True,
+                "policy_expiry": True
+            }
+            
+            for setting, enabled in default_settings.items():
+                query = """
+                    INSERT INTO notification_settings (user_id, setting_key, enabled)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (user_id, setting_key) DO NOTHING
+                """
+                await conn.execute(query, user_id, setting, enabled)
+                
+    except Exception as e:
+        logger.error(f"Error initializing notification settings: {str(e)}")
 
 async def main():
     """Example usage of database functions"""

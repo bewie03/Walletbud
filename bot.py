@@ -48,7 +48,8 @@ from database import (
     update_notification_setting,
     get_last_dapp_tx,
     update_last_dapp_tx,
-    add_transaction
+    add_transaction,
+    initialize_notification_settings
 )
 
 # Configure logging
@@ -214,10 +215,13 @@ class WalletBud(commands.Bot):
     }
 
     DAPP_IDENTIFIERS = {
+        # Common metadata fields
+        "metadata_fields": ["dapp", "platform", "protocol", "application"],
+        
         # DApp name -> List of identifiers in metadata
-        "SundaeSwap": ["sundae", "sundaeswap", "sundaeswap.io"],
-        "MuesliSwap": ["muesli", "muesliswap", "muesliswap.com"],
-        "MinSwap": ["min", "minswap", "minswap.org"],
+        "SundaeSwap": ["sundae", "sundaeswap", "sundaeswap.io", "swap.sundae"],
+        "MuesliSwap": ["muesli", "muesliswap", "muesliswap.com", "swap.muesli"],
+        "MinSwap": ["min", "minswap", "minswap.org", "swap.min"],
         "WingRiders": ["wing", "wingriders", "wingriders.com"],
         "VyFinance": ["vyfi", "vyfinance", "vyfi.io"],
         "Genius Yield": ["genius", "geniusyield", "geniusyield.co"],
@@ -228,6 +232,7 @@ class WalletBud(commands.Bot):
         "Ardana": ["ardana", "ardana.io"],
         "Optim Finance": ["optim", "optimfinance"],
         "Spectrum": ["spectrum", "spectrum.fi"],
+        "JPEG Store": ["jpeg", "jpgstore", "jpg.store"],
         "NFT/Token Contract": ["721", "20", "nft", "token"]  # NFT and Token standards
     }
 
@@ -241,10 +246,22 @@ class WalletBud(commands.Bot):
         
         # Initialize rate limiter
         self.rate_limiter = RateLimiter(
-            max_requests=MAX_REQUESTS_PER_SECOND,  # 10 requests per second
-            burst_limit=BURST_LIMIT,   # 500 requests burst
-            cooldown_seconds=RATE_LIMIT_COOLDOWN  # 1 second cooldown
+            max_requests=9,  # Slightly lower for safety
+            burst_limit=500,
+            cooldown_seconds=50
         )
+        logger.info(f"Initialized RateLimiter with: max_requests=9, burst_limit=500, cooldown_seconds=50")
+        
+        # Admin channel for error notifications
+        try:
+            self.admin_channel_id = os.getenv('ADMIN_CHANNEL_ID')
+            if self.admin_channel_id:
+                logger.info(f"Admin channel configured: {self.admin_channel_id}")
+            else:
+                logger.warning("No admin channel configured (ADMIN_CHANNEL_ID not set)")
+        except Exception as e:
+            logger.error(f"Error configuring admin channel: {str(e)}")
+            self.admin_channel_id = None
         
         # Initialize Blockfrost client
         self.blockfrost_client = None
@@ -253,6 +270,14 @@ class WalletBud(commands.Bot):
         self.monitoring_paused = False
         self.wallet_task_lock = asyncio.Lock()
         self.processing_wallets = False
+        
+        # Pre-compile DApp metadata patterns
+        self.dapp_patterns = {
+            name.lower(): [pattern.lower() for pattern in patterns]
+            for name, patterns in self.DAPP_IDENTIFIERS.items()
+            if name != "metadata_fields"
+        }
+        self.metadata_fields = [field.lower() for field in self.DAPP_IDENTIFIERS["metadata_fields"]]
         
     async def setup_hook(self):
         """Setup hook called before the bot starts"""
@@ -405,6 +430,74 @@ class WalletBud(commands.Bot):
             finally:
                 await self.rate_limiter.release()
 
+    async def _rate_limited_request(self, func, *args, **kwargs):
+        """Make a rate-limited request with retry logic
+        
+        Args:
+            func: The API function to call
+            *args: Positional arguments for the function
+            **kwargs: Keyword arguments for the function
+            
+        Returns:
+            The API response
+            
+        Raises:
+            Exception if all retries fail
+        """
+        retry_count = 0
+        max_retries = 3
+        rate_limit_hits = 0
+        
+        while retry_count < max_retries:
+            try:
+                return await self.rate_limited_request(func, *args, **kwargs)
+            except Exception as e:
+                retry_count += 1
+                rate_limit_hit = "rate limit" in str(e).lower()
+                
+                if rate_limit_hit:
+                    rate_limit_hits += 1
+                    if rate_limit_hits >= 3:
+                        await self.send_admin_alert(
+                            f"⚠️ Frequent rate limits hit for {func.__name__}\n"
+                            f"Consider adjusting rate limiter settings."
+                        )
+                
+                if retry_count == max_retries:
+                    if isinstance(e, Exception) and "rate limit" not in str(e).lower():
+                        await self.send_admin_alert(
+                            f"❌ API request failed after {max_retries} retries:\n"
+                            f"Function: {func.__name__}\n"
+                            f"Error: {str(e)}"
+                        )
+                    raise e
+                    
+                # Exponential backoff
+                wait_time = 2 ** retry_count
+                logger.warning(f"API request failed, retrying in {wait_time}s: {str(e)}")
+                await asyncio.sleep(wait_time)
+
+    async def send_admin_alert(self, message: str, is_error: bool = True):
+        """Send alert to admin channel
+        
+        Args:
+            message (str): Alert message
+            is_error (bool, optional): Whether this is an error alert. Defaults to True.
+        """
+        if not self.admin_channel_id:
+            logger.warning("No admin channel configured for alerts")
+            return
+            
+        try:
+            channel = self.get_channel(int(self.admin_channel_id))
+            if channel:
+                emoji = "🚨" if is_error else "ℹ️"
+                await channel.send(f"{emoji} **Alert**: {message}")
+            else:
+                logger.error(f"Could not find admin channel: {self.admin_channel_id}")
+        except Exception as e:
+            logger.error(f"Failed to send admin alert: {str(e)}")
+
     async def check_yummi_requirement(self, address: str):
         """Check if wallet meets YUMMI token requirement
         
@@ -416,7 +509,7 @@ class WalletBud(commands.Bot):
         """
         try:
             # First try getting UTXOs
-            utxos = await self.rate_limited_request(
+            utxos = await self._rate_limited_request(
                 self.blockfrost_client.address_utxos,
                 address
             )
@@ -434,7 +527,7 @@ class WalletBud(commands.Bot):
             # If UTXOs show 0, try getting address assets directly
             if yummi_amount == 0:
                 logger.info("UTXOs showed 0 balance, checking address assets directly...")
-                assets = await self.rate_limited_request(
+                assets = await self._rate_limited_request(
                     self.blockfrost_client.address_assets,
                     address
                 )
@@ -564,7 +657,7 @@ class WalletBud(commands.Bot):
                 # Get current balances
                 try:
                     # Get UTXOs for balance calculation
-                    utxos = await self.rate_limited_request(
+                    utxos = await self._rate_limited_request(
                         self.blockfrost_client.address_utxos,
                         address
                     )
@@ -649,7 +742,7 @@ class WalletBud(commands.Bot):
         """Check for expiring token policies"""
         try:
             # Get all tokens in wallet
-            assets = await self.rate_limited_request(
+            assets = await self._rate_limited_request(
                 self.blockfrost_client.address_assets,
                 address
             )
@@ -659,7 +752,7 @@ class WalletBud(commands.Bot):
                 
                 # Get policy script
                 try:
-                    policy = await self.rate_limited_request(
+                    policy = await self._rate_limited_request(
                         self.blockfrost_client.script,
                         policy_id
                     )
@@ -672,7 +765,7 @@ class WalletBud(commands.Bot):
                             await update_policy_expiry(policy_id, expiry_slot)
                             
                             # Get current slot
-                            tip = await self.rate_limited_request(
+                            tip = await self._rate_limited_request(
                                 self.blockfrost_client.block_latest
                             )
                             current_slot = tip.slot
@@ -698,14 +791,14 @@ class WalletBud(commands.Bot):
         """Check for delegation status changes"""
         try:
             # Get stake address
-            addr_details = await self.rate_limited_request(
+            addr_details = await self._rate_limited_request(
                 self.blockfrost_client.address_details,
                 address
             )
             
             if addr_details and addr_details.stake_address:
                 # Get delegation info
-                delegation = await self.rate_limited_request(
+                delegation = await self._rate_limited_request(
                     self.blockfrost_client.account_delegation_history,
                     addr_details.stake_address,
                     count=1,
@@ -720,7 +813,7 @@ class WalletBud(commands.Bot):
                         await update_delegation_status(address, current_pool)
                         
                         if await self.should_notify(int(user.id), "delegation"):
-                            pool_info = await self.rate_limited_request(
+                            pool_info = await self._rate_limited_request(
                                 self.blockfrost_client.pool,
                                 current_pool
                             )
@@ -743,7 +836,7 @@ class WalletBud(commands.Bot):
             last_tx = await get_last_dapp_tx(address)
             
             # Get recent transactions
-            txs = await self.rate_limited_request(
+            txs = await self._rate_limited_request(
                 self.blockfrost_client.address_transactions,
                 address,
                 params={'order': 'desc', 'count': 20}
@@ -754,26 +847,49 @@ class WalletBud(commands.Bot):
                 if last_tx and tx.tx_hash == last_tx:
                     break
                     
-                # Get transaction details
-                tx_details = await self.rate_limited_request(
-                    self.blockfrost_client.transaction_metadata,
-                    tx.tx_hash
-                )
+                # Get transaction details with retry
+                tx_details = None
+                retry_count = 0
+                while retry_count < 3:
+                    try:
+                        tx_details = await self._rate_limited_request(
+                            self.blockfrost_client.transaction_metadata,
+                            tx.tx_hash
+                        )
+                        break
+                    except Exception as e:
+                        retry_count += 1
+                        await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+                
+                if not tx_details:
+                    logger.error(f"Failed to get transaction details after retries: {tx.tx_hash}")
+                    continue
                 
                 # Check for contract interactions (metadata with known DApp identifiers)
                 if tx_details.metadata:
                     # Convert metadata to string for easier searching
                     metadata_str = str(tx_details.metadata).lower()
                     
-                    for dapp_name, identifiers in self.DAPP_IDENTIFIERS.items():
-                        if any(id.lower() in metadata_str for id in identifiers):
+                    # First check common metadata fields
+                    found_fields = []
+                    for field in self.metadata_fields:
+                        if field in metadata_str:
+                            found_fields.append(field)
+                            logger.info(f"Found DApp metadata field: {field} in tx {tx.tx_hash}")
+                    
+                    # Then check specific DApp identifiers
+                    for dapp_name, patterns in self.dapp_patterns.items():
+                        if any(pattern in metadata_str for pattern in patterns):
                             # Store transaction metadata
                             wallet_id = await get_wallet_id(str(user.id), address)
                             if wallet_id:
+                                # Store with found metadata fields
+                                metadata = tx_details.metadata.copy()
+                                metadata['detected_fields'] = found_fields
                                 await add_transaction(
                                     wallet_id=wallet_id,
                                     tx_hash=tx.tx_hash,
-                                    metadata=tx_details.metadata
+                                    metadata=metadata
                                 )
                             
                             # Send notification if enabled
@@ -791,6 +907,9 @@ class WalletBud(commands.Bot):
                 
         except Exception as e:
             logger.error(f"Error checking DApp interactions: {str(e)}")
+            await self.send_admin_alert(
+                f"Error checking DApp interactions for wallet {address[:8]}...{address[-8:]}: {str(e)}"
+            )
 
     async def should_notify(self, user_id: int, notification_type: str):
         """Check if we should send a notification to the user
@@ -961,66 +1080,22 @@ class WalletBud(commands.Bot):
             if not address.startswith('addr1'):
                 await interaction.response.send_message("❌ Invalid wallet address! Address must start with 'addr1'", ephemeral=True)
                 return
-
-            # Check if wallet is already being monitored
-            existing_wallet = await get_wallet(str(interaction.user.id), address)
-            if existing_wallet:
-                await interaction.response.send_message("❌ This wallet is already being monitored!", ephemeral=True)
-                return
-
-            # Check YUMMI token requirement
-            try:
-                # Get UTXOs
-                utxos = await self.rate_limited_request(
-                    self.blockfrost_client.address_utxos,
-                    address
-                )
                 
-                # Calculate YUMMI balance
-                logger.info(f"Checking YUMMI balance for address {address}")
-                logger.info(f"YUMMI Token ID: {YUMMI_TOKEN_ID}")
-                yummi_amount = sum(
-                    int(amount.quantity)
-                    for utxo in utxos
-                    for amount in utxo.amount
-                    if amount.unit.lower() == YUMMI_TOKEN_ID.lower()  # Case-insensitive comparison
-                )
-                logger.info(f"Found YUMMI amount: {yummi_amount}")
-
-                if yummi_amount < YUMMI_REQUIREMENT:
-                    await interaction.response.send_message(
-                        f"❌ Wallet must hold at least {YUMMI_REQUIREMENT:,} YUMMI tokens!\n"
-                        f"Current balance: `{yummi_amount:,} YUMMI`", 
-                        ephemeral=True
-                    )
-                    return
-
-            except Exception as e:
-                logger.error(f"Error checking YUMMI balance: {str(e)}")
-                await interaction.response.send_message("❌ Error checking YUMMI balance. Please try again later.", ephemeral=True)
-                return
-
             # Add wallet to database
             if await add_wallet(str(interaction.user.id), address):
-                # Initialize warning count to 0 since they meet the requirement
-                wallet_id = await get_wallet_id(str(interaction.user.id), address)
-                if wallet_id:
-                    await reset_yummi_warning(wallet_id)
-                    
-                await interaction.response.send_message(
-                    f"✅ Now monitoring wallet: `{address[:8]}...{address[-8:]}`\n"
-                    f"Current YUMMI balance: `{yummi_amount:,}`\n"
-                    f"Required YUMMI: `{YUMMI_REQUIREMENT:,}`\n"
-                    f"Status: ✅ Meets requirement",
-                    ephemeral=True
-                )
-                logger.info(f"Added wallet {address} for user {interaction.user.id}")
+                # Initialize notification settings for new user
+                await initialize_notification_settings(str(interaction.user.id))
+                
+                await interaction.response.send_message(f"✅ Added wallet `{address[:8]}...{address[-8:]}` to tracking", ephemeral=True)
+                
+                # Start monitoring immediately
+                asyncio.create_task(self._monitor_wallet(address, interaction.user))
             else:
-                await interaction.response.send_message("❌ Failed to add wallet. Please try again.", ephemeral=True)
-            
+                await interaction.response.send_message("❌ Failed to add wallet or wallet already exists", ephemeral=True)
+                
         except Exception as e:
             logger.error(f"Error adding wallet: {str(e)}")
-            await interaction.response.send_message("❌ An error occurred. Please try again later.", ephemeral=True)
+            await interaction.response.send_message("❌ An error occurred while adding the wallet", ephemeral=True)
 
     async def _remove_wallet(self, interaction: discord.Interaction, address: str):
         """Remove a wallet from monitoring"""
@@ -1045,7 +1120,7 @@ class WalletBud(commands.Bot):
             
         except Exception as e:
             logger.error(f"Error removing wallet: {str(e)}")
-            await interaction.response.send_message("❌ An error occurred while removing the wallet.", ephemeral=True)
+            await interaction.response.send_message("❌ An error occurred while removing the wallet", ephemeral=True)
 
     async def _list_wallets(self, interaction: discord.Interaction):
         """List all registered wallets"""
@@ -1067,7 +1142,7 @@ class WalletBud(commands.Bot):
             for i, address in enumerate(addresses, 1):
                 try:
                     # Get wallet info
-                    utxos = await self.rate_limited_request(
+                    utxos = await self._rate_limited_request(
                         self.blockfrost_client.address_utxos,
                         address
                     )
@@ -1089,7 +1164,7 @@ class WalletBud(commands.Bot):
                         )
                         
                         # Get transaction count
-                        tx_info = await self.rate_limited_request(
+                        tx_info = await self._rate_limited_request(
                             self.blockfrost_client.address_total,
                             address
                         )
@@ -1215,7 +1290,7 @@ class WalletBud(commands.Bot):
             try:
                 # Test with a known address
                 test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
-                await self.rate_limited_request(
+                await self._rate_limited_request(
                     self.blockfrost_client.address,
                     test_address
                 )
@@ -1280,7 +1355,7 @@ class WalletBud(commands.Bot):
             for address in addresses:
                 try:
                     # Get current UTXOs
-                    utxos = await self.rate_limited_request(
+                    utxos = await self._rate_limited_request(
                         self.blockfrost_client.address_utxos,
                         address
                     )
