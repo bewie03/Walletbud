@@ -49,12 +49,12 @@ BLOCKFROST_BASE_URL = "https://cardano-mainnet.blockfrost.io/api/v0"
 # YUMMI Token Configuration
 try:
     YUMMI_POLICY_ID = validate_hex(
-        os.getenv('YUMMI_POLICY_ID', "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6"),
+        os.getenv('YUMMI_POLICY_ID', "078eafce5cd7edafdf63900edef2c1ea759e77f30ca81d6bbdeec924"),
         56,  # Cardano policy IDs are 56 characters
         "YUMMI_POLICY_ID"
     )
     YUMMI_ASSET_NAME = validate_hex(
-        os.getenv('YUMMI_ASSET_NAME', "4d494d4d49"),  # hex for "YUMMI"
+        os.getenv('YUMMI_ASSET_NAME', "59554D4D49"),  # hex for "YUMMI"
         10,  # "YUMMI" in hex is 10 characters
         "YUMMI_ASSET_NAME"
     )

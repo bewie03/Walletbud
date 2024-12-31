@@ -13,7 +13,7 @@ A Discord bot for monitoring Cardano wallets and YUMMI token transactions.
 
 ## Commands
 
-- `/addwallet` - Add a Cardano wallet (DM only, requires 20,000 YUMMI tokens)
+- `/addwallet` - Add a Cardano wallet (DM only, requires 25,000 YUMMI tokens)
 - `/removewallet` - Remove a wallet from tracking
 - `/listwallets` - View your registered wallets
 - `/health` - Check bot's health status
@@ -34,6 +34,7 @@ Create a `.env` file with:
 DISCORD_TOKEN=your_discord_bot_token
 BLOCKFROST_API_KEY=your_blockfrost_api_key
 YUMMI_POLICY_ID=078eafce5cd7edafdf63900edef2c1ea759e77f30ca81d6bbdeec924
+YUMMI_ASSET_NAME=59554D4D49  # hex-encoded "YUMMI"
 ```
 
 ## Configuration
@@ -42,8 +43,9 @@ The bot can be configured using environment variables:
 
 - `DISCORD_TOKEN`: Your Discord bot token
 - `BLOCKFROST_API_KEY`: Your Blockfrost API key
-- `YUMMI_POLICY_ID`: The policy ID for YUMMI tokens
-- `REQUIRED_BUD_TOKENS`: Number of YUMMI tokens required (default: 20,000)
+- `YUMMI_POLICY_ID`: The policy ID for YUMMI tokens (078eafce5cd7edafdf63900edef2c1ea759e77f30ca81d6bbdeec924)
+- `YUMMI_ASSET_NAME`: The hex-encoded asset name (59554D4D49)
+- `REQUIRED_YUMMI_TOKENS`: Number of YUMMI tokens required (default: 25,000)
 - `TRANSACTION_CHECK_INTERVAL`: Minutes between wallet checks (default: 5)
 - `YUMMI_CHECK_INTERVAL`: Hours between YUMMI balance checks (default: 6)
 - `MAX_TX_HISTORY`: Maximum number of transactions to check per wallet (default: 10)
