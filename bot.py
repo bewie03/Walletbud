@@ -39,7 +39,8 @@ from database import (
     get_new_tokens,
     get_removed_nfts,
     check_ada_balance,
-    get_all_wallets_for_user
+    get_all_wallets_for_user,
+    get_wallet_id
 )
 
 # Configure logging
@@ -321,12 +322,10 @@ class WalletBud(commands.Bot):
                     return
 
                 # Get wallet ID
-                wallet = await get_wallet(str(user_id), address)
-                if not wallet:
-                    logger.error(f"Could not find wallet {address} for user {user_id}")
+                wallet_id = await get_wallet_id(str(user_id), address)
+                if not wallet_id:
+                    logger.error(f"Could not find wallet ID for {address}")
                     return
-                    
-                wallet_id = wallet['wallet_id']
 
                 # Update last checked timestamp
                 await update_last_checked(wallet_id)
@@ -844,19 +843,22 @@ class WalletBud(commands.Bot):
     async def _remove_wallet(self, interaction: discord.Interaction, address: str):
         """Remove a wallet from monitoring"""
         try:
-            # Check if wallet is registered
-            if not await get_wallet(address):
-                await interaction.response.send_message("❌ Wallet not registered!", ephemeral=True)
+            # Check if wallet exists
+            wallet = await get_wallet(str(interaction.user.id), address)
+            if not wallet:
+                await interaction.response.send_message("❌ Wallet not found!", ephemeral=True)
                 return
             
-            # Remove wallet from database
-            await remove_wallet(address)
-            
-            await interaction.response.send_message("✅ Wallet removed successfully!", ephemeral=True)
+            # Remove wallet
+            success = await remove_wallet(str(interaction.user.id), address)
+            if success:
+                await interaction.response.send_message("✅ Wallet removed successfully!", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ Failed to remove wallet.", ephemeral=True)
             
         except Exception as e:
             logger.error(f"Error removing wallet: {str(e)}")
-            await interaction.response.send_message("❌ An error occurred while removing your wallet.", ephemeral=True)
+            await interaction.response.send_message("❌ An error occurred while removing the wallet.", ephemeral=True)
 
     async def _list_wallets(self, interaction: discord.Interaction):
         """List all registered wallets"""
@@ -970,20 +972,32 @@ class WalletBud(commands.Bot):
             # Get balance for each wallet
             for address in addresses:
                 try:
-                    balance_info = await self.rate_limited_request(
-                        self.blockfrost_client.address_total,
+                    # Get current UTXOs
+                    utxos = await self.rate_limited_request(
+                        self.blockfrost_client.address_utxos,
                         address
                     )
                     
-                    if balance_info:
-                        # Calculate ADA balance
-                        ada_balance = int(balance_info.received_sum[0].quantity) / 1_000_000
+                    if utxos:
+                        # Calculate ADA balance from UTXOs
+                        ada_balance = sum(
+                            int(utxo.amount[0].quantity) / 1_000_000 
+                            for utxo in utxos 
+                            if utxo.amount and utxo.amount[0].unit == 'lovelace'
+                        )
                         total_ada += ada_balance
+                        
+                        # Get transaction count
+                        tx_info = await self.rate_limited_request(
+                            self.blockfrost_client.address_total,
+                            address
+                        )
+                        tx_count = tx_info.tx_count if tx_info else 0
                         
                         # Add wallet info
                         embed.add_field(
                             name=f"Wallet `{address[:20]}...`",
-                            value=f"Balance: `{ada_balance:,.6f} ADA`\nTransactions: `{balance_info.tx_count}`",
+                            value=f"Balance: `{ada_balance:,.6f} ADA`\nTransactions: `{tx_count}`",
                             inline=False
                         )
                         
