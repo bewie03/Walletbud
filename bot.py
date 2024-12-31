@@ -456,7 +456,7 @@ class WalletBud(commands.Bot):
         """
         try:
             # First check UTXOs
-            utxos = await self._rate_limited_request(
+            utxos = await self.rate_limited_request(
                 self.blockfrost_client.address_utxos,
                 address
             )
@@ -472,7 +472,7 @@ class WalletBud(commands.Bot):
             # If UTXOs show 0, try getting address details directly
             if yummi_amount == 0:
                 logger.info(f"UTXOs showed 0 balance for {address}, checking address details...")
-                details = await self._rate_limited_request(
+                details = await self.rate_limited_request(
                     self.blockfrost_client.address_details,
                     address
                 )
@@ -577,7 +577,7 @@ class WalletBud(commands.Bot):
                     await update_stake_address(address, stake_address)
 
                 # Get current UTxO state
-                current_utxos = await self._rate_limited_request(
+                current_utxos = await self.rate_limited_request(
                     self.blockfrost_client.address_utxos,
                     address
                 )
@@ -672,7 +672,7 @@ class WalletBud(commands.Bot):
                             
                             # Check for staking rewards
                             if not await is_reward_processed(tx.hash):
-                                rewards = await self._rate_limited_request(
+                                rewards = await self.rate_limited_request(
                                     self.blockfrost_client.transaction_stake_addresses,
                                     tx.hash
                                 )
@@ -718,7 +718,7 @@ class WalletBud(commands.Bot):
         """Check for expiring token policies"""
         try:
             # Get all tokens in wallet
-            assets = await self._rate_limited_request(
+            assets = await self.rate_limited_request(
                 self.blockfrost_client.address_assets,
                 address
             )
@@ -727,7 +727,7 @@ class WalletBud(commands.Bot):
                 policy_id = asset.unit[:56]  # First 56 chars are policy ID
                 
                 # Get policy expiry info from Blockfrost
-                policy = await self._rate_limited_request(
+                policy = await self.rate_limited_request(
                     self.blockfrost_client.policy,
                     policy_id
                 )
@@ -761,14 +761,14 @@ class WalletBud(commands.Bot):
         """Check for delegation status changes"""
         try:
             # Get stake address
-            addr_details = await self._rate_limited_request(
+            addr_details = await self.rate_limited_request(
                 self.blockfrost_client.address_details,
                 address
             )
             
             if addr_details and addr_details.stake_address:
                 # Get delegation info
-                delegation = await self._rate_limited_request(
+                delegation = await self.rate_limited_request(
                     self.blockfrost_client.account_delegation_history,
                     addr_details.stake_address,
                     count=1,
@@ -783,7 +783,7 @@ class WalletBud(commands.Bot):
                         await update_delegation_status(address, current_pool)
                         
                         if await self.should_notify(int(user_id), "delegation_status"):
-                            pool_info = await self._rate_limited_request(
+                            pool_info = await self.rate_limited_request(
                                 self.blockfrost_client.pool,
                                 current_pool
                             )
@@ -804,7 +804,7 @@ class WalletBud(commands.Bot):
         """Check for DApp interactions"""
         try:
             # Get latest transactions
-            transactions = await self._rate_limited_request(
+            transactions = await self.rate_limited_request(
                 self.blockfrost_client.address_transactions,
                 address,
                 count=10
@@ -818,7 +818,7 @@ class WalletBud(commands.Bot):
                     break
                     
                 # Check transaction metadata
-                metadata = await self._rate_limited_request(
+                metadata = await self.rate_limited_request(
                     self.blockfrost_client.transaction_metadata,
                     tx.hash
                 )
@@ -1296,7 +1296,7 @@ class WalletBud(commands.Bot):
             try:
                 # Test with a known address
                 test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
-                await self._rate_limited_request(
+                await self.rate_limited_request(
                     self.blockfrost_client.address,
                     test_address
                 )
@@ -1371,7 +1371,7 @@ class WalletBud(commands.Bot):
                     wallet_id = wallet['id']
                     
                     # Get UTXOs for balance calculation
-                    utxos = await self._rate_limited_request(
+                    utxos = await self.rate_limited_request(
                         self.blockfrost_client.address_utxos,
                         address
                     )
@@ -1393,7 +1393,7 @@ class WalletBud(commands.Bot):
                         )
                         
                         # Get transaction count
-                        tx_info = await self._rate_limited_request(
+                        tx_info = await self.rate_limited_request(
                             self.blockfrost_client.address_total,
                             address
                         )
