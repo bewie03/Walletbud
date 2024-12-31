@@ -233,6 +233,28 @@ async def get_all_wallets():
         logger.error(f"Error getting all wallets: {str(e)}")
         return []
 
+async def get_all_wallets_for_user(user_id: str):
+    """Get all wallets for a user
+    
+    Args:
+        user_id (str): Discord user ID
+        
+    Returns:
+        list: List of wallet addresses
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                'SELECT address FROM wallets WHERE user_id = $1',
+                user_id
+            )
+            return [row['address'] for row in rows] if rows else []
+            
+    except Exception as e:
+        logger.error(f"Error getting wallets for user: {str(e)}")
+        return []
+
 async def update_last_checked(wallet_id: int, timestamp: datetime = None):
     """Update last checked timestamp for a wallet
     

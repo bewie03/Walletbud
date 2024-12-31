@@ -38,7 +38,8 @@ from database import (
     get_recent_transactions,
     get_new_tokens,
     get_removed_nfts,
-    check_ada_balance
+    check_ada_balance,
+    get_all_wallets_for_user
 )
 
 # Configure logging
@@ -951,51 +952,58 @@ class WalletBud(commands.Bot):
     async def _balance(self, interaction: discord.Interaction):
         """Get your wallet's current balance"""
         try:
-            # Get user's wallet
-            address = await get_wallet_for_user(interaction.user.id)
-            if not address:
-                await interaction.response.send_message("❌ You don't have a registered wallet! Use `/addwallet` first.", ephemeral=True)
+            # Get all user's wallets
+            addresses = await get_all_wallets_for_user(str(interaction.user.id))
+            if not addresses:
+                await interaction.response.send_message("❌ You don't have any registered wallets! Use `/addwallet` first.", ephemeral=True)
                 return
-                        
-            # Get current balance
-            ada_balance, token_balances = await get_wallet_balance(address)
             
             # Create embed
             embed = discord.Embed(
-                title="💰 Wallet Balance",
-                description=f"Current balance for wallet `{address}`",
-                color=discord.Color.blue()
+                title="💰 Wallet Balances",
+                description="Your current wallet balances:",
+                color=discord.Color.green()
             )
             
-            # Add ADA balance
+            total_ada = 0
+            
+            # Get balance for each wallet
+            for address in addresses:
+                try:
+                    balance_info = await self.rate_limited_request(
+                        self.blockfrost_client.address_total,
+                        address
+                    )
+                    
+                    if balance_info:
+                        # Calculate ADA balance
+                        ada_balance = int(balance_info.received_sum[0].quantity) / 1_000_000
+                        total_ada += ada_balance
+                        
+                        # Add wallet info
+                        embed.add_field(
+                            name=f"Wallet `{address[:20]}...`",
+                            value=f"Balance: `{ada_balance:,.6f} ADA`\nTransactions: `{balance_info.tx_count}`",
+                            inline=False
+                        )
+                        
+                except Exception as e:
+                    logger.error(f"Error getting balance for {address}: {str(e)}")
+                    embed.add_field(
+                        name=f"Wallet `{address[:20]}...`",
+                        value="❌ Failed to get balance",
+                        inline=False
+                    )
+            
+            # Add total balance
             embed.add_field(
-                name="ADA Balance",
-                value=f"`{ada_balance / 1_000_000:,.6f} ADA`",
+                name="Total ADA Balance",
+                value=f"`{total_ada:,.6f} ADA`",
                 inline=False
             )
             
-            # Add token balances
-            if token_balances:
-                token_list = []
-                for policy_id, amount in token_balances.items():
-                    try:
-                        asset_details = await self.rate_limited_request(
-                            self.blockfrost_client.asset,
-                            policy_id
-                        )
-                        name = asset_details.onchain_metadata.get('name', 'Unknown Token')
-                        token_list.append(f"{name}: `{amount:,}`")
-                    except Exception:
-                        token_list.append(f"Policy {policy_id[:8]}...{policy_id[-8:]}: `{amount:,}`")
-                
-                embed.add_field(
-                    name="Token Balances",
-                    value="\n".join(token_list) if token_list else "No tokens",
-                    inline=False
-                )
-            
             await interaction.response.send_message(embed=embed, ephemeral=True)
-                    
+            
         except Exception as e:
             logger.error(f"Error getting balance: {str(e)}")
             await interaction.response.send_message("❌ An error occurred while getting your balance.", ephemeral=True)
