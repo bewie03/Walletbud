@@ -29,6 +29,7 @@ from database import (
     add_wallet,
     remove_wallet,
     get_user_id_for_wallet,
+    get_wallet_for_user,
     get_all_wallets_for_user,
     get_last_yummi_check,
     update_last_yummi_check,
@@ -604,12 +605,13 @@ class WalletBud(commands.Bot):
         """Check a single wallet's balance and transactions"""
         try:
             async with self.wallet_task_lock:
-                # Get wallet details including user
+                # Get user ID for the wallet
                 user_id = await get_user_id_for_wallet(address)
                 if not user_id:
                     logger.error(f"No user found for wallet {address}")
                     return
-                
+                    
+                # Get wallet details
                 wallet = await get_wallet_for_user(user_id, address)
                 if not wallet:
                     logger.error(f"No wallet found for user {user_id} and address {address}")
