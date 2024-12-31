@@ -32,6 +32,9 @@ CREATE_TABLES_SQL = """
 DROP TABLE IF EXISTS transactions;
 DROP TABLE IF EXISTS wallets;
 DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS wallet_states;
+DROP TABLE IF EXISTS processed_rewards;
+DROP TABLE IF EXISTS stake_addresses;
 
 -- Users table
 CREATE TABLE IF NOT EXISTS users (
@@ -49,6 +52,13 @@ CREATE TABLE IF NOT EXISTS wallets (
     UNIQUE(user_id, address)
 );
 
+-- Wallet states table
+CREATE TABLE IF NOT EXISTS wallet_states (
+    address TEXT PRIMARY KEY,
+    utxo_state TEXT NOT NULL,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Transactions table
 CREATE TABLE IF NOT EXISTS transactions (
     tx_id SERIAL PRIMARY KEY,
@@ -56,6 +66,20 @@ CREATE TABLE IF NOT EXISTS transactions (
     tx_hash TEXT NOT NULL,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(wallet_id, tx_hash)
+);
+
+-- Processed rewards table
+CREATE TABLE IF NOT EXISTS processed_rewards (
+    address TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    PRIMARY KEY (address, epoch)
+);
+
+-- Stake addresses table
+CREATE TABLE IF NOT EXISTS stake_addresses (
+    address TEXT PRIMARY KEY,
+    stake_address TEXT NOT NULL,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 
@@ -179,6 +203,172 @@ async def add_transaction(wallet_id: int, tx_hash: str, timestamp: datetime = No
             
     except Exception as e:
         logger.error(f"Error adding transaction: {str(e)}")
+        return False
+
+async def get_user_id_for_wallet(address: str) -> str:
+    """Get the user ID associated with a wallet address
+    
+    Args:
+        address (str): The wallet address to look up
+        
+    Returns:
+        str: The user ID if found, None otherwise
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval(
+                'SELECT user_id FROM wallets WHERE address = $1',
+                address
+            )
+            return result
+            
+    except Exception as e:
+        logger.error(f"Error getting user ID for wallet: {str(e)}")
+        return None
+
+async def store_utxo_state(address: str, utxo_state: str) -> bool:
+    """Store the current UTXO state for a wallet
+    
+    Args:
+        address (str): The wallet address
+        utxo_state (str): JSON string of current UTXOs
+        
+    Returns:
+        bool: True if successful
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                '''
+                INSERT INTO wallet_states (address, utxo_state)
+                VALUES ($1, $2)
+                ON CONFLICT (address) DO UPDATE
+                SET utxo_state = $2, last_updated = NOW()
+                ''',
+                address, utxo_state
+            )
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error storing UTXO state: {str(e)}")
+        return False
+
+async def get_utxo_state(address: str) -> str:
+    """Get the last stored UTXO state for a wallet
+    
+    Args:
+        address (str): The wallet address
+        
+    Returns:
+        str: JSON string of stored UTXOs, or None if not found
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                'SELECT utxo_state FROM wallet_states WHERE address = $1',
+                address
+            )
+            
+    except Exception as e:
+        logger.error(f"Error getting UTXO state: {str(e)}")
+        return None
+
+async def is_reward_processed(address: str, epoch: int) -> bool:
+    """Check if a staking reward has been processed
+    
+    Args:
+        address (str): The wallet address
+        epoch (int): The epoch number
+        
+    Returns:
+        bool: True if reward was already processed
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval(
+                'SELECT EXISTS(SELECT 1 FROM processed_rewards WHERE address = $1 AND epoch = $2)',
+                address, epoch
+            )
+            return result
+            
+    except Exception as e:
+        logger.error(f"Error checking processed reward: {str(e)}")
+        return False
+
+async def add_processed_reward(address: str, epoch: int) -> bool:
+    """Mark a staking reward as processed
+    
+    Args:
+        address (str): The wallet address
+        epoch (int): The epoch number
+        
+    Returns:
+        bool: True if successful
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                'INSERT INTO processed_rewards (address, epoch) VALUES ($1, $2)',
+                address, epoch
+            )
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error adding processed reward: {str(e)}")
+        return False
+
+async def get_stake_address(address: str) -> str:
+    """Get the stored stake address for a wallet
+    
+    Args:
+        address (str): The wallet address
+        
+    Returns:
+        str: The stake address if found, None otherwise
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                'SELECT stake_address FROM stake_addresses WHERE address = $1',
+                address
+            )
+            
+    except Exception as e:
+        logger.error(f"Error getting stake address: {str(e)}")
+        return None
+
+async def update_stake_address(address: str, stake_address: str) -> bool:
+    """Update the stake address for a wallet
+    
+    Args:
+        address (str): The wallet address
+        stake_address (str): The new stake address
+        
+    Returns:
+        bool: True if successful
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                '''
+                INSERT INTO stake_addresses (address, stake_address)
+                VALUES ($1, $2)
+                ON CONFLICT (address) DO UPDATE
+                SET stake_address = $2, last_updated = NOW()
+                ''',
+                address, stake_address
+            )
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error updating stake address: {str(e)}")
         return False
 
 async def main():
