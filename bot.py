@@ -34,7 +34,11 @@ from database import (
     get_wallet_for_user,
     get_wallet_balance,
     is_token_change_processed,
-    add_processed_token_change
+    add_processed_token_change,
+    get_recent_transactions,
+    get_new_tokens,
+    get_removed_nfts,
+    check_ada_balance
 )
 
 # Configure logging
@@ -1234,6 +1238,9 @@ if __name__ == "__main__":
         # Constants
         REQUIRED_YUMMI_TOKENS = 25000
         WALLET_CHECK_INTERVAL = 60  # seconds
+        MAX_TX_PER_HOUR = 10
+        MIN_ADA_BALANCE = 2  # ADA
+        YUMMI_POLICY_ID = "f9f5af5a6c9df7c7f9c2f86c5e1f2a7c"
         
         # Create bot instance
         bot = WalletBud()
