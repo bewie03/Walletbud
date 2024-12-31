@@ -304,17 +304,26 @@ class WalletBud(commands.Bot):
             if not await self.init_blockfrost():
                 logger.error("Failed to initialize Blockfrost client")
                 return
-                
-            # Start wallet monitoring task
-            self.check_wallets.start()
-            logger.info("Started wallet monitoring task")
+            
+            # Set up commands before syncing
+            await self.setup_commands()
+            logger.info("Commands set up")
             
             # Sync commands
             await self.tree.sync()
             logger.info("Synced commands")
             
+            # Start wallet monitoring task only after successful initialization
+            if self.blockfrost_client:
+                self.check_wallets.start()
+                logger.info("Started wallet monitoring task")
+            else:
+                logger.error("Cannot start wallet monitoring - Blockfrost client not initialized")
+            
         except Exception as e:
             logger.error(f"Error in setup_hook: {str(e)}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
             raise
             
     async def init_blockfrost(self):
@@ -965,50 +974,26 @@ class WalletBud(commands.Bot):
             
         await self.send_dm(int(user_id), message)
 
-    @commands.Cog.listener()
-    async def on_ready(self):
-        """Called when bot is ready"""
-        try:
-            logger.info(f"Logged in as {self.user.name} ({self.user.id})")
-            logger.info(f"Discord API version: {discord.__version__}")
-            logger.info(f"Connected to {len(self.guilds)} guilds")
-            
-            # Log guild information
-            for guild in self.guilds:
-                logger.info(f"Connected to guild: {guild.name} ({guild.id})")
-                
-            # Initialize Blockfrost
-            await self.init_blockfrost()
-            
-            # Start monitoring task
-            self.bg_task = self.loop.create_task(self.check_wallets())
-            logger.info("Started wallet monitoring task")
-            
-            logger.info("Bot initialization complete!")
-            
-        except Exception as e:
-            logger.error(f"Error in on_ready: {str(e)}")
-
-    @commands.Cog.listener()
-    async def on_guild_join(self, guild):
-        """Called when bot joins a guild"""
-        logger.info(f"Joined guild {guild.name} ({guild.id})")
-
     async def setup_commands(self):
         """Set up bot commands"""
         try:
+            logger.info("Setting up commands...")
+            
             # Wallet management commands
             @self.tree.command(name="addwallet", description="Register a wallet to monitor")
+            @dm_only()
             @app_commands.describe(address="The wallet address to monitor")
             async def addwallet(interaction: discord.Interaction, address: str):
                 await self._add_wallet(interaction, address)
 
             @self.tree.command(name="removewallet", description="Stop monitoring a wallet")
+            @dm_only()
             @app_commands.describe(address="The wallet address to remove")
             async def removewallet(interaction: discord.Interaction, address: str):
                 await self._remove_wallet(interaction, address)
 
             @self.tree.command(name="listwallets", description="List your registered wallets")
+            @dm_only()
             async def listwallets(interaction: discord.Interaction):
                 await self._list_wallets(interaction)
 
@@ -1022,14 +1007,17 @@ class WalletBud(commands.Bot):
 
             # Balance and notification commands
             @self.tree.command(name="balance", description="Get your wallet's current balance")
+            @dm_only()
             async def balance(interaction: discord.Interaction):
                 await self._balance(interaction)
 
             @self.tree.command(name="notifications", description="View your notification settings")
+            @dm_only()
             async def notifications(interaction: discord.Interaction):
                 await self._notifications(interaction)
 
             @self.tree.command(name="toggle", description="Toggle notification types")
+            @dm_only()
             @app_commands.choices(notification_type=[
                 app_commands.Choice(name="ADA Transactions", value="ada_transactions"),
                 app_commands.Choice(name="Token Changes", value="token_changes"),
@@ -1091,13 +1079,42 @@ class WalletBud(commands.Bot):
                         ephemeral=True
                     )
             
-            # Sync the commands
-            await self.tree.sync()
-            logger.info("Commands synced successfully")
-
+            logger.info("Commands set up successfully")
+            
         except Exception as e:
-            logger.error(f"Failed to set up commands: {str(e)}")
+            logger.error(f"Error setting up commands: {str(e)}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
             raise
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Called when bot is ready"""
+        try:
+            logger.info(f"Logged in as {self.user.name} ({self.user.id})")
+            logger.info(f"Discord API version: {discord.__version__}")
+            logger.info(f"Connected to {len(self.guilds)} guilds")
+            
+            # Log guild information
+            for guild in self.guilds:
+                logger.info(f"Connected to guild: {guild.name} ({guild.id})")
+                
+            # Initialize Blockfrost
+            await self.init_blockfrost()
+            
+            # Start monitoring task
+            self.bg_task = self.loop.create_task(self.check_wallets())
+            logger.info("Started wallet monitoring task")
+            
+            logger.info("Bot initialization complete!")
+            
+        except Exception as e:
+            logger.error(f"Error in on_ready: {str(e)}")
+
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild):
+        """Called when bot joins a guild"""
+        logger.info(f"Joined guild {guild.name} ({guild.id})")
 
     async def _add_wallet(self, interaction: discord.Interaction, address: str):
         """Add a wallet to monitor"""
