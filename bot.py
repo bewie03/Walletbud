@@ -49,7 +49,7 @@ from config import (
 
 from database import (
     get_pool,
-    add_wallet,
+    add_wallet_for_user,
     remove_wallet,
     get_user_id_for_wallet,
     get_all_wallets_for_user,
@@ -697,137 +697,39 @@ class WalletBud(commands.Bot):
 
     async def _add_wallet(self, interaction: discord.Interaction, address: str):
         """Add a wallet to monitor"""
-        # Check rate limit first
-        if not await self.handle_interaction_ratelimit(interaction):
-            return
-            
-        # Track interaction state
-        interaction_responded = False
-            
         try:
             # Validate address format
             if not address.startswith("addr1"):
-                await self.safe_send(interaction, "Invalid wallet address format.")
-                interaction_responded = True
+                await self.safe_send(interaction, "❌ Invalid address format. Address must start with 'addr1'")
                 return
-                
-            # Check if wallet is already registered
-            wallets = await get_all_wallets_for_user(str(interaction.user.id))
-            if address in wallets:
-                await self.safe_send(interaction, "This wallet is already registered.")
-                interaction_responded = True
-                return
-                
-            # Let user know we're checking their wallet
-            if not await self.safe_send(interaction, f"Checking wallet `{address[:8]}...{address[-8:]}`..."):
-                return
-                
+
             # Get stake address
+            stake_address = None
             try:
-                logger.info(f"Getting stake address for {address}")
-                stake_address = await self.blockfrost_client.address_stake(address)
-                logger.info(f"Got stake address: {stake_address}")
-            except ApiError as e:
-                logger.error(f"Blockfrost API error getting stake address: {str(e)}")
-                if e.status_code == 400:
-                    await self.safe_send(interaction, "Invalid wallet address.")
-                    return
-                elif e.status_code == 404:
-                    await self.safe_send(interaction, "Wallet not found on the blockchain.")
-                    return
-                else:
-                    await self.safe_send(interaction, "Error checking wallet. Please try again later.")
-                    return
+                stake_info = await self.rate_limited_request(
+                    self.blockfrost_client.address_info, address
+                )
+                stake_address = stake_info.stake_address
             except Exception as e:
                 logger.error(f"Error getting stake address: {str(e)}")
-                await self.safe_send(interaction, "Error checking wallet. Please try again later.")
-                return
-            
-            # Check YUMMI requirement
-            try:
-                logger.info(f"Checking YUMMI balance for {address}")
-                logger.info(f"Using ASSET_ID: {ASSET_ID}")
-                utxos = await self.blockfrost_client.address_utxos_asset(address, ASSET_ID)
-                logger.info(f"Got UTXOs: {utxos}")
-                
-                yummi_balance = sum(
-                    int(amount.quantity)
-                    for utxo in utxos
-                    for amount in utxo.amount
-                    if amount.unit.lower() == ASSET_ID.lower()
-                )
-                logger.info(f"Calculated YUMMI balance: {yummi_balance}")
-                
-            except ApiError as e:
-                logger.error(f"Blockfrost API error checking YUMMI balance: {str(e)}")
-                if e.status_code == 400:
-                    await self.safe_send(interaction, "Invalid asset ID.")
-                    return
-                elif e.status_code == 404:
-                    yummi_balance = 0
-                else:
-                    await self.safe_send(interaction, "Error checking YUMMI balance. Please try again later.")
-                    return
-            except Exception as e:
-                logger.error(f"Error checking YUMMI balance: {str(e)}")
-                await self.safe_send(interaction, "Error checking YUMMI balance. Please try again later.")
-                return
-            
-            if yummi_balance < MINIMUM_YUMMI:
-                await self.safe_send(
-                    interaction,
-                    f"❌ Wallet `{address[:8]}...{address[-8:]}` does not meet the minimum YUMMI token requirement.\n"
-                    f"Required: {MINIMUM_YUMMI:,}\n"
-                    f"Current: {yummi_balance:,}"
-                )
-                return
-            
+
             # Add wallet to database
-            success = await add_wallet(str(interaction.user.id), address, stake_address)
+            success = await add_wallet_for_user(str(interaction.user.id), address, stake_address)
             if not success:
-                await self.safe_send(
-                    interaction,
-                    "❌ Failed to add wallet. Please try again later.",
-                    ephemeral=True
-                )
+                await self.safe_send(interaction, "❌ Failed to add wallet to monitoring")
                 return
-            
-            # Initialize notification settings
-            await initialize_notification_settings(str(interaction.user.id))
-            
-            await self.safe_send(
-                interaction,
-                f"✅ Added wallet `{address[:8]}...{address[-8:]}` to monitoring.",
-                ephemeral=True
-            )
-            
+
+            # Update monitored addresses
+            self.monitored_addresses.add(address)
+            if stake_address:
+                self.monitored_stake_addresses.add(stake_address)
+
+            await self.safe_send(interaction, f"✅ Now monitoring wallet: `{address}`")
+
         except Exception as e:
             logger.error(f"Error adding wallet: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            try:
-                if not interaction_responded:
-                    await self.safe_send(
-                        interaction,
-                        "❌ An error occurred while adding the wallet. Please try again later.",
-                        ephemeral=True
-                    )
-                else:
-                    # Only try followup if we haven't already sent an error
-                    try:
-                        await self.safe_send(
-                            interaction,
-                            "❌ An error occurred while adding the wallet. Please try again later.",
-                            ephemeral=True
-                        )
-                    except discord.errors.InteractionResponded:
-                        pass  # Ignore if interaction was already responded to
-            except Exception as e2:
-                logger.error(f"Error sending error message: {str(e2)}")
-        finally:
-            # Clean up interaction tracking
-            await self.cleanup_interaction(str(interaction.id))
-            
+            await self.safe_send(interaction, "❌ An error occurred while adding the wallet")
+
     async def _remove_wallet(self, interaction: discord.Interaction, address: str):
         """Remove a wallet from monitoring"""
         try:
@@ -1300,53 +1202,23 @@ class WalletBud(commands.Bot):
                     return
                 await self._remove_wallet(interaction, address)
 
+            @self.tree.command(name="toggle", description="Toggle notification settings")
+            @app_commands.describe(
+                setting="The notification setting to toggle",
+                enabled="Whether to enable or disable the setting"
+            )
+            async def toggle(interaction: discord.Interaction, setting: str, enabled: bool):
+                if not isinstance(interaction.channel, discord.DMChannel):
+                    await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                    return
+                await self._toggle(interaction, setting, enabled)
+
             @self.tree.command(name="list", description="List your monitored wallets")
             async def list_wallets(interaction: discord.Interaction):
                 if not isinstance(interaction.channel, discord.DMChannel):
                     await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
                     return
                 await self._list_wallets(interaction)
-
-            @self.tree.command(name="toggle", description="Toggle notification settings")
-            @app_commands.describe(
-                setting="The notification setting to toggle",
-                enabled="Enable or disable the notification"
-            )
-            @app_commands.choices(setting=[
-                app_commands.Choice(name="ADA Transactions", value="ada_transactions"),
-                app_commands.Choice(name="Token Changes", value="token_changes"),
-                app_commands.Choice(name="NFT Updates", value="nft_updates"),
-                app_commands.Choice(name="Stake Key Changes", value="stake_changes"),
-                app_commands.Choice(name="Policy Expiry Alerts", value="policy_expiry"),
-                app_commands.Choice(name="Delegation Status", value="delegation_status"),
-                app_commands.Choice(name="Staking Rewards", value="staking_rewards"),
-                app_commands.Choice(name="DApp Interactions", value="dapp_interactions"),
-                app_commands.Choice(name="Failed Transactions", value="failed_transactions")
-            ])
-            async def toggle(interaction: discord.Interaction, setting: str, enabled: bool):
-                if not isinstance(interaction.channel, discord.DMChannel):
-                    await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
-                    return
-                
-                try:
-                    # Update the setting
-                    if await update_notification_setting(str(interaction.user.id), setting, enabled):
-                        status = "enabled" if enabled else "disabled"
-                        await interaction.response.send_message(
-                            f"✅ {self.NOTIFICATION_DISPLAY[setting]} notifications {status}!",
-                            ephemeral=True
-                        )
-                    else:
-                        await interaction.response.send_message(
-                            "❌ Failed to update notification settings. Please try again.",
-                            ephemeral=True
-                        )
-                except Exception as e:
-                    logger.error(f"Error updating notification setting: {str(e)}")
-                    await interaction.response.send_message(
-                        "❌ An error occurred while updating your notification settings.",
-                        ephemeral=True
-                    )
 
             @self.tree.command(name="stats", description="Show system monitoring statistics")
             async def stats(interaction: discord.Interaction):

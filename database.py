@@ -1101,7 +1101,7 @@ async def get_utxo_state(address: str) -> Optional[dict]:
                 logger.error(f"Error details: {e.__dict__}")
             return None
 
-async def get_wallet_for_user(user_id: str, address: str) -> Optional[asyncpg.Record]:
+async def get_wallet_for_user(user_id: str, address: str) -> Optional[dict]:
     """Get wallet details for a specific user and address
     
     Args:
@@ -1109,26 +1109,32 @@ async def get_wallet_for_user(user_id: str, address: str) -> Optional[asyncpg.Re
         address (str): Wallet address
         
     Returns:
-        Optional[asyncpg.Record]: Wallet record with all details or None if not found
+        Optional[dict]: Wallet record with all details or None if not found
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        try:
-            logger.debug(f"Fetching wallet for user {user_id} and address {address[:20]}...")
-            row = await conn.fetchrow(
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            wallet = await conn.fetchrow(
                 """
-                SELECT *
-                FROM wallets
+                SELECT * FROM wallets 
                 WHERE user_id = $1 AND address = $2
                 """,
                 user_id, address
             )
-            return row
-        except Exception as e:
-            logger.error(f"Error getting wallet for user {user_id} address {address[:20]}: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
+            if wallet:
+                return {
+                    'id': wallet['id'],
+                    'user_id': wallet['user_id'],
+                    'address': wallet['address'],
+                    'stake_address': wallet['stake_address'],
+                    'ada_balance': wallet['ada_balance'],
+                    'last_updated': wallet['last_updated'],
+                    'last_policy_check': wallet['last_policy_check']
+                }
             return None
+    except Exception as e:
+        logger.error(f"Error getting wallet for user {user_id} address {address}: {str(e)}")
+        return None
 
 async def is_token_change_processed(wallet_id: int, tx_hash: str) -> bool:
     """Check if a token change has been processed

@@ -265,6 +265,9 @@ except Exception as e:
     logger.error(f"Environment validation failed:\n{str(e)}")
     raise
 
+# Test address for health checks (a known valid mainnet address)
+TEST_ADDRESS = "addr1qxqs59lphg8g6qnplr8q6kw2hyzn8c8e3r5jlnwjqppn8k2vllp6xf5qvjgclau0t2q5jz7c7vyvs3x4u2xqm7gaex0s6dd9ay"
+
 # Webhook Configuration
 WEBHOOKS = {
     "transaction": {
