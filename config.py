@@ -90,13 +90,13 @@ ENV_VARS = {
     # YUMMI Token Configuration
     'YUMMI_POLICY_ID': EnvVar(
         name="YUMMI Policy ID",
-        validator=lambda x, n: validate_hex(x, 48, n),
-        description="Policy ID for YUMMI token (Blockfrost format)"
+        validator=lambda x: bool(re.match(r'^[0-9a-f]{56}$', x.lower())),
+        description="YUMMI token policy ID (56-character hexadecimal string)"
     ),
     'YUMMI_TOKEN_NAME': EnvVar(
         name="YUMMI Token Name",
-        validator=lambda x, n: validate_hex(x, 8, n),
-        description="Token name in hex format for YUMMI token (Blockfrost format)"
+        validator=lambda x: bool(re.match(r'^[0-9a-f]{9}$', x.lower())),
+        description="YUMMI token name (9-character hexadecimal string)"
     ),
     
     # API Rate Limiting
