@@ -28,7 +28,13 @@ from database import (
     is_reward_processed,
     add_processed_reward,
     get_stake_address,
-    update_stake_address
+    update_stake_address,
+    get_notification_settings,
+    update_notification_setting,
+    get_wallet_for_user,
+    get_wallet_balance,
+    is_token_change_processed,
+    add_processed_token_change
 )
 
 # Configure logging
@@ -450,6 +456,153 @@ class WalletBud(commands.Bot):
                         ephemeral=True
                     )
 
+            @self.tree.command(name="balance", description="Get your wallet's current balance")
+            async def balance_cmd(self, ctx: commands.Context):
+                """Get current balance of your registered wallet"""
+                try:
+                    # Get user's wallet
+                    address = await get_wallet_for_user(ctx.author.id)
+                    if not address:
+                        await ctx.send("❌ You don't have a registered wallet! Use `/register` first.")
+                        return
+                        
+                    # Get current balance
+                    ada_balance, token_balances = await get_wallet_balance(address)
+                    
+                    # Create embed
+                    embed = discord.Embed(
+                        title="💰 Wallet Balance",
+                        description=f"Current balance for wallet `{address}`",
+                        color=discord.Color.blue()
+                    )
+                    
+                    # Add ADA balance
+                    embed.add_field(
+                        name="ADA Balance",
+                        value=f"`{ada_balance / 1_000_000:,.6f} ADA`",
+                        inline=False
+                    )
+                    
+                    # Add token balances
+                    if token_balances:
+                        token_list = []
+                        for policy_id, amount in token_balances.items():
+                            try:
+                                asset_details = await self.rate_limited_request(
+                                    self.blockfrost_client.asset,
+                                    policy_id
+                                )
+                                name = asset_details.onchain_metadata.get('name', 'Unknown Token')
+                                token_list.append(f"{name}: `{amount:,}`")
+                            except Exception:
+                                token_list.append(f"Policy {policy_id[:8]}...{policy_id[-8:]}: `{amount:,}`")
+                        
+                        embed.add_field(
+                            name="Token Balances",
+                            value="\n".join(token_list) if token_list else "No tokens",
+                            inline=False
+                        )
+                    
+                    await ctx.send(embed=embed)
+                    
+                except Exception as e:
+                    logger.error(f"Error getting balance: {str(e)}")
+                    await ctx.send("❌ An error occurred while getting your balance.")
+
+            @self.tree.command(name="notifications", description="View and manage your notification settings")
+            async def notifications_cmd(self, ctx: commands.Context):
+                """View and manage notification settings"""
+                try:
+                    settings = await get_notification_settings(ctx.author.id)
+                    if not settings:
+                        await ctx.send("❌ You don't have any notification settings! Use `/register` first.")
+                        return
+                        
+                    # Create embed
+                    embed = discord.Embed(
+                        title="🔔 Notification Settings",
+                        description="Your current notification settings:",
+                        color=discord.Color.blue()
+                    )
+                    
+                    # Add each setting
+                    settings_display = {
+                        "ada_transactions": "ADA Transactions",
+                        "token_changes": "Token Changes",
+                        "nft_updates": "NFT Updates",
+                        "staking_rewards": "Staking Rewards",
+                        "stake_changes": "Stake Key Changes",
+                        "low_balance": "Low Balance Alerts",
+                        "unusual_activity": "Unusual Activity"
+                    }
+                    
+                    for setting, display_name in settings_display.items():
+                        status = settings.get(setting, False)
+                        embed.add_field(
+                            name=display_name,
+                            value=f"{'✅ Enabled' if status else '❌ Disabled'}",
+                            inline=True
+                        )
+                    
+                    # Add instructions
+                    embed.add_field(
+                        name="How to Change",
+                        value="Use `/toggle_notification [type]` to enable/disable notifications",
+                        inline=False
+                    )
+                    
+                    await ctx.send(embed=embed)
+                    
+                except Exception as e:
+                    logger.error(f"Error getting notification settings: {str(e)}")
+                    await ctx.send("❌ An error occurred while getting your notification settings.")
+
+            @self.tree.command(name="toggle_notification", description="Toggle a specific notification type")
+            async def toggle_notification_cmd(
+                self,
+                ctx: commands.Context,
+                notification_type: str = commands.parameter(
+                    description="Type of notification to toggle"
+                )
+            ):
+                """Toggle a specific notification type on/off"""
+                try:
+                    valid_types = {
+                        "ada": "ada_transactions",
+                        "token": "token_changes",
+                        "nft": "nft_updates",
+                        "staking": "staking_rewards",
+                        "stake": "stake_changes",
+                        "balance": "low_balance",
+                        "activity": "unusual_activity"
+                    }
+                    
+                    if notification_type not in valid_types:
+                        type_list = ", ".join(f"`{t}`" for t in valid_types.keys())
+                        await ctx.send(f"❌ Invalid notification type! Valid types are: {type_list}")
+                        return
+                        
+                    setting_key = valid_types[notification_type]
+                    settings = await get_notification_settings(ctx.author.id)
+                    
+                    if not settings:
+                        await ctx.send("❌ You don't have any notification settings! Use `/register` first.")
+                        return
+                        
+                    # Toggle the setting
+                    new_status = not settings.get(setting_key, True)
+                    success = await update_notification_setting(ctx.author.id, setting_key, new_status)
+                    
+                    if success:
+                        status = "enabled" if new_status else "disabled"
+                        await ctx.send(f"✅ Successfully {status} {notification_type} notifications!")
+                    else:
+                        await ctx.send("❌ Failed to update notification setting.")
+                    
+                except Exception as e:
+                    logger.error(f"Error toggling notification: {str(e)}")
+                    await ctx.send("❌ An error occurred while updating your notification settings.")
+
             # Sync commands with Discord
             logger.info("Syncing commands with Discord...")
             await self.tree.sync()
@@ -615,7 +768,7 @@ class WalletBud(commands.Bot):
                     # TODO: Notify user and remove wallet
                     return
                 
-                # 1. Check ADA Transactions
+                # 1. Check ADA Transactions and Unusual Activity
                 txs = await self.rate_limited_request(
                     self.blockfrost_client.address_transactions,
                     address,
@@ -623,6 +776,32 @@ class WalletBud(commands.Bot):
                     page=1,
                     order='desc'
                 )
+                
+                # Check for unusual transaction frequency
+                recent_txs = await get_recent_transactions(address, hours=1)
+                if len(recent_txs) > MAX_TX_PER_HOUR:
+                    embed = discord.Embed(
+                        title="⚠️ Unusual Wallet Activity",
+                        description="High frequency of transactions detected!",
+                        color=discord.Color.orange()
+                    )
+                    embed.add_field(
+                        name="Wallet",
+                        value=f"`{address}`",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="Transactions (Last Hour)",
+                        value=f"`{len(recent_txs)}`",
+                        inline=True
+                    )
+                    embed.add_field(
+                        name="Threshold",
+                        value=f"`{MAX_TX_PER_HOUR}`",
+                        inline=True
+                    )
+                    if await self.should_notify(user_id, "unusual_activity"):
+                        await user.send(embed=embed)
                 
                 for tx in txs:
                     try:
@@ -675,69 +854,24 @@ class WalletBud(commands.Bot):
                                     value=f"`{tx_hash}`",
                                     inline=False
                                 )
-                                await user.send(embed=embed)
+                                if await self.should_notify(user_id, "ada_transactions"):
+                                    await user.send(embed=embed)
                     
                     except Exception as e:
                         logger.error(f"Error processing transaction {tx_hash}: {str(e)}")
                         continue
                 
-                # 2. Check Token Balance Changes (including YUMMI)
-                current_balances = {}
-                for utxo in current_utxos:
-                    for amount in utxo.amount:
-                        if amount.unit != "lovelace":
-                            current_balances[amount.unit] = current_balances.get(amount.unit, 0) + int(amount.quantity)
-                
-                prev_balances = {}
-                for utxo_data in prev_state.values():
-                    for unit, quantity in utxo_data.items():
-                        if unit != "lovelace":
-                            prev_balances[unit] = prev_balances.get(unit, 0) + int(quantity)
-                
-                # Check for balance changes
-                all_tokens = set(current_balances.keys()) | set(prev_balances.keys())
-                for token in all_tokens:
-                    curr_bal = current_balances.get(token, 0)
-                    prev_bal = prev_balances.get(token, 0)
-                    
-                    if curr_bal != prev_bal:
-                        # Special handling for YUMMI token
-                        is_yummi = token == f"{YUMMI_POLICY_ID}{'79756d6d69'}"
-                        token_name = "YUMMI" if is_yummi else token
-                        
-                        embed = discord.Embed(
-                            title=f"🔄 {'YUMMI' if is_yummi else 'Token'} Balance Change",
-                            description=f"Your {token_name} balance has changed.",
-                            color=discord.Color.blue()
-                        )
-                        embed.add_field(
-                            name="Wallet",
-                            value=f"`{address}`",
-                            inline=False
-                        )
-                        embed.add_field(
-                            name="Previous Balance",
-                            value=f"`{prev_bal:,}`",
-                            inline=True
-                        )
-                        embed.add_field(
-                            name="New Balance",
-                            value=f"`{curr_bal:,}`",
-                            inline=True
-                        )
-                        embed.add_field(
-                            name="Change",
-                            value=f"`{curr_bal - prev_bal:+,}`",
-                            inline=True
-                        )
-                        await user.send(embed=embed)
-                
-                # 3. Check for New NFTs
+                # 2. Check for New Tokens (excluding NFTs)
+                current_tokens = set()
                 current_nfts = set()
+                total_ada = 0
+                
                 for utxo in current_utxos:
                     for amount in utxo.amount:
-                        if amount.unit != "lovelace" and amount.quantity == "1":
-                            # Get asset details to confirm if it's an NFT
+                        if amount.unit == "lovelace":
+                            total_ada += int(amount.quantity)
+                        elif amount.unit != "lovelace":
+                            # Check if it's an NFT
                             try:
                                 asset_details = await self.rate_limited_request(
                                     self.blockfrost_client.asset,
@@ -745,28 +879,103 @@ class WalletBud(commands.Bot):
                                 )
                                 if hasattr(asset_details, 'onchain_metadata'):
                                     current_nfts.add(amount.unit)
+                                else:
+                                    current_tokens.add(amount.unit)
                             except Exception:
-                                continue
+                                # If we can't get metadata, treat as regular token
+                                current_tokens.add(amount.unit)
                 
+                prev_tokens = set()
                 prev_nfts = set()
                 for utxo_data in prev_state.values():
-                    for unit, quantity in utxo_data.items():
-                        if unit != "lovelace" and quantity == "1":
-                            prev_nfts.add(unit)
+                    for unit in utxo_data.keys():
+                        if unit != "lovelace":
+                            if unit in current_nfts:
+                                prev_nfts.add(unit)
+                            else:
+                                prev_tokens.add(unit)
                 
-                new_nfts = current_nfts - prev_nfts
-                if new_nfts:
+                # Check for new tokens
+                new_tokens = await get_new_tokens(address, prev_tokens, current_tokens)
+                if new_tokens:
+                    for token in new_tokens:
+                        try:
+                            # Skip if already processed
+                            curr_bal = current_state.get(token, 0)
+                            prev_bal = prev_state.get(token, 0)
+                            
+                            if await is_token_change_processed(address, token, prev_bal, curr_bal):
+                                continue
+                                
+                            # Get token details
+                            asset_details = await self.rate_limited_request(
+                                self.blockfrost_client.asset,
+                                token
+                            )
+                            
+                            # Get token name and metadata
+                            token_name = "Unknown Token"
+                            if hasattr(asset_details, 'onchain_metadata') and asset_details.onchain_metadata:
+                                token_name = asset_details.onchain_metadata.get('name', 'Unknown Token')
+                            elif hasattr(asset_details, 'metadata') and asset_details.metadata:
+                                token_name = asset_details.metadata.get('name', 'Unknown Token')
+                            
+                            # Create notification
+                            embed = discord.Embed(
+                                title="🪙 Token Balance Change",
+                                description=f"Your {token_name} balance has changed.",
+                                color=discord.Color.blue()
+                            )
+                            embed.add_field(
+                                name="Wallet",
+                                value=f"`{address}`",
+                                inline=False
+                            )
+                            embed.add_field(
+                                name="Token",
+                                value=f"`{token_name}`",
+                                inline=True
+                            )
+                            embed.add_field(
+                                name="Previous Balance",
+                                value=f"`{prev_bal:,}`",
+                                inline=True
+                            )
+                            embed.add_field(
+                                name="New Balance",
+                                value=f"`{curr_bal:,}`",
+                                inline=True
+                            )
+                            embed.add_field(
+                                name="Change",
+                                value=f"`{curr_bal - prev_bal:+,}`",
+                                inline=True
+                            )
+                            
+                            # Record this change
+                            await add_processed_token_change(address, token, prev_bal, curr_bal)
+                            
+                            if await self.should_notify(user_id, "token_changes"):
+                                await user.send(embed=embed)
+                                
+                        except Exception as e:
+                            logger.error(f"Error processing token change for {token}: {str(e)}")
+                            continue
+                
+                # Check for removed NFTs
+                removed_nfts = await get_removed_nfts(address, prev_nfts, current_nfts)
+                if removed_nfts:
                     embed = discord.Embed(
-                        title="🎨 New NFT Received",
-                        description="New NFT(s) detected in your wallet!",
-                        color=discord.Color.purple()
+                        title="🎨 NFT Removed",
+                        description="NFT(s) have been removed from your wallet.",
+                        color=discord.Color.red()
                     )
                     embed.add_field(
                         name="Wallet",
                         value=f"`{address}`",
                         inline=False
                     )
-                    for nft in new_nfts:
+                    for nft in removed_nfts:
                         try:
                             asset_details = await self.rate_limited_request(
                                 self.blockfrost_client.asset,
@@ -775,88 +984,135 @@ class WalletBud(commands.Bot):
                             name = asset_details.onchain_metadata.get('name', 'Unknown NFT')
                             embed.add_field(
                                 name=name,
-                                value=f"Policy: `{nft[:56]}`\nAsset: `{nft[56:]}`",
+                                value=f"Policy: `{nft[:56]}`",
                                 inline=False
                             )
                         except Exception:
                             continue
-                    await user.send(embed=embed)
+                    if await self.should_notify(user_id, "nft_updates"):
+                        await user.send(embed=embed)
                 
-                # 4. Check Staking Rewards
-                try:
-                    rewards = await self.rate_limited_request(
-                        self.blockfrost_client.account_rewards,
-                        address,
-                        count=5,
-                        page=1
+                # Check for low ADA balance
+                is_low, balance_ada = await check_ada_balance(address, total_ada)
+                if is_low:
+                    embed = discord.Embed(
+                        title="⚠️ Low ADA Balance",
+                        description="Your wallet's ADA balance is below the minimum threshold!",
+                        color=discord.Color.red()
                     )
-                    
-                    for reward in rewards:
-                        # Only notify about new rewards
-                        if not await is_reward_processed(address, reward.epoch):
-                            await add_processed_reward(address, reward.epoch)
-                            
-                            embed = discord.Embed(
-                                title="🎁 Staking Reward Received",
-                                description="You've received staking rewards!",
-                                color=discord.Color.gold()
-                            )
-                            embed.add_field(
-                                name="Wallet",
-                                value=f"`{address}`",
-                                inline=False
-                            )
-                            embed.add_field(
-                                name="Amount",
-                                value=f"`{int(reward.amount) / 1_000_000:,.6f} ADA`",
-                                inline=True
-                            )
-                            embed.add_field(
-                                name="Epoch",
-                                value=f"`{reward.epoch}`",
-                                inline=True
-                            )
-                            await user.send(embed=embed)
-                            
-                except Exception as e:
-                    logger.error(f"Error checking staking rewards: {str(e)}")
+                    embed.add_field(
+                        name="Wallet",
+                        value=f"`{address}`",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="Current Balance",
+                        value=f"`{balance_ada:,.6f} ADA`",
+                        inline=True
+                    )
+                    embed.add_field(
+                        name="Minimum Required",
+                        value=f"`{MIN_ADA_BALANCE:,.6f} ADA`",
+                        inline=True
+                    )
+                    if await self.should_notify(user_id, "low_balance"):
+                        await user.send(embed=embed)
                 
-                # 5. Check Stake Key Changes
-                try:
-                    stake_address = await self.rate_limited_request(
-                        self.blockfrost_client.address_details,
-                        address
-                    )
-                    
-                    if stake_address and stake_address.stake_address:
-                        current_stake = stake_address.stake_address
-                        prev_stake = await get_stake_address(address)
-                        
-                        if current_stake != prev_stake:
-                            await update_stake_address(address, current_stake)
-                            
-                            embed = discord.Embed(
-                                title="🔑 Stake Key Change Detected",
-                                description="Your stake key registration has changed.",
-                                color=discord.Color.yellow()
-                            )
-                            embed.add_field(
-                                name="Wallet",
-                                value=f"`{address}`",
-                                inline=False
-                            )
-                            embed.add_field(
-                                name="New Stake Address",
-                                value=f"`{current_stake}`",
-                                inline=False
-                            )
-                            await user.send(embed=embed)
-                            
-                except Exception as e:
-                    logger.error(f"Error checking stake key changes: {str(e)}")
+                # Continue with other checks (staking rewards, stake key changes)
+                await self._check_staking_and_stake_key(address, user)
                 
         except Exception as e:
             logger.error(f"Error checking wallet {address}: {str(e)}")
+            
+    async def should_notify(self, user_id: int, notification_type: str) -> bool:
+        """Check if we should send a notification to the user
+        
+        Args:
+            user_id (int): Discord user ID
+            notification_type (str): Type of notification
+            
+        Returns:
+            bool: Whether to send the notification
+        """
+        try:
+            settings = await get_notification_settings(user_id)
+            return settings.get(notification_type, True)  # Default to True if setting doesn't exist
+            
+        except Exception as e:
+            logger.error(f"Error checking notification settings: {str(e)}")
+            return True  # Default to sending notification if error occurs
+
+    async def _check_staking_and_stake_key(self, address: str, user: discord.User):
+        """Helper method to check staking rewards and stake key changes"""
+        try:
+            # Check Staking Rewards
+            rewards = await self.rate_limited_request(
+                self.blockfrost_client.account_rewards,
+                address,
+                count=5,
+                page=1
+            )
+            
+            for reward in rewards:
+                if not await is_reward_processed(address, reward.epoch):
+                    await add_processed_reward(address, reward.epoch)
+                    
+                    embed = discord.Embed(
+                        title="🎁 Staking Reward Received",
+                        description="You've received staking rewards!",
+                        color=discord.Color.gold()
+                    )
+                    embed.add_field(
+                        name="Wallet",
+                        value=f"`{address}`",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="Amount",
+                        value=f"`{int(reward.amount) / 1_000_000:,.6f} ADA`",
+                        inline=True
+                    )
+                    embed.add_field(
+                        name="Epoch",
+                        value=f"`{reward.epoch}`",
+                        inline=True
+                    )
+                    if await self.should_notify(user.id, "staking_rewards"):
+                        await user.send(embed=embed)
+            
+            # Check Stake Key Changes
+            stake_address = await self.rate_limited_request(
+                self.blockfrost_client.address_details,
+                address
+            )
+            
+            if stake_address and stake_address.stake_address:
+                current_stake = stake_address.stake_address
+                prev_stake = await get_stake_address(address)
+                
+                if current_stake != prev_stake:
+                    await update_stake_address(address, current_stake)
+                    
+                    embed = discord.Embed(
+                        title="🔑 Stake Key Change Detected",
+                        description="Your stake key registration has changed.",
+                        color=discord.Color.yellow()
+                    )
+                    embed.add_field(
+                        name="Wallet",
+                        value=f"`{address}`",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="New Stake Address",
+                        value=f"`{current_stake}`",
+                        inline=False
+                    )
+                    if await self.should_notify(user.id, "stake_changes"):
+                        await user.send(embed=embed)
+                    
+        except Exception as e:
+            logger.error(f"Error checking staking and stake key: {str(e)}")
 
     async def verify_yummi_balance(self, address: str) -> tuple[bool, int]:
         """Verify YUMMI token balance with robust asset parsing
