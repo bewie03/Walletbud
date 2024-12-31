@@ -614,25 +614,55 @@ class WalletBud(commands.Bot):
             tuple[bool, int]: (has_enough_tokens, current_balance)
         """
         try:
-            assets = await self.rate_limited_request(
-                self.blockfrost_client.address_utxos_asset,
-                address=address,
-                asset=f"{YUMMI_POLICY_ID}"
+            # First check if address has any UTXOs with YUMMI tokens
+            utxos = await self.rate_limited_request(
+                self.blockfrost_client.address_utxos,
+                address
             )
             
-            total_tokens = 0
-            for utxo in assets:
+            # Check if any UTXO contains YUMMI token
+            asset = f"{YUMMI_POLICY_ID}{'79756d6d69'}"  # 79756d6d69 is hex for "yummi"
+            has_yummi = False
+            for utxo in utxos:
                 for amount in utxo.amount:
-                    if amount.unit == f"{YUMMI_POLICY_ID}":
-                        total_tokens += int(amount.quantity)
+                    if amount.unit == asset:
+                        has_yummi = True
+                        break
+                if has_yummi:
+                    break
             
-            logger.info(f"Found {total_tokens} YUMMI tokens for address {address}")
-            return total_tokens >= REQUIRED_YUMMI_TOKENS, total_tokens
+            if not has_yummi:
+                logger.info(f"No YUMMI tokens found in address {address}")
+                return False, 0
+                
+            # Now get specific asset UTXOs to calculate total
+            try:
+                asset_utxos = await self.rate_limited_request(
+                    self.blockfrost_client.address_utxos_asset,
+                    address=address,
+                    asset=asset
+                )
+                
+                # Calculate total YUMMI tokens across all UTXOs
+                total_tokens = 0
+                for utxo in asset_utxos:
+                    for amount in utxo.amount:
+                        if amount.unit == asset:
+                            total_tokens += int(amount.quantity)
+                
+                logger.info(f"Found {total_tokens} YUMMI tokens for address {address}")
+                return total_tokens >= 25000, total_tokens
+                
+            except Exception as e:
+                if hasattr(e, 'status_code') and e.status_code == 404:
+                    logger.info(f"No YUMMI tokens found in address {address} (404 response)")
+                    return False, 0
+                raise
             
         except Exception as e:
             logger.error(f"Failed to verify YUMMI balance: {str(e)}")
             return False, 0
-            
+
     async def process_interaction(self, interaction: discord.Interaction, ephemeral: bool = True):
         """Process interaction with proper error handling"""
         try:

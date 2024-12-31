@@ -50,7 +50,7 @@ YUMMI_POLICY_ID = validate_hex(
     'YUMMI_POLICY_ID'
 )
 
-REQUIRED_YUMMI_TOKENS = int(os.getenv('REQUIRED_YUMMI_TOKENS', '20000'))
+REQUIRED_YUMMI_TOKENS = 25000  # Updated threshold
 MAX_REQUESTS_PER_SECOND = int(os.getenv('MAX_REQUESTS_PER_SECOND', '10'))
 BURST_LIMIT = int(os.getenv('BURST_LIMIT', '20'))
 RATE_LIMIT_DELAY = float(os.getenv('RATE_LIMIT_DELAY', '0.1'))
