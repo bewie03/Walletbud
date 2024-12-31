@@ -1,8 +1,9 @@
 import os
+import json
 import logging
+import asyncio
 import asyncpg
 from datetime import datetime
-import json
 from typing import List, Optional
 from dotenv import load_dotenv
 
@@ -1701,6 +1702,29 @@ async def initialize_notification_settings(user_id: str):
         logger.error(f"Error initializing notification settings: {e}")
         if hasattr(e, '__dict__'):
             logger.error(f"Error details: {e.__dict__}")
+
+async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
+    """Get the user ID associated with a stake address
+    
+    Args:
+        stake_address (str): Stake address
+        
+    Returns:
+        Optional[str]: Discord user ID or None if not found
+    """
+    try:
+        pool = await get_pool()
+        query = """
+            SELECT DISTINCT user_id 
+            FROM wallets 
+            WHERE stake_address = $1
+            LIMIT 1
+        """
+        result = await pool.fetchval(query, stake_address)
+        return result
+    except Exception as e:
+        logger.error(f"Error getting user ID for stake address: {str(e)}")
+        return None
 
 async def get_last_policy_check(address: str):
     """Get the last time policy expiry was checked
