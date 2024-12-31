@@ -338,8 +338,7 @@ class WalletBud(commands.Bot):
                     
                     # Test basic address info
                     logger.info("Testing address info endpoint...")
-                    try:
-                        # Get basic address info
+                    async with self.rate_limiter:
                         address_info = await self.blockfrost_client.address(test_address)
                         if not address_info:
                             raise Exception("Failed to get address info")
@@ -371,26 +370,13 @@ class WalletBud(commands.Bot):
                             raise Exception("Failed to get transactions")
                         logger.info("Transactions test passed")
                         
-                    except Exception as e:
-                        logger.error(f"Blockfrost test failed: {str(e)}")
-                        raise
-                        
                     logger.info("All Blockfrost connection tests passed")
                     return True
                     
                 except Exception as e:
-                    logger.error(f"Failed to test Blockfrost connection: {str(e)}")
-                    if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                        logger.error(f"Response details: {e.response.text}")
-                    if hasattr(e, '__dict__'):
-                        logger.error(f"Error details: {e.__dict__}")
-                    self.blockfrost_client = None
-                    
-                    if attempt < MAX_RETRIES - 1:
-                        logger.info(f"Retrying in {RETRY_DELAY} seconds...")
-                        await asyncio.sleep(RETRY_DELAY)
-                    continue
-                
+                    logger.error(f"Blockfrost test failed: {str(e)}")
+                    raise
+                        
             except Exception as e:
                 logger.error(f"Failed to create Blockfrost client: {str(e)}")
                 if hasattr(e, 'response') and hasattr(e.response, 'text'):
@@ -1368,7 +1354,8 @@ class WalletBud(commands.Bot):
             try:
                 # Test with a known address
                 test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
-                await self.blockfrost_client.address(test_address)
+                async with self.rate_limiter:
+                    await self.blockfrost_client.address(test_address)
                 blockfrost_status = "✅ Connected"
             except Exception as e:
                 logger.error(f"Blockfrost health check failed: {str(e)}")
