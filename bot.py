@@ -363,21 +363,21 @@ class WalletBud(commands.Bot):
                     # Test basic address info
                     logger.info("Testing address info endpoint...")
                     async with self.rate_limiter:
-                        address_info = await asyncio.to_thread(self.blockfrost_client.address, test_address)
+                        address_info = await self.blockfrost_client.address(test_address)
                         if not address_info:
                             raise Exception("Failed to get address info")
                         logger.info("Basic address info test passed")
                     
                     # Get extended address info
                     async with self.rate_limiter:
-                        extended_info = await asyncio.to_thread(self.blockfrost_client.address_extended, test_address)
+                        extended_info = await self.blockfrost_client.address_extended(test_address)
                         if not extended_info:
                             raise Exception("Failed to get extended address info")
                         logger.info("Extended address info test passed")
                     
                     # Get address total
                     async with self.rate_limiter:
-                        total_info = await asyncio.to_thread(self.blockfrost_client.address_total, test_address)
+                        total_info = await self.blockfrost_client.address_total(test_address)
                         if not total_info:
                             raise Exception("Failed to get address total")
                         logger.info("Address total test passed")
@@ -385,19 +385,11 @@ class WalletBud(commands.Bot):
                     # Test UTXOs
                     logger.info("Testing UTXOs endpoint...")
                     async with self.rate_limiter:
-                        utxos = await asyncio.to_thread(self.blockfrost_client.address_utxos, test_address)
+                        utxos = await self.blockfrost_client.address_utxos(test_address)
                         if not utxos:
                             raise Exception("Failed to get UTXOs")
                         logger.info("UTXOs test passed")
                     
-                    # Test transactions
-                    logger.info("Testing transactions endpoint...")
-                    async with self.rate_limiter:
-                        txs = await asyncio.to_thread(self.blockfrost_client.address_transactions, test_address)
-                        if txs is None:  # Can be empty list but shouldn't be None
-                            raise Exception("Failed to get transactions")
-                        logger.info("Transactions test passed")
-                        
                     logger.info("All Blockfrost connection tests passed")
                     return True
                     
@@ -450,73 +442,20 @@ class WalletBud(commands.Bot):
         for attempt in range(max_retries):
             try:
                 async with self.rate_limiter:
-                    # Use endpoint-specific rate limiting
-                    await self.rate_limiter.acquire(endpoint)
-                    try:
-                        result = await func(*args, **kwargs)
-                        return result
-                    finally:
-                        await self.rate_limiter.release(endpoint)
+                    result = await func(*args, **kwargs)
+                    logger.info(f"[{request_id}] Request to {endpoint} successful")
+                    return result
                     
             except Exception as e:
-                # Get status code if available
-                status_code = None
-                if hasattr(e, 'status_code'):
-                    status_code = e.status_code
-                elif hasattr(e, 'response') and hasattr(e.response, 'status'):
-                    status_code = e.response.status
+                delay = base_delay * (2 ** attempt) + random.uniform(0, max_jitter)
+                logger.error(f"[{request_id}] Request to {endpoint} failed (attempt {attempt + 1}/{max_retries}): {str(e)}")
                 
-                # Handle specific error codes
-                if status_code:
-                    if status_code == 400:
-                        logger.error(f"[{request_id}] Bad Request - Check parameters: {str(e)}")
-                        raise  # Don't retry invalid requests
-                    elif status_code == 403:
-                        logger.error(f"[{request_id}] Forbidden - Check API key: {str(e)}")
-                        raise  # Don't retry auth errors
-                    elif status_code == 429:
-                        # Rate limit hit - use exponential backoff with jitter
-                        delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
-                        jitter = random.uniform(-max_jitter * delay, max_jitter * delay)
-                        delay = max(0.1, delay + jitter)  # Ensure minimum delay of 0.1s
-                        logger.warning(
-                            f"[{request_id}] Rate limit hit for {endpoint}. "
-                            f"Retrying in {delay:.2f} seconds..."
-                        )
-                    elif status_code == 500:
-                        # Server error - use exponential backoff with jitter
-                        delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
-                        jitter = random.uniform(-max_jitter * delay, max_jitter * delay)
-                        delay = max(0.1, delay + jitter)  # Ensure minimum delay of 0.1s
-                        logger.error(
-                            f"[{request_id}] Server error for {endpoint}. "
-                            f"Retrying in {delay:.2f} seconds..."
-                        )
-                    else:
-                        # Unknown error - use exponential backoff with jitter
-                        delay = base_delay * (2 ** attempt)  # 1s, 2s, 4s
-                        jitter = random.uniform(-max_jitter * delay, max_jitter * delay)
-                        delay = max(0.1, delay + jitter)  # Ensure minimum delay of 0.1s
-                        logger.error(
-                            f"[{request_id}] Request failed for {endpoint} "
-                            f"with status {status_code}: {str(e)}"
-                        )
-                
-                # Log the error with more detail
-                logger.error(
-                    f"[{request_id}] Request failed for {endpoint} "
-                    f"(attempt {attempt + 1}/{max_retries}): {str(e)}\n"
-                    f"Args: {args}\nKwargs: {kwargs}"
-                )
-                
-                if attempt < max_retries - 1:  # Don't sleep on last attempt
+                if attempt < max_retries - 1:
+                    logger.info(f"[{request_id}] Retrying in {delay:.2f} seconds...")
                     await asyncio.sleep(delay)
-                    
-        # All retries failed
-        raise Exception(
-            f"[{request_id}] All {max_retries} attempts failed for {endpoint}. "
-            f"Last error: {str(e)}"
-        )
+                else:
+                    logger.error(f"[{request_id}] All retry attempts failed for {endpoint}")
+                    raise
 
     async def send_admin_alert(self, message: str, is_error: bool = True):
         """Send alert to admin channel
@@ -539,7 +478,7 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to send admin alert: {str(e)}")
 
-    async def check_yummi_requirement(self, address: str) -> tuple[bool, int]:
+    async def check_yummi_requirement(self, address: str):
         """Check if wallet meets YUMMI token requirement
         
         Args:
@@ -549,27 +488,21 @@ class WalletBud(commands.Bot):
             tuple: (bool, int) - (meets requirement, current balance)
         """
         try:
-            # Get UTXOs for the specific token
-            utxos = await self.rate_limited_request(
-                self.blockfrost_client.address_utxos_asset,
-                address=address,
-                asset=YUMMI_TOKEN_ID
-            )
+            # Get all assets for the address
+            assets = await self.rate_limited_request(self.blockfrost_client.address_assets, address)
             
-            # Calculate total balance
-            total_balance = 0
-            if utxos:
-                for utxo in utxos:
-                    for amount in utxo.amount:
-                        if amount.unit == YUMMI_TOKEN_ID:
-                            total_balance += int(amount.quantity)
+            # Find YUMMI token
+            yummi_balance = 0
+            for asset in assets:
+                if asset.unit == YUMMI_TOKEN_ID:
+                    yummi_balance = int(asset.quantity)
+                    break
             
-            # Check if balance meets requirement
-            meets_requirement = total_balance >= MIN_YUMMI_REQUIREMENT
-            return meets_requirement, total_balance
+            meets_requirement = yummi_balance >= MIN_YUMMI_REQUIREMENT
+            return meets_requirement, yummi_balance
             
         except Exception as e:
-            logger.error(f"Failed to check YUMMI requirement: {str(e)}")
+            logger.error(f"Error checking YUMMI requirement for {address}: {str(e)}")
             return False, 0
 
     @tasks.loop(seconds=WALLET_CHECK_INTERVAL)
@@ -1435,7 +1368,7 @@ class WalletBud(commands.Bot):
                 # Test with a known address
                 test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
                 async with self.rate_limiter:
-                    await asyncio.to_thread(self.blockfrost_client.address, test_address)
+                    await self.blockfrost_client.address(test_address)
                 blockfrost_status = "✅ Connected"
             except Exception as e:
                 logger.error(f"Blockfrost health check failed: {str(e)}")
