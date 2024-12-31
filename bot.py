@@ -28,7 +28,7 @@ from database import (
     get_pool,
     add_wallet,
     remove_wallet,
-    get_wallet_for_user,
+    get_user_id_for_wallet,
     get_all_wallets_for_user,
     get_last_yummi_check,
     update_last_yummi_check,
@@ -591,7 +591,7 @@ class WalletBud(commands.Bot):
                 # Check each wallet
                 for wallet in wallets:
                     if not self.monitoring_paused:
-                        await self.check_wallet(wallet.address)
+                        await self.check_wallet(wallet['address'])
                     
             except Exception as e:
                 logger.error(f"Error in wallet check loop: {str(e)}")
@@ -605,12 +605,16 @@ class WalletBud(commands.Bot):
         try:
             async with self.wallet_task_lock:
                 # Get wallet details including user
-                wallet = await get_wallet_for_user(address)
-                if not wallet:
+                user_id = await get_user_id_for_wallet(address)
+                if not user_id:
                     logger.error(f"No user found for wallet {address}")
                     return
+                
+                wallet = await get_wallet_for_user(user_id, address)
+                if not wallet:
+                    logger.error(f"No wallet found for user {user_id} and address {address}")
+                    return
                     
-                user_id = wallet['user_id']
                 wallet_id = wallet['id']
 
                 # Check YUMMI requirement every 6 hours
@@ -1435,7 +1439,7 @@ class WalletBud(commands.Bot):
             for i, address in enumerate(wallets, 1):
                 try:
                     # Get wallet details
-                    wallet = await get_wallet_for_user(address)
+                    wallet = await get_wallet_for_user(str(interaction.user.id), address)
                     if not wallet:
                         logger.error(f"No wallet found for address {address}")
                         continue
