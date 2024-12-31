@@ -42,6 +42,7 @@ from database import (
     get_notification_settings,
     update_notification_setting,
     initialize_notification_settings,
+    get_wallet,
     init_db
 )
 
@@ -142,6 +143,15 @@ class RateLimiter:
             if self.requests:
                 self.requests.pop()
 
+    async def __aenter__(self):
+        """Enter the async context manager"""
+        await self.acquire()
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Exit the async context manager"""
+        await self.release()
+        
 class WalletBud(commands.Bot):
     """WalletBud Discord bot"""
     NOTIFICATION_TYPES = {
@@ -330,33 +340,33 @@ class WalletBud(commands.Bot):
                     logger.info("Testing address info endpoint...")
                     try:
                         # Get basic address info
-                        address_info = await self.blockfrost_client.addresses(test_address)
+                        address_info = await self.blockfrost_client.address(test_address)
                         if not address_info:
                             raise Exception("Failed to get address info")
                         logger.info("Basic address info test passed")
                         
                         # Get extended address info
-                        extended_info = await self.blockfrost_client.addresses_extended(test_address)
+                        extended_info = await self.blockfrost_client.address_extended(test_address)
                         if not extended_info:
                             raise Exception("Failed to get extended address info")
                         logger.info("Extended address info test passed")
                         
                         # Get address total
-                        total_info = await self.blockfrost_client.addresses_total(test_address)
+                        total_info = await self.blockfrost_client.address_total(test_address)
                         if not total_info:
                             raise Exception("Failed to get address total")
                         logger.info("Address total test passed")
                         
                         # Test UTXOs
                         logger.info("Testing UTXOs endpoint...")
-                        utxos = await self.blockfrost_client.addresses_utxos(test_address)
+                        utxos = await self.blockfrost_client.address_utxos(test_address)
                         if not utxos:
                             raise Exception("Failed to get UTXOs")
                         logger.info("UTXOs test passed")
                         
                         # Test transactions
                         logger.info("Testing transactions endpoint...")
-                        txs = await self.blockfrost_client.addresses_transactions(test_address)
+                        txs = await self.blockfrost_client.address_transactions(test_address)
                         if txs is None:  # Can be empty list but shouldn't be None
                             raise Exception("Failed to get transactions")
                         logger.info("Transactions test passed")
@@ -504,7 +514,7 @@ class WalletBud(commands.Bot):
         """
         try:
             # Get UTXOs for the specific token
-            utxos = await self.blockfrost_client.addresses_utxos_asset(
+            utxos = await self.blockfrost_client.address_utxos_asset(
                 address=address,
                 asset=YUMMI_TOKEN_ID
             )
@@ -584,7 +594,7 @@ class WalletBud(commands.Bot):
                     return
                     
                 # Get wallet details
-                wallet = await get_wallet_for_user(user_id, address)
+                wallet = await get_wallet(address)
                 if not wallet:
                     logger.error(f"No wallet found for user {user_id} and address {address}")
                     return
@@ -628,7 +638,7 @@ class WalletBud(commands.Bot):
 
                 # Get current UTxO state
                 current_utxos = await self.rate_limited_request(
-                    self.blockfrost_client.addresses_utxos,
+                    self.blockfrost_client.address_utxos,
                     address
                 )
                 
@@ -723,7 +733,7 @@ class WalletBud(commands.Bot):
                             # Check for staking rewards
                             if not await is_reward_processed(tx.hash):
                                 rewards = await self.rate_limited_request(
-                                    self.blockfrost_client.transaction_stake_addresses,
+                                    self.blockfrost_client.transaction_stakes,
                                     tx.hash
                                 )
                                 
@@ -769,7 +779,7 @@ class WalletBud(commands.Bot):
         try:
             # Get all tokens in wallet
             assets = await self.rate_limited_request(
-                self.blockfrost_client.addresses_assets,
+                self.blockfrost_client.address_assets,
                 address
             )
             
@@ -778,7 +788,7 @@ class WalletBud(commands.Bot):
                 
                 # Get policy expiry info from Blockfrost
                 policy = await self.rate_limited_request(
-                    self.blockfrost_client.policy,
+                    self.blockfrost_client.pool,
                     policy_id
                 )
                 
@@ -812,7 +822,7 @@ class WalletBud(commands.Bot):
         try:
             # Get address details
             addr_details = await self.rate_limited_request(
-                self.blockfrost_client.addresses,
+                self.blockfrost_client.address,
                 address
             )
             
@@ -857,7 +867,7 @@ class WalletBud(commands.Bot):
         try:
             # Get latest transactions
             transactions = await self.rate_limited_request(
-                self.blockfrost_client.addresses_transactions,
+                self.blockfrost_client.address_transactions,
                 address,
                 count=10
             )
@@ -1157,7 +1167,7 @@ class WalletBud(commands.Bot):
         """Add a wallet to monitor"""
         try:
             # Check if wallet is already being monitored
-            existing = await get_wallet_for_user(str(interaction.user.id), address)
+            existing = await get_wallet(address)
             if existing:
                 await interaction.response.send_message(
                     f"❌ Wallet `{address[:8]}...{address[-8:]}` is already being monitored.",
@@ -1196,7 +1206,7 @@ class WalletBud(commands.Bot):
         """Remove a wallet from monitoring"""
         try:
             # Check if wallet exists
-            wallet = await get_wallet_for_user(address)
+            wallet = await get_wallet(address)
             if not wallet or wallet['user_id'] != str(interaction.user.id):
                 await interaction.response.send_message("❌ Wallet not found!", ephemeral=True)
                 return
@@ -1219,7 +1229,7 @@ class WalletBud(commands.Bot):
         """List all registered wallets"""
         try:
             # Get user's wallets
-            addresses = await get_all_wallets_for_user(str(interaction.user.id))
+            addresses = await get_all_wallets()
             if not addresses:
                 await self.send_response(
                     interaction,
@@ -1239,7 +1249,7 @@ class WalletBud(commands.Bot):
             for i, address in enumerate(addresses, 1):
                 try:
                     # Get wallet details
-                    wallet = await get_wallet_for_user(str(interaction.user.id), address)
+                    wallet = await get_wallet(address)
                     if not wallet:
                         logger.error(f"No wallet found for address {address}")
                         continue
@@ -1358,7 +1368,7 @@ class WalletBud(commands.Bot):
             try:
                 # Test with a known address
                 test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
-                await self.blockfrost_client.addresses(test_address)
+                await self.blockfrost_client.address(test_address)
                 blockfrost_status = "✅ Connected"
             except Exception as e:
                 logger.error(f"Blockfrost health check failed: {str(e)}")
@@ -1402,7 +1412,7 @@ class WalletBud(commands.Bot):
         """Get your wallet's current balance"""
         try:
             # Get user's wallets
-            wallets = await get_all_wallets_for_user(str(interaction.user.id))
+            wallets = await get_all_wallets()
             if not wallets:
                 await self.send_response(
                     interaction,
@@ -1422,7 +1432,7 @@ class WalletBud(commands.Bot):
             for i, address in enumerate(wallets, 1):
                 try:
                     # Get wallet details
-                    wallet = await get_wallet_for_user(str(interaction.user.id), address)
+                    wallet = await get_wallet(address)
                     if not wallet:
                         logger.error(f"No wallet found for address {address}")
                         continue
@@ -1430,7 +1440,7 @@ class WalletBud(commands.Bot):
                     wallet_id = wallet['id']
                     
                     # Get UTXOs for balance calculation
-                    utxos = await self.blockfrost_client.addresses_utxos(address)
+                    utxos = await self.blockfrost_client.address_utxos(address)
                     
                     if utxos:
                         # Calculate ADA balance
@@ -1449,7 +1459,7 @@ class WalletBud(commands.Bot):
                         )
                         
                         # Get transaction count
-                        tx_info = await self.blockfrost_client.addresses_total(address)
+                        tx_info = await self.blockfrost_client.address_total(address)
                         tx_count = tx_info.tx_count if tx_info else 0
                         
                         # Get warning count

@@ -4,6 +4,10 @@ import asyncpg
 from datetime import datetime
 import json
 from typing import List, Optional
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -1398,6 +1402,8 @@ async def initialize_notification_settings(user_id: str):
                 default_settings['delegation_status'],
                 default_settings['dapp_interactions']
             )
+            
+            logger.info(f"Initialized notification settings for user {user_id}")
                 
     except Exception as e:
         logger.error(f"Error initializing notification settings: {e}")
