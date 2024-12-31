@@ -59,7 +59,8 @@ from database import (
     increment_yummi_warning,
     get_policy_expiry,
     update_policy_expiry,
-    init_db
+    init_db,
+    get_all_wallets
 )
 
 # Configure logging

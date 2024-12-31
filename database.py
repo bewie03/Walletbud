@@ -35,7 +35,6 @@ SCHEMA = """
 -- Drop tables in correct order
 DROP TABLE IF EXISTS transactions CASCADE;
 DROP TABLE IF EXISTS processed_rewards CASCADE;
-DROP TABLE IF EXISTS notification_settings CASCADE;
 DROP TABLE IF EXISTS yummi_warnings CASCADE;
 DROP TABLE IF EXISTS stake_addresses CASCADE;
 DROP TABLE IF EXISTS policy_expiry CASCADE;
@@ -47,17 +46,15 @@ CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     user_id TEXT UNIQUE NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    notification_settings JSONB DEFAULT '{
-        "ada_transactions": true,
-        "token_changes": true,
-        "nft_updates": true,
-        "staking_rewards": true,
-        "stake_changes": true,
-        "low_balance": true,
-        "policy_expiry": true,
-        "delegation_status": true,
-        "dapp_interactions": true
-    }'::jsonb
+    ada_transactions BOOLEAN DEFAULT TRUE,
+    token_changes BOOLEAN DEFAULT TRUE,
+    nft_updates BOOLEAN DEFAULT TRUE,
+    staking_rewards BOOLEAN DEFAULT TRUE,
+    stake_changes BOOLEAN DEFAULT TRUE,
+    low_balance BOOLEAN DEFAULT TRUE,
+    policy_expiry BOOLEAN DEFAULT TRUE,
+    delegation_status BOOLEAN DEFAULT TRUE,
+    dapp_interactions BOOLEAN DEFAULT TRUE
 );
 
 -- Wallets table for storing wallet addresses
@@ -516,10 +513,23 @@ async def get_notification_settings(user_id: str):
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT notification_settings FROM users WHERE user_id = $1",
+                "SELECT * FROM users WHERE user_id = $1",
                 user_id
             )
-            return row['notification_settings'] if row else None
+            if row:
+                return {
+                    "ada_transactions": row['ada_transactions'],
+                    "token_changes": row['token_changes'],
+                    "nft_updates": row['nft_updates'],
+                    "staking_rewards": row['staking_rewards'],
+                    "stake_changes": row['stake_changes'],
+                    "low_balance": row['low_balance'],
+                    "policy_expiry": row['policy_expiry'],
+                    "delegation_status": row['delegation_status'],
+                    "dapp_interactions": row['dapp_interactions']
+                }
+            else:
+                return None
     except Exception as e:
         logger.error(f"Error getting notification settings: {str(e)}")
         return None
@@ -538,22 +548,13 @@ async def update_notification_setting(user_id: str, setting: str, enabled: bool)
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Update specific setting using jsonb_set
-            result = await conn.execute(
-                """
+            # Update specific setting
+            query = f"""
                 UPDATE users 
-                SET notification_settings = jsonb_set(
-                    COALESCE(notification_settings, '{}'::jsonb),
-                    ARRAY[$2],
-                    $3::jsonb,
-                    true
-                )
-                WHERE user_id = $1
-                """,
-                user_id, 
-                '{' + setting + '}',  # Convert setting to proper JSONB path
-                'true' if enabled else 'false'
-            )
+                SET {setting} = $1
+                WHERE user_id = $2
+            """
+            result = await conn.execute(query, enabled, user_id)
             return result == "UPDATE 1"
     except Exception as e:
         logger.error(f"Error updating notification setting: {str(e)}")
@@ -1373,17 +1374,33 @@ async def initialize_notification_settings(user_id: str):
             # Insert into users table with default settings
             await conn.execute(
                 """
-                INSERT INTO users (user_id, notification_settings)
-                VALUES ($1, $2)
+                INSERT INTO users (user_id, ada_transactions, token_changes, nft_updates, staking_rewards, stake_changes, low_balance, policy_expiry, delegation_status, dapp_interactions)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT (user_id) DO UPDATE 
-                SET notification_settings = EXCLUDED.notification_settings
+                SET ada_transactions = EXCLUDED.ada_transactions,
+                    token_changes = EXCLUDED.token_changes,
+                    nft_updates = EXCLUDED.nft_updates,
+                    staking_rewards = EXCLUDED.staking_rewards,
+                    stake_changes = EXCLUDED.stake_changes,
+                    low_balance = EXCLUDED.low_balance,
+                    policy_expiry = EXCLUDED.policy_expiry,
+                    delegation_status = EXCLUDED.delegation_status,
+                    dapp_interactions = EXCLUDED.dapp_interactions
                 """,
                 user_id,
-                json.dumps(default_settings)
+                default_settings['ada_transactions'],
+                default_settings['token_changes'],
+                default_settings['nft_updates'],
+                default_settings['staking_rewards'],
+                default_settings['stake_changes'],
+                default_settings['low_balance'],
+                default_settings['policy_expiry'],
+                default_settings['delegation_status'],
+                default_settings['dapp_interactions']
             )
                 
     except Exception as e:
-        logger.error(f"Error initializing notification settings: {str(e)}")
+        logger.error(f"Error initializing notification settings: {e}")
 
 async def main():
     """Example usage of database functions"""
