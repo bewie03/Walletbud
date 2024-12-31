@@ -30,6 +30,14 @@ A Discord bot for monitoring Cardano wallets with YUMMI token validation and com
 - Automatic retry with exponential backoff
 - Admin channel error reporting
 
+### Database Optimization
+- Automated schema migrations
+- Table partitioning for efficient data management
+- Optimized indexes for fast queries
+- Connection pooling for better performance
+- Parallel query execution support
+- Configurable PostgreSQL settings
+
 ## Commands
 
 - `/addwallet <address>` - Register a wallet (DM only, requires YUMMI tokens)
@@ -82,6 +90,28 @@ MIN_ADA_BALANCE=5
 MAX_TX_PER_HOUR=10
 MONITORING_INTERVAL=60
 ```
+
+### Database Setup
+1. Create a PostgreSQL database
+2. Set `DATABASE_URL` environment variable
+3. Run migrations: `python database.py`
+
+The bot uses an automated migration system to manage database schema changes. Migrations are versioned and run automatically during startup. The system includes:
+
+- Version tracking table
+- Automated schema updates
+- Table partitioning for transactions
+- Index creation for performance
+- Connection pool optimization
+
+### Performance Tuning
+The database is optimized for high performance with:
+
+- Monthly partitioning for transaction history
+- Indexes on frequently queried columns
+- Connection pooling (max 200 connections)
+- Parallel query execution (4-8 workers)
+- Optimized PostgreSQL settings for SSD storage
 
 ### Local Development
 1. Clone the repository
