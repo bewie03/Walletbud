@@ -8,15 +8,20 @@ import asyncio
 from functools import wraps
 import random
 import psutil
+import hmac
+import hashlib
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from blockfrost import BlockFrostApi, ApiUrls
+from aiohttp import web
+
+import config
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Set to DEBUG for more detailed logs
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout)
@@ -29,9 +34,13 @@ from config import (
     MAX_REQUESTS_PER_SECOND,
     BURST_LIMIT,
     RATE_LIMIT_COOLDOWN,
-    YUMMI_TOKEN_ID,
-    MIN_YUMMI_REQUIREMENT,
-    WALLET_CHECK_INTERVAL
+    YUMMI_POLICY_ID,
+    YUMMI_TOKEN_NAME,
+    MINIMUM_YUMMI,
+    WALLET_CHECK_INTERVAL,
+    WEBHOOK_IDENTIFIER,
+    WEBHOOK_AUTH_TOKEN,
+    WEBHOOK_CONFIRMATIONS
 )
 
 from database import (
@@ -44,7 +53,10 @@ from database import (
     update_notification_setting,
     initialize_notification_settings,
     get_wallet_for_user,
-    init_db
+    init_db,
+    get_all_monitored_addresses,
+    get_addresses_for_stake,
+    update_pool_for_stake
 )
 
 def get_request_id():
@@ -184,14 +196,12 @@ class WalletBud(commands.Bot):
         "ada_transactions": "ada_transactions",
         "token_changes": "token_changes", 
         "nft_updates": "nft_updates",
-        "staking_rewards": "staking_rewards",
         "stake_changes": "stake_changes",
-        "low_balance": "low_balance",
         "policy_expiry": "policy_expiry",
         "delegation_status": "delegation_status",
+        "staking_rewards": "staking_rewards",
         "dapp_interactions": "dapp_interactions",
-        "failed_transactions": "failed_transactions",
-        "asset_history": "asset_history"
+        "failed_transactions": "failed_transactions"
     }
     
     NOTIFICATION_DISPLAY = {
@@ -199,28 +209,24 @@ class WalletBud(commands.Bot):
         "ada_transactions": "ADA Transactions",
         "token_changes": "Token Changes",
         "nft_updates": "NFT Updates",
-        "staking_rewards": "Staking Rewards",
         "stake_changes": "Stake Key Changes",
-        "low_balance": "Low Balance Alerts",
         "policy_expiry": "Policy Expiry Alerts",
         "delegation_status": "Delegation Status",
+        "staking_rewards": "Staking Rewards",
         "dapp_interactions": "DApp Interactions",
-        "failed_transactions": "Failed Transactions",
-        "asset_history": "Asset History"
+        "failed_transactions": "Failed Transactions"
     }
-    
+
     DEFAULT_SETTINGS = {
         "ada_transactions": True,
         "token_changes": True,
         "nft_updates": True,
-        "staking_rewards": True,
         "stake_changes": True,
-        "low_balance": True,
         "policy_expiry": True,
         "delegation_status": True,
+        "staking_rewards": True,
         "dapp_interactions": True,
-        "failed_transactions": True,
-        "asset_history": True
+        "failed_transactions": True
     }
 
     DAPP_IDENTIFIERS = {
@@ -247,9 +253,14 @@ class WalletBud(commands.Bot):
 
     def __init__(self):
         """Initialize the bot"""
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        intents.members = True
+        
         super().__init__(
             command_prefix='!',
-            intents=discord.Intents.all(),
+            intents=intents,
             help_command=None
         )
         
@@ -288,146 +299,100 @@ class WalletBud(commands.Bot):
         }
         self.metadata_fields = [field.lower() for field in self.DAPP_IDENTIFIERS["metadata_fields"]]
         
+        # Initialize webhook server
+        self.app = web.Application()
+        self.app.router.add_post('/webhooks/blockfrost', self.handle_webhook)
+        self.runner = web.AppRunner(self.app)
+        self.port = 49152  # Using a high port number less likely to be in use
+        self.monitored_addresses = set()
+        self.monitored_stake_addresses = set()
+        
     async def setup_hook(self):
         """Setup hook called before the bot starts"""
         try:
-            logger.info("Starting bot initialization...")
-            
-            # Initialize database first
-            logger.info("Initializing database...")
+            # Initialize database
             await init_db()
-            logger.info("Database initialized successfully")
             
-            # Initialize Blockfrost client with retries
-            logger.info("Initializing Blockfrost client...")
-            if not await self.init_blockfrost():
-                logger.error("Failed to initialize Blockfrost client - bot may have limited functionality")
-            else:
-                logger.info("Blockfrost client initialized successfully")
+            # Load monitored addresses
+            addresses, stake_addresses = await get_all_monitored_addresses()
+            self.monitored_addresses = addresses
+            self.monitored_stake_addresses = stake_addresses
             
-            # Set up commands
-            logger.info("Setting up Discord commands...")
-            try:
-                await self.setup_commands()
-                logger.info("Commands set up successfully")
-                
-                # Sync commands with Discord
-                logger.info("Syncing commands with Discord...")
-                await self.tree.sync()
-                logger.info("Commands synced successfully")
-            except Exception as e:
-                logger.error(f"Failed to set up or sync commands: {str(e)}")
-                if hasattr(e, '__dict__'):
-                    logger.error(f"Error details: {e.__dict__}")
-                raise
-            
-            # Start wallet monitoring task only if Blockfrost is initialized
-            if self.blockfrost_client:
-                logger.info("Starting wallet monitoring task...")
-                self.check_wallets.start()
-                logger.info("Wallet monitoring task started")
-            else:
-                logger.error("Skipping wallet monitoring task - Blockfrost client not initialized")
-            
-            # Start system monitoring
-            self.bg_task = self.loop.create_task(self.monitor_system_health())
-            
-            # Start cleanup task
-            self.cleanup_task.start()
-            
-            # Store start time for uptime tracking
-            self.start_time = datetime.now()
-            
-            logger.info("Bot initialization completed")
+            logger.info(f"Loaded {len(addresses)} monitored addresses")
+            logger.info(f"Loaded {len(stake_addresses)} stake addresses")
             
         except Exception as e:
-            logger.error(f"Critical error during bot initialization: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            raise
+            logger.error(f"Error in setup: {str(e)}")
+            raise e
+
+    async def update_webhook_conditions(self):
+        """Update Blockfrost webhook conditions"""
+        try:
+            # Get Blockfrost API client
+            project_id = os.getenv('BLOCKFROST_PROJECT_ID')
+            if not project_id:
+                logger.error("BLOCKFROST_PROJECT_ID not configured")
+                return
+                
+            # Update transaction webhook
+            conditions = {
+                "addresses": list(self.monitored_addresses),
+                "confirmations": config.WEBHOOKS['transaction']['confirmations']
+            }
+            await self.rate_limited_request(
+                self.blockfrost_client.webhook_update,
+                webhook_id=config.WEBHOOKS['transaction']['id'],
+                conditions=conditions
+            )
+            logger.info(f"Updated transaction webhook with {len(self.monitored_addresses)} addresses")
+            
+            # Update delegation webhook
+            conditions = {
+                "stake_addresses": list(self.monitored_stake_addresses),
+                "confirmations": config.WEBHOOKS['delegation']['confirmations']
+            }
+            await self.rate_limited_request(
+                self.blockfrost_client.webhook_update,
+                webhook_id=config.WEBHOOKS['delegation']['id'],
+                conditions=conditions
+            )
+            logger.info(f"Updated delegation webhook with {len(self.monitored_stake_addresses)} stake addresses")
+            
+        except Exception as e:
+            logger.error(f"Error updating webhook conditions: {str(e)}")
 
     async def init_blockfrost(self):
         """Initialize Blockfrost API client"""
-        MAX_RETRIES = 3
-        RETRY_DELAY = 5  # seconds
-        
-        for attempt in range(MAX_RETRIES):
+        try:
+            logger.info("Creating Blockfrost client...")
+            self.blockfrost_client = BlockFrostApi(
+                project_id=BLOCKFROST_PROJECT_ID
+            )
+            logger.info("Blockfrost client created successfully")
+            
+            # Test connection
+            logger.info("Testing Blockfrost connection...")
+            test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
+            logger.info(f"Testing with address: {test_address[:20]}...")
+            
             try:
-                logger.info(f"Creating Blockfrost client (attempt {attempt + 1}/{MAX_RETRIES})...")
-                
-                # Check project ID
-                if not BLOCKFROST_PROJECT_ID:
-                    logger.error("BLOCKFROST_PROJECT_ID not set")
-                    return False
-                    
-                # Log first few characters of project ID for debugging
-                logger.info(f"Using project ID starting with: {BLOCKFROST_PROJECT_ID[:8]}...")
-                
-                # Create client with correct project ID
-                self.blockfrost_client = BlockFrostApi(
-                    project_id=BLOCKFROST_PROJECT_ID
+                logger.info("Testing address info endpoint...")
+                await self.rate_limited_request(
+                    self.blockfrost_client.address,
+                    test_address
                 )
-                logger.info("BlockFrostApi client created successfully")
+                logger.info("Blockfrost connection test successful")
+                return True
                 
-                # Test connection with address endpoint
-                try:
-                    logger.info("Testing Blockfrost connection...")
-                    # Use a known valid address to test connection
-                    test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
-                    logger.info(f"Testing with address: {test_address[:20]}...")
-                    
-                    # Test basic address info
-                    logger.info("Testing address info endpoint...")
-                    async with self.rate_limiter:
-                        address_info = await asyncio.to_thread(self.blockfrost_client.address, test_address)
-                        if not address_info:
-                            raise Exception("Failed to get address info")
-                        logger.info("Basic address info test passed")
-                    
-                    # Get extended address info
-                    async with self.rate_limiter:
-                        extended_info = await asyncio.to_thread(self.blockfrost_client.address_extended, test_address)
-                        if not extended_info:
-                            raise Exception("Failed to get extended address info")
-                        logger.info("Extended address info test passed")
-                    
-                    # Get address total
-                    async with self.rate_limiter:
-                        total_info = await asyncio.to_thread(self.blockfrost_client.address_total, test_address)
-                        if not total_info:
-                            raise Exception("Failed to get address total")
-                        logger.info("Address total test passed")
-                    
-                    # Test UTXOs
-                    logger.info("Testing UTXOs endpoint...")
-                    async with self.rate_limiter:
-                        utxos = await asyncio.to_thread(self.blockfrost_client.address_utxos, test_address)
-                        if not utxos:
-                            raise Exception("Failed to get UTXOs")
-                        logger.info("UTXOs test passed")
-                    
-                    logger.info("All Blockfrost connection tests passed")
-                    return True
-                    
-                except Exception as e:
-                    logger.error(f"Blockfrost test failed: {str(e)}")
-                    raise
-                        
             except Exception as e:
-                logger.error(f"Failed to create Blockfrost client: {str(e)}")
-                if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                    logger.error(f"Response details: {e.response.text}")
-                if hasattr(e, '__dict__'):
-                    logger.error(f"Error details: {e.__dict__}")
-                self.blockfrost_client = None
+                logger.error(f"Address info test failed: {str(e)}")
+                logger.error(f"Error details: {e}")
+                return False
                 
-                if attempt < MAX_RETRIES - 1:
-                    logger.info(f"Retrying in {RETRY_DELAY} seconds...")
-                    await asyncio.sleep(RETRY_DELAY)
-                continue
-        
-        logger.error(f"Failed to initialize Blockfrost client after {MAX_RETRIES} attempts")
-        return False
+        except Exception as e:
+            logger.error(f"Failed to create Blockfrost client: {str(e)}")
+            logger.error(f"Error details: {e}")
+            return False
 
     async def rate_limited_request(self, func, *args, **kwargs):
         """Make a rate-limited request to the Blockfrost API with retry logic"""
@@ -529,441 +494,285 @@ class WalletBud(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to send admin alert: {str(e)}")
 
-    async def check_yummi_requirement(self, address: str):
+    async def check_yummi_requirement(self, address: str, user_id: int):
         """Check if wallet meets YUMMI token requirement"""
         try:
-            # Get all assets for the address
-            assets = await self.rate_limited_request(self.blockfrost_client.address_assets, address)
+            assets = await self.rate_limited_request(
+                self.blockfrost_client.address_assets,
+                address=address
+            )
             
             # Find YUMMI token
             yummi_balance = 0
             for asset in assets:
-                if asset.unit == YUMMI_TOKEN_ID:
+                if asset.unit == f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}":
                     yummi_balance = int(asset.quantity)
                     break
             
-            meets_requirement = yummi_balance >= MIN_YUMMI_REQUIREMENT
-            return meets_requirement, yummi_balance
+            if yummi_balance < MINIMUM_YUMMI:
+                await self.notify_user(
+                    user_id,
+                    f"❌ Wallet {address[:8]}... has been removed due to insufficient YUMMI balance"
+                )
+                await remove_wallet(address)
+                return False
+                
+            return True
             
         except Exception as e:
-            logger.error(f"Error checking YUMMI requirement for {address}: {str(e)}")
-            return False, 0
+            logger.error(f"Error checking YUMMI requirement: {str(e)}")
+            return False
 
     @tasks.loop(seconds=WALLET_CHECK_INTERVAL)
     async def check_wallets(self):
-        """Background task to check all wallets periodically"""
-        if self.monitoring_paused or self.processing_wallets:
-            logger.info("Skipping wallet check - monitoring paused or already processing")
-            return
-            
-        try:
-            async with self.wallet_task_lock:
-                self.processing_wallets = True
-                logger.info("Starting wallet check cycle...")
-                
-                # Verify Blockfrost client
-                if not self.blockfrost_client:
-                    logger.error("Cannot check wallets - Blockfrost client not initialized")
-                    # Try to reinitialize
-                    if not await self.init_blockfrost():
-                        logger.error("Failed to reinitialize Blockfrost client")
-                        return
-                
-                # Get all wallets
+        """Check all registered wallets periodically"""
+        while True:
+            try:
                 wallets = await get_all_wallets()
                 if not wallets:
-                    logger.info("No wallets to check")
-                    return
-                    
-                logger.info(f"Checking {len(wallets)} wallets...")
+                    await asyncio.sleep(300)
+                    continue
+
+                # Process in smaller batches of 25 to stay within rate limits
+                # 25 wallets = ~75 calls per batch, allowing for burst recovery
+                wallet_batches = [wallets[i:i + 25] for i in range(0, len(wallets), 25)]
                 
-                for wallet in wallets:
+                for batch_idx, batch in enumerate(wallet_batches):
                     try:
-                        await self.check_wallet(wallet['address'])
+                        addresses = [w['address'] for w in batch]
+                        
+                        # Get all data concurrently for this batch
+                        batch_utxos, batch_txs, batch_extended = await self.get_batch_data(addresses)
+                        
+                        # Process each wallet in the batch
+                        for i, wallet in enumerate(batch):
+                            address = wallet['address']
+                            user_id = wallet['user_id']
+                            
+                            # YUMMI check (every 6 hours)
+                            last_yummi_check = await get_last_yummi_check(address)
+                            if not last_yummi_check or (datetime.now() - last_yummi_check).total_seconds() > 21600:
+                                meets_req = await self.check_yummi_requirement(address, user_id)
+                                await update_last_yummi_check(address)
+                                
+                                if not meets_req:
+                                    warning_count = await increment_yummi_warning(wallet['id'])
+                                    if warning_count >= 3:
+                                        logger.warning(f"Removing wallet {address} due to insufficient YUMMI balance")
+                                        await remove_wallet(wallet['id'])
+                                        continue
+                            
+                            # Policy check (weekly)
+                            last_policy_check = await get_last_policy_check(address)
+                            if not last_policy_check or (datetime.now() - last_policy_check).total_seconds() > 604800:
+                                await self._check_policy_expiry(address, user_id)
+                            
+                            # Get wallet's data from batch responses
+                            wallet_utxos = [u for u in batch_utxos if u.address == address]
+                            wallet_txs = [tx for tx in batch_txs if tx.address == address]
+                            wallet_extended = batch_extended[i]
+                            
+                            # Process regular checks
+                            await self._process_wallet_data(
+                                address, 
+                                user_id, 
+                                wallet_utxos, 
+                                wallet_txs,
+                                wallet_extended
+                            )
+                            
+                            # Get stake address if not cached
+                            if not await get_stake_address(address):
+                                stake_address = await self.rate_limited_request(
+                                    self.blockfrost_client.address_stake,
+                                    address
+                                )
+                                if stake_address:
+                                    await update_stake_address(address, stake_address)
+                        
                     except Exception as e:
-                        logger.error(f"Error checking wallet {wallet['address']}: {str(e)}")
+                        logger.error(f"Error processing wallet batch: {str(e)}")
                         if hasattr(e, '__dict__'):
                             logger.error(f"Error details: {e.__dict__}")
                         continue
+                    
+                    # Calculate delay needed for rate limit
+                    # Each batch uses ~75 calls, we want to recharge at least that many
+                    # At 10 calls/second recharge rate, we need 7.5 seconds
+                    delay = 8 if batch_idx < len(wallet_batches) - 1 else 0
+                    await asyncio.sleep(delay)
                 
-                logger.info("Wallet check cycle completed")
-                
+            except Exception as e:
+                logger.error(f"Error in check_wallets loop: {str(e)}")
+                if hasattr(e, '__dict__'):
+                    logger.error(f"Error details: {e.__dict__}")
+            
+            # Wait 5 minutes before next check
+            await asyncio.sleep(300)
+
+    async def get_paginated_transactions(self, address: str, pages: int = 3) -> list:
+        """Get paginated transactions for an address
+        
+        Args:
+            address: Wallet address
+            pages: Number of pages to fetch (default 3 = 300 transactions)
+            
+        Returns:
+            List of transactions
+        """
+        all_txs = []
+        for page in range(1, pages + 1):
+            txs = await self.rate_limited_request(
+                self.blockfrost_client.address_transactions,
+                address=address,
+                count=100,
+                page=page
+            )
+            if not txs:
+                break
+            all_txs.extend(txs)
+        return all_txs
+
+    async def get_batch_data(self, addresses: list) -> tuple:
+        """Get all data for a batch of addresses concurrently
+        
+        Args:
+            addresses: List of wallet addresses
+            
+        Returns:
+            Tuple of (utxos, transactions, extended_info)
+        """
+        # Create tasks for each type of request
+        utxo_task = self.rate_limited_request(
+            self.blockfrost_client.addresses_utxos,
+            addresses=addresses
+        )
+        
+        tx_task = self.rate_limited_request(
+            self.blockfrost_client.addresses_transactions,
+            addresses=addresses,
+            count=100
+        )
+        
+        # Get extended info for each address concurrently
+        extended_tasks = [
+            self.rate_limited_request(
+                self.blockfrost_client.address_extended,
+                address=addr
+            ) for addr in addresses
+        ]
+        
+        # Run all tasks concurrently
+        utxos, txs, extended_info = await asyncio.gather(
+            utxo_task,
+            tx_task,
+            asyncio.gather(*extended_tasks)
+        )
+        
+        return utxos, txs, extended_info
+
+    async def _process_wallet_data(self, address: str, user_id: int, utxos: list, transactions: list, extended_info):
+        """Process wallet data from batch responses"""
+        try:
+            monitoring_since = await get_monitoring_since(address)
+            if not monitoring_since:
+                return
+
+            # Filter transactions after monitoring started
+            new_transactions = [
+                tx for tx in transactions 
+                if datetime.fromisoformat(tx.block_time) > monitoring_since
+            ]
+
+            # Process checks in parallel
+            await asyncio.gather(
+                self._check_delegation_status(address, user_id, extended_info),
+                self._check_balance_changes(address, user_id, utxos, new_transactions)
+            )
+
         except Exception as e:
-            logger.error(f"Critical error in wallet check task: {str(e)}")
+            logger.error(f"Error processing wallet data for {address}: {str(e)}")
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
-            await self.send_admin_alert(f"Critical error in wallet monitoring: {str(e)}")
-            
-        finally:
-            self.processing_wallets = False
 
-    async def check_wallet(self, address: str):
-        """Check a single wallet's balance and transactions"""
+    async def _check_balance_changes(self, address: str, user_id: int, utxos: list, transactions: list):
+        """Check for balance changes in wallet"""
         try:
-            async with self.wallet_task_lock:
-                # Get user ID for the wallet
-                user_id = await get_user_id_for_wallet(address)
-                if not user_id:
-                    logger.error(f"No user found for wallet {address}")
-                    return
-                    
-                # Get wallet details
-                wallet = await get_wallet_for_user(user_id, address)
-                if not wallet:
-                    logger.error(f"No wallet found for user {user_id} and address {address}")
-                    return
-                    
-                wallet_id = wallet['id']
+            # Get previous UTxO state
+            previous_state = await get_utxo_state(address)
+                
+            # Update UTxO state
+            new_state = {
+                'utxos': [utxo.tx_hash for utxo in utxos],
+                'last_updated': datetime.now().isoformat()
+            }
 
-                # Check YUMMI requirement every 6 hours
-                last_check = await get_last_yummi_check(address)
-                if not last_check or (datetime.now() - last_check).total_seconds() > 21600:  # 6 hours
-                    meets_req, balance = await self.check_yummi_requirement(address)
-                    await update_last_yummi_check(address)
+            # Only notify if we have a previous state to compare against
+            if previous_state and previous_state.get('utxos'):
+                old_utxos = set(previous_state['utxos'])
+                new_utxos = set(new_state['utxos'])
+                
+                # Check for spent and received UTXOs
+                spent = old_utxos - new_utxos
+                received = new_utxos - old_utxos
+                
+                if spent or received:
+                    # Get transaction details for new UTXOs
+                    message = f"💰 Balance change detected in wallet {address[:8]}...\n"
                     
-                    if not meets_req:
-                        # Increment warning count and get new count
-                        warning_count = await increment_yummi_warning(wallet_id)
+                    if spent:
+                        message += "🔸 Outgoing transaction(s)\n"
+                    if received:
+                        message += "🔹 Incoming transaction(s)\n"
                         
-                        # Remove wallet after 3 warnings
-                        if warning_count >= 3:
-                            logger.warning(f"Removing wallet {address} due to insufficient YUMMI balance")
-                            await remove_wallet(wallet_id)
-                            
-                            if await should_notify(user_id, "low_balance"):
-                                await self.send_dm(
-                                    user_id,
-                                    f"❌ Your wallet `{address[:8]}...{address[-8:]}` has been removed from monitoring due to "
-                                    f"insufficient YUMMI token balance ({balance} < {MIN_YUMMI_REQUIREMENT})"
-                                )
-                            return
-                        
-                        # Send warning
-                        if await should_notify(user_id, "low_balance"):
-                            await self.send_dm(
-                                user_id,
-                                f"⚠️ Warning ({warning_count}/3): Your wallet `{address[:8]}...{address[-8:]}` has insufficient "
-                                f"YUMMI token balance ({balance} < {MIN_YUMMI_REQUIREMENT}). Please add more YUMMI tokens to "
-                                "continue monitoring."
-                            )
-                
-                # Get current wallet state
-                try:
-                    # Get current transactions
-                    current_txs = await self.rate_limited_request(
-                        self.blockfrost_client.address_transactions,
-                        address=address,
-                        count=50  # Limit to recent transactions
-                    )
-                    
-                    # Get current UTXOs
-                    current_utxos = await self.rate_limited_request(
-                        self.blockfrost_client.address_utxos,
-                        address=address
-                    )
-                    
-                    # Get extended info for delegation status
-                    extended_info = await self.rate_limited_request(
-                        self.blockfrost_client.address_extended,
-                        address=address
-                    )
-                    
-                    # Process each check in parallel
-                    await asyncio.gather(
-                        self._check_policy_expiry(address, user_id),
-                        self._check_delegation_status(address, user_id, extended_info),
-                        self._check_dapp_interactions(address, user_id, current_txs)
-                    )
-                    
-                except Exception as e:
-                    logger.error(f"Error getting wallet state for {address}: {str(e)}")
-                    if hasattr(e, '__dict__'):
-                        logger.error(f"Error details: {e.__dict__}")
-                    return
-                
-                # Get and update stake address
-                stake_address = await self.rate_limited_request(
-                    self.blockfrost_client.address_stake,
-                    address
-                )
-                if stake_address:
-                    await update_stake_address(address, stake_address)
-
-                # Get current UTxO state
-                current_utxos = await self.rate_limited_request(
-                    self.blockfrost_client.address_utxos,
-                    address
-                )
-                
-                if not current_utxos:
-                    logger.error(f"Failed to get UTXOs for {address}")
-                    return
-
-                # Get previous UTxO state to check for changes
-                previous_state = await get_utxo_state(address)
-                
-                # Update UTxO state
-                new_state = {
-                    'utxos': [utxo.tx_hash for utxo in current_utxos],
-                    'last_updated': datetime.now().isoformat()
-                }
-                await update_utxo_state(address, new_state)
-                
-                # Check for UTxO changes
-                if previous_state:
-                    prev_utxos = set(previous_state.get('utxos', []))
-                    current_utxos_set = set(new_state['utxos'])
-                    
-                    # Notify about significant UTxO changes
-                    if prev_utxos != current_utxos_set and await should_notify(user_id, "utxo_changes"):
-                        spent_utxos = prev_utxos - current_utxos_set
-                        new_utxos = current_utxos_set - prev_utxos
-                        
-                        if spent_utxos or new_utxos:
-                            message = f"📝 UTxO Changes Detected for `{address[:8]}...{address[-8:]}`:\n"
-                            if new_utxos:
-                                message += f"New UTxOs: {len(new_utxos)}\n"
-                            if spent_utxos:
-                                message += f"Spent UTxOs: {len(spent_utxos)}\n"
-                            await self.send_dm(int(user_id), message)
-                
-                # Calculate ADA balance and token balances
-                ada_balance = 0
-                token_balances = {}
-                
-                for utxo in current_utxos:
-                    if utxo.amount:
-                        for amount in utxo.amount:
-                            if amount.unit == 'lovelace':
-                                ada_balance += int(amount.quantity)
-                            else:
-                                token_id = amount.unit
-                                current_amount = token_balances.get(token_id, 0)
-                                token_balances[token_id] = current_amount + int(amount.quantity)
-                
-                ada_balance = ada_balance / 1_000_000  # Convert to ADA
-                
-                # Update token balances in database
-                await update_token_balances(address, token_balances)
-                
-                # Get previous balance for comparison
-                previous_balance = await get_wallet_balance(address)
-                
-                # Check for low ADA balance
-                if ada_balance < 5 and await should_notify(user_id, "low_balance"):
-                    await self.send_dm(
-                        int(user_id),
-                        f"⚠️ Low ADA balance warning!\n"
-                        f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                        f"Current balance: {ada_balance:.2f} ₳"
-                    )
-                
-                # Check for significant balance changes
-                if previous_balance and abs(ada_balance - previous_balance) > 1:  # 1 ADA threshold
-                    if await should_notify(user_id, "ada_transactions"):
-                        change = ada_balance - previous_balance
-                        await self.send_dm(
-                            int(user_id),
-                            f"💰 Balance Change Detected!\n"
-                            f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                            f"{'Received' if change > 0 else 'Sent'}: {abs(change):.2f} ₳\n"
-                            f"New Balance: {ada_balance:.2f} ₳"
-                        )
-                
-                # Update wallet balance
-                await update_ada_balance(address, ada_balance)
-                
-                # Get and process recent transactions
-                recent_txs = await self.rate_limited_request(
-                    self.blockfrost_client.address_transactions,
-                    address=address,
-                    count=50  # Limit to recent transactions
-                )
-                if recent_txs:
-                    last_known_txs = await get_last_transactions(address) or []
-                    
-                    for tx in recent_txs:
-                        if tx.hash not in last_known_txs:
-                            # Add new transaction to database
-                            await add_transaction(wallet_id, tx.hash)
-                            
-                            # Check for staking rewards
-                            if not await is_reward_processed(tx.hash):
-                                rewards = await self.rate_limited_request(
-                                    self.blockfrost_client.transaction_stakes,
-                                    tx.hash
-                                )
-                                
-                                if rewards:
-                                    for reward in rewards:
-                                        if reward.cert_index == 0:  # Reward certificate
-                                            await add_processed_reward(tx.hash)
-                                            if await should_notify(user_id, "staking_rewards"):
-                                                await self.send_dm(
-                                                    int(user_id),
-                                                    f"🎉 Staking Reward Received!\n"
-                                                    f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                                                    f"Amount: {float(reward.amount) / 1_000_000:.2f} ₳\n"
-                                                    f"Transaction: `{tx.hash}`"
-                                                )
-                            
-                            # Process transaction metadata for DApp interactions
-                            if await should_notify(user_id, "dapp_interactions"):
-                                metadata = await get_transaction_metadata(wallet_id, tx.hash)
-                                if metadata:
-                                    for field in self.metadata_fields:
-                                        if field in metadata:
-                                            value = str(metadata[field]).lower()
-                                            for dapp, patterns in self.dapp_patterns.items():
-                                                if any(pattern in value for pattern in patterns):
-                                                    await self.send_dm(
-                                                        int(user_id),
-                                                        f"🔄 DApp Interaction Detected!\n"
-                                                        f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                                                        f"DApp: {dapp.title()}\n"
-                                                        f"Transaction: `{tx.hash}`"
-                                                    )
-                                                    break
-                
-                # Update last checked timestamp
-                await update_last_checked(wallet_id)
-                
-        except Exception as e:
-            logger.error(f"Error checking wallet {address}: {str(e)}")
-
-    async def _check_policy_expiry(self, address: str, user_id: int):
-        """Check for expiring token policies"""
-        try:
-            # Get all tokens in wallet
-            assets = await self.rate_limited_request(
-                self.blockfrost_client.address_assets,
-                address
-            )
+                    await self.notify_user(user_id, message)
             
-            for asset in assets:
-                policy_id = asset.unit[:56]  # First 56 chars are policy ID
-                
-                # Get policy expiry info from Blockfrost
-                policy = await self.rate_limited_request(
-                    self.blockfrost_client.pool,
-                    policy_id
-                )
-                
-                if policy and policy.expiry:
-                    # Get stored expiry time
-                    stored_expiry = await get_policy_expiry(address, policy_id)
-                    
-                    if not stored_expiry:
-                        # New policy, store expiry
-                        await update_policy_expiry(address, policy_id, policy.expiry)
-                        continue
-                        
-                    # Check if expiring soon (within 30 days)
-                    expiry_date = datetime.fromtimestamp(policy.expiry)
-                    days_until_expiry = (expiry_date - datetime.now()).days
-                    
-                    if days_until_expiry <= 30 and await self.should_notify(int(user_id), "policy_expiry"):
-                        await self.send_dm(
-                            int(user_id),
-                            f"⚠️ **Token Policy Expiring Soon!**\n"
-                            f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                            f"Policy ID: `{policy_id}`\n"
-                            f"Days Until Expiry: `{days_until_expiry}`"
-                        )
-                        
+            # Update the stored state
+            await update_utxo_state(address, new_state)
+
         except Exception as e:
-            logger.error(f"Error checking policy expiry: {str(e)}")
+            logger.error(f"Error checking balance changes for {address}: {str(e)}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
 
     async def _check_delegation_status(self, address: str, user_id: int, extended_info):
-        """Check for delegation status changes"""
+        """Check delegation status changes"""
         try:
-            # Get delegation info
-            delegation = await self.rate_limited_request(
-                self.blockfrost_client.account_delegations,
-                extended_info.stake_address,
-                count=1,
-                page=1
-            )
+            if not extended_info:
+                return
+                
+            stake_address = extended_info.stake_address
+            if not stake_address:
+                return
+                
+            # Get previous delegation status
+            prev_status = await get_delegation_status(address)
+            curr_status = {
+                'pool_id': extended_info.stake_pool_id,
+                'active': extended_info.stake_address is not None
+            }
             
-            if delegation:
-                current_pool = delegation[0].pool_id
-                stored_pool = await get_delegation_status(address)
-                
-                if current_pool != stored_pool:
-                    await update_delegation_status(address, current_pool)
-                    
-                    if await self.should_notify(int(user_id), "delegation_status"):
-                        pool_info = await self.rate_limited_request(
-                            self.blockfrost_client.pool,
-                            current_pool
+            # Check for changes
+            if prev_status:
+                if prev_status['pool_id'] != curr_status['pool_id']:
+                    if curr_status['pool_id']:
+                        await self.notify_user(
+                            user_id,
+                            f"🏊‍♂️ Wallet {address[:8]}... has been delegated to a new stake pool: {curr_status['pool_id']}"
                         )
-                        pool_name = pool_info.metadata.name if pool_info.metadata else "Unknown Pool"
+                    else:
+                        await self.notify_user(
+                            user_id,
+                            f"⚠️ Wallet {address[:8]}... is no longer delegated to any stake pool"
+                        )
                         
-                        await self.send_dm(
-                            int(user_id),
-                            f"🔄 **Delegation Status Changed**\n"
-                            f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                            f"New Pool: `{pool_name}`\n"
-                            f"Pool ID: `{current_pool}`"
-                        )
-                            
-        except Exception as e:
-            logger.error(f"Error checking delegation status: {str(e)}")
-            if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                logger.error(f"Response details: {e.response.text}")
-
-    async def _check_dapp_interactions(self, address: str, user_id: int, current_txs):
-        """Check for DApp interactions"""
-        try:
-            # Get last processed tx
-            last_processed = await get_dapp_interactions(address)
+            # Update stored status
+            await update_delegation_status(address, curr_status)
             
-            for tx in current_txs:
-                if last_processed and tx.hash == last_processed:
-                    break
-                    
-                # Check transaction metadata
-                metadata = await self.rate_limited_request(
-                    self.blockfrost_client.transaction_metadata,
-                    tx.hash
-                )
-                
-                if not metadata:
-                    continue
-                    
-                # Look for DApp identifiers in metadata
-                dapp_found = False
-                dapp_name = None
-                
-                for field in self.metadata_fields:
-                    for meta in metadata:
-                        if field.lower() in str(meta.label).lower():
-                            # Check against known DApp patterns
-                            meta_str = str(meta.json_metadata).lower()
-                            for name, patterns in self.dapp_patterns.items():
-                                if any(pattern in meta_str for pattern in patterns):
-                                    dapp_found = True
-                                    dapp_name = name
-                                    break
-                            if dapp_found:
-                                break
-                        
-                if dapp_found and await self.should_notify(int(user_id), "dapp_interactions"):
-                    await self.send_dm(
-                        int(user_id),
-                        f"🔄 **New DApp Interaction Detected!**\n"
-                        f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                        f"DApp: `{dapp_name}`\n"
-                        f"Transaction: `{tx.hash}`"
-                    )
-                    
-                # Update last processed tx
-                await update_dapp_interaction(address, tx.hash)
-                
         except Exception as e:
-            logger.error(f"Error checking DApp interactions: {str(e)}")
-            if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                logger.error(f"Response details: {e.response.text}")
+            logger.error(f"Error checking delegation status for {address}: {str(e)}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
 
     async def should_notify(self, user_id: int, notification_type: str) -> bool:
         """Check if we should send a notification to the user"""
@@ -1047,548 +856,6 @@ class WalletBud(commands.Bot):
             
         await self.send_dm(int(user_id), message)
 
-    async def setup_commands(self):
-        """Set up bot commands"""
-        try:
-            logger.info("Setting up commands...")
-            
-            # Wallet management commands
-            @self.tree.command(name="addwallet", description="Register a wallet to monitor")
-            @dm_only()
-            @app_commands.describe(address="The wallet address to monitor")
-            async def addwallet(interaction: discord.Interaction, address: str):
-                await self._add_wallet(interaction, address)
-
-            @self.tree.command(name="removewallet", description="Stop monitoring a wallet")
-            @dm_only()
-            @app_commands.describe(address="The wallet address to remove")
-            async def removewallet(interaction: discord.Interaction, address: str):
-                await self._remove_wallet(interaction, address)
-
-            @self.tree.command(name="listwallets", description="List your registered wallets")
-            @dm_only()
-            async def listwallets(interaction: discord.Interaction):
-                await self._list_wallets(interaction)
-
-            @self.tree.command(name="help", description="Show bot help and commands")
-            async def help(interaction: discord.Interaction):
-                await self._help(interaction)
-
-            @self.tree.command(name="health", description="Check bot and API status")
-            async def health(interaction: discord.Interaction):
-                await self._health(interaction)
-
-            # Balance and notification commands
-            @self.tree.command(name="balance", description="Get your wallet's current balance")
-            @dm_only()
-            async def balance(interaction: discord.Interaction):
-                await self._balance(interaction)
-
-            @self.tree.command(name="notifications", description="Manage your notification settings")
-            @dm_only()
-            @app_commands.choices(action=[
-                app_commands.Choice(name="view", value="view"),
-                app_commands.Choice(name="enable", value="enable"),
-                app_commands.Choice(name="disable", value="disable")
-            ])
-            @app_commands.choices(notification_type=[
-                app_commands.Choice(name="ada_transactions", value="ada_transactions"),
-                app_commands.Choice(name="token_changes", value="token_changes"),
-                app_commands.Choice(name="nft_updates", value="nft_updates"),
-                app_commands.Choice(name="staking_rewards", value="staking_rewards"),
-                app_commands.Choice(name="stake_changes", value="stake_changes"),
-                app_commands.Choice(name="low_balance", value="low_balance"),
-                app_commands.Choice(name="policy_expiry", value="policy_expiry"),
-                app_commands.Choice(name="delegation_status", value="delegation_status"),
-                app_commands.Choice(name="dapp_interactions", value="dapp_interactions"),
-                app_commands.Choice(name="failed_transactions", value="failed_transactions"),
-                app_commands.Choice(name="asset_history", value="asset_history")
-            ])
-            async def notifications(interaction: discord.Interaction, action: str, notification_type: str = None):
-                """Manage notification settings"""
-                try:
-                    user_id = str(interaction.user.id)
-                    
-                    if action == "view":
-                        settings = await get_notification_settings(user_id)
-                        
-                        embed = discord.Embed(
-                            title="🔔 Your Notification Settings",
-                            description="Here are your current notification settings:",
-                            color=discord.Color.blue()
-                        )
-                        
-                        for ntype, enabled in settings.items():
-                            status = "✅ Enabled" if enabled else "❌ Disabled"
-                            embed.add_field(
-                                name=ntype.replace("_", " ").title(),
-                                value=status,
-                                inline=True
-                            )
-                        
-                        await interaction.response.send_message(embed=embed)
-                        
-                    elif notification_type:
-                        await update_notification_setting(user_id, notification_type, action == "enable")
-                        status = "enabled" if action == "enable" else "disabled"
-                        
-                        embed = discord.Embed(
-                            title="✅ Notification Setting Updated",
-                            description=f"{notification_type.replace('_', ' ').title()} notifications have been {status}.",
-                            color=discord.Color.green()
-                        )
-                        
-                        await interaction.response.send_message(embed=embed)
-                    else:
-                        await interaction.response.send_message(
-                            "Please specify a notification type to enable/disable.",
-                            ephemeral=True
-                        )
-                        
-                except Exception as e:
-                    logger.error(f"Error in notifications command: {str(e)}")
-                    await interaction.response.send_message(
-                        "❌ An error occurred while managing notifications.",
-                        ephemeral=True
-                    )
-
-            @self.tree.command(name="check", description="Check various wallet information")
-            @app_commands.choices(check_type=[
-                app_commands.Choice(name="balance", value="balance"),
-                app_commands.Choice(name="transactions", value="transactions"),
-                app_commands.Choice(name="nfts", value="nfts"),
-                app_commands.Choice(name="stake", value="stake"),
-                app_commands.Choice(name="failed", value="failed"),
-                app_commands.Choice(name="history", value="history")
-            ])
-            async def check(interaction: discord.Interaction, check_type: str):
-                """Check various wallet information"""
-                try:
-                    user_id = str(interaction.user.id)
-                    wallets = await get_user_wallets(user_id)
-                    
-                    if not wallets:
-                        await interaction.response.send_message(
-                            "❌ No wallets found. Please add a wallet first using `/addwallet`.",
-                            ephemeral=True
-                        )
-                        return
-                        
-                    await interaction.response.defer()
-                    
-                    if check_type == "balance":
-                        embed = discord.Embed(
-                            title="💰 Wallet Balance",
-                            color=discord.Color.blue()
-                        )
-                        
-                        for wallet in wallets:
-                            balance = await get_wallet_balance(wallet)
-                            if balance:
-                                embed.add_field(
-                                    name=f"Wallet {wallet[:8]}...",
-                                    value=f"ADA: {balance['ada']} ₳\nTokens: {len(balance['tokens'])}",
-                                    inline=False
-                                )
-                                
-                                # Add token details if any
-                                if balance['tokens']:
-                                    token_text = ""
-                                    for token, amount in balance['tokens'].items():
-                                        token_text += f"{token}: {amount}\n"
-                                    embed.add_field(
-                                        name="Token Details",
-                                        value=token_text[:1024],  # Discord field value limit
-                                        inline=False
-                                    )
-                        
-                        await interaction.followup.send(embed=embed)
-                        
-                    elif check_type == "transactions":
-                        embed = discord.Embed(
-                            title="📝 Recent Transactions",
-                            color=discord.Color.blue()
-                        )
-                        
-                        for wallet in wallets:
-                            txs = await get_recent_transactions(wallet)
-                            if txs:
-                                tx_text = ""
-                                for tx in txs[:5]:  # Show last 5 transactions
-                                    tx_text += f"Hash: [{tx['hash'][:8]}...](https://cardanoscan.io/transaction/{tx['hash']})\n"
-                                    tx_text += f"Amount: {tx['amount']} ₳\n"
-                                    tx_text += f"Date: {tx['date']}\n\n"
-                                
-                                embed.add_field(
-                                    name=f"Wallet {wallet[:8]}...",
-                                    value=tx_text or "No recent transactions",
-                                    inline=False
-                                )
-                        
-                        await interaction.followup.send(embed=embed)
-                        
-                    elif check_type == "nfts":
-                        embed = discord.Embed(
-                            title="🎨 NFT Collection",
-                            color=discord.Color.blue()
-                        )
-                        
-                        for wallet in wallets:
-                            nfts = await get_nfts(wallet)
-                            if nfts:
-                                nft_text = ""
-                                for nft in nfts[:5]:  # Show first 5 NFTs
-                                    nft_text += f"Name: {nft['name']}\n"
-                                    nft_text += f"Policy: {nft['policy_id'][:8]}...\n\n"
-                                
-                                embed.add_field(
-                                    name=f"Wallet {wallet[:8]}...",
-                                    value=nft_text or "No NFTs found",
-                                    inline=False
-                                )
-                                
-                                # Add thumbnail of first NFT if it has an image
-                                if nfts and nfts[0].get('image'):
-                                    embed.set_thumbnail(url=nfts[0]['image'])
-                        
-                        await interaction.followup.send(embed=embed)
-                        
-                    elif check_type == "stake":
-                        embed = discord.Embed(
-                            title="🎯 Staking Information",
-                            color=discord.Color.blue()
-                        )
-                        
-                        for wallet in wallets:
-                            stake_info = await get_stake_info(wallet)
-                            if stake_info:
-                                embed.add_field(
-                                    name=f"Wallet {wallet[:8]}...",
-                                    value=f"Pool: {stake_info['pool_id']}\n"
-                                          f"Rewards: {stake_info['rewards']} ₳\n"
-                                          f"Delegated: {stake_info['delegated']} ₳",
-                                    inline=False
-                                )
-                        
-                        await interaction.followup.send(embed=embed)
-                        
-                    elif check_type == "failed":
-                        embed = discord.Embed(
-                            title="❌ Failed Transactions",
-                            color=discord.Color.red()
-                        )
-                        
-                        for wallet in wallets:
-                            failed_txs = await get_failed_transactions(wallet)
-                            if failed_txs:
-                                tx_text = ""
-                                for tx in failed_txs[:5]:  # Show last 5 failed transactions
-                                    tx_text += f"Hash: [{tx['hash'][:8]}...](https://cardanoscan.io/transaction/{tx['hash']})\n"
-                                    tx_text += f"Type: {tx['type']}\n"
-                                    tx_text += f"Error: {tx['error']}\n\n"
-                                
-                                embed.add_field(
-                                    name=f"Wallet {wallet[:8]}...",
-                                    value=tx_text or "No failed transactions",
-                                    inline=False
-                                )
-                        
-                        await interaction.followup.send(embed=embed)
-                        
-                    elif check_type == "history":
-                        embed = discord.Embed(
-                            title="📊 Asset History",
-                            color=discord.Color.blue()
-                        )
-                        
-                        for wallet in wallets:
-                            history = await get_asset_history(wallet)
-                            if history:
-                                history_text = ""
-                                for entry in history[:5]:  # Show last 5 history entries
-                                    history_text += f"Asset: {entry['asset_id'][:8]}...\n"
-                                    history_text += f"Action: {entry['action']}\n"
-                                    history_text += f"Amount: {entry['quantity']}\n"
-                                    history_text += f"Date: {entry['date']}\n\n"
-                                
-                                embed.add_field(
-                                    name=f"Wallet {wallet[:8]}...",
-                                    value=history_text or "No asset history",
-                                    inline=False
-                                )
-                        
-                        await interaction.followup.send(embed=embed)
-                        
-                except Exception as e:
-                    logger.error(f"Error in check command: {str(e)}")
-                    await interaction.followup.send(
-                        "❌ An error occurred while checking wallet information.",
-                        ephemeral=True
-                    )
-            
-            logger.info("Commands set up successfully")
-            
-        except Exception as e:
-            logger.error(f"Error setting up commands: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            raise
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-        """Called when bot is ready"""
-        try:
-            logger.info(f"Logged in as {self.user.name} ({self.user.id})")
-            logger.info(f"Discord API version: {discord.__version__}")
-            logger.info(f"Connected to {len(self.guilds)} guilds")
-            
-            # Log guild information
-            for guild in self.guilds:
-                logger.info(f"Connected to guild: {guild.name} ({guild.id})")
-                
-            # Initialize Blockfrost
-            await self.init_blockfrost()
-            
-            # Start monitoring task
-            self.bg_task = self.loop.create_task(self.check_wallets())
-            logger.info("Started wallet monitoring task")
-            
-            logger.info("Bot initialization complete!")
-            
-        except Exception as e:
-            logger.error(f"Error in on_ready: {str(e)}")
-
-    @commands.Cog.listener()
-    async def on_guild_join(self, guild):
-        """Called when bot joins a guild"""
-        logger.info(f"Joined guild {guild.name} ({guild.id})")
-
-    async def monitor_system_health(self):
-        """Background task to monitor system health"""
-        while True:
-            try:
-                # Get system metrics
-                process = psutil.Process()
-                memory_usage = process.memory_info().rss / 1024 / 1024  # MB
-                cpu_percent = process.cpu_percent()
-                
-                # Check database connection
-                db_healthy = await self.check_database()
-                
-                # Check Blockfrost API
-                bf_healthy = await self.check_blockfrost()
-                
-                # Check monitored wallets
-                total_wallets = len(await get_all_wallets())
-                
-                # Define thresholds
-                MEMORY_THRESHOLD = 500  # MB
-                CPU_THRESHOLD = 80  # percent
-                
-                # Prepare status message
-                status = []
-                
-                if memory_usage > MEMORY_THRESHOLD:
-                    status.append(f"⚠️ High memory usage: {memory_usage:.1f} MB")
-                
-                if cpu_percent > CPU_THRESHOLD:
-                    status.append(f"⚠️ High CPU usage: {cpu_percent}%")
-                
-                if not db_healthy:
-                    status.append("❌ Database connection issues")
-                
-                if not bf_healthy:
-                    status.append("❌ Blockfrost API issues")
-                
-                # Send alert if any issues
-                if status:
-                    await self.send_admin_alert(
-                        "System Health Alert:\n" + "\n".join(status),
-                        is_error=True
-                    )
-                
-                # Log metrics
-                logger.info(
-                    f"Health Check - Memory: {memory_usage:.1f}MB, CPU: {cpu_percent}%, "
-                    f"DB: {'✅' if db_healthy else '❌'}, "
-                    f"API: {'✅' if bf_healthy else '❌'}, "
-                    f"Wallets: {total_wallets}"
-                )
-                
-                # Wait before next check
-                await asyncio.sleep(300)  # Check every 5 minutes
-                
-            except Exception as e:
-                logger.error(f"Error in health monitoring: {str(e)}")
-                await asyncio.sleep(60)  # Wait a minute before retrying
-
-    @tasks.loop(minutes=5)
-    async def cleanup_task(self):
-        """Cleanup task to maintain system health"""
-        try:
-            # 1. Clean up old notifications
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    """DELETE FROM notifications 
-                    WHERE created_at < NOW() - INTERVAL '30 days'"""
-                )
-            
-            # 2. Remove inactive wallets
-            inactive_days = 90
-            await conn.execute(
-                """DELETE FROM wallets 
-                WHERE last_activity < NOW() - INTERVAL '%s days'""",
-                inactive_days
-            )
-            
-            # 3. Optimize database
-            await conn.execute("VACUUM ANALYZE")
-            
-            logger.info("Cleanup task completed successfully")
-            
-        except Exception as e:
-            logger.error(f"Error in cleanup task: {str(e)}")
-            await self.send_admin_alert(
-                f"❌ Cleanup task failed: {str(e)}",
-                is_error=True
-            )
-
-    async def check_database(self) -> bool:
-        """Check database connection and health"""
-        try:
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                # Check connection
-                result = await conn.fetchval("SELECT 1")
-                if result != 1:
-                    return False
-                    
-                # Check table health
-                tables = ['wallets', 'notifications', 'transactions', 'rewards']
-                for table in tables:
-                    await conn.execute(f"SELECT COUNT(*) FROM {table}")
-                    
-                return True
-                
-        except Exception as e:
-            logger.error(f"Database health check failed: {str(e)}")
-            return False
-
-    async def check_blockfrost(self) -> bool:
-        """Check Blockfrost API health and rate limits"""
-        try:
-            if not self.blockfrost_client:
-                return False
-                
-            # Test API connection
-            health = await self.rate_limited_request(
-                self.blockfrost_client.health
-            )
-            
-            if not health or health.is_healthy is False:
-                return False
-                
-            # Check rate limits
-            limits = await self.rate_limited_request(
-                self.blockfrost_client.health_clock
-            )
-            
-            if not limits:
-                return False
-                
-            return True
-            
-        except Exception as e:
-            logger.error(f"Blockfrost health check failed: {str(e)}")
-            return False
-
-    @self.tree.command(name="health", description="Check bot health status")
-    async def health(interaction: discord.Interaction):
-        """Enhanced health check command"""
-        try:
-            # System metrics
-            process = psutil.Process()
-            memory_usage = process.memory_info().rss / 1024 / 1024  # MB
-            cpu_percent = process.cpu_percent()
-            
-            # Database check
-            db_status = await self.check_database()
-            
-            # Blockfrost check
-            bf_status = await self.check_blockfrost()
-            
-            # Get bot uptime
-            uptime = datetime.now() - self.start_time
-            hours = uptime.total_seconds() / 3600
-            
-            # Get wallet stats
-            total_wallets = len(await get_all_wallets())
-            
-            # Create rich embed
-            embed = discord.Embed(
-                title="🏥 Bot Health Status",
-                color=discord.Color.green() if db_status and bf_status else discord.Color.red(),
-                timestamp=datetime.now()
-            )
-            
-            # Core Services
-            embed.add_field(
-                name="Core Services",
-                value=f"""
-                • Database: {'✅' if db_status else '❌'}
-                • Blockfrost API: {'✅' if bf_status else '❌'}
-                """.strip(),
-                inline=False
-            )
-            
-            # System Metrics
-            embed.add_field(
-                name="System Metrics",
-                value=f"""
-                • Memory Usage: {memory_usage:.1f} MB
-                • CPU Usage: {cpu_percent}%
-                • Uptime: {hours:.1f} hours
-                """.strip(),
-                inline=False
-            )
-            
-            # Bot Stats
-            embed.add_field(
-                name="Bot Statistics",
-                value=f"""
-                • Monitored Wallets: {total_wallets}
-                • Commands Available: {len(self.tree.get_commands())}
-                """.strip(),
-                inline=False
-            )
-            
-            # Rate Limits
-            if bf_status:
-                limits = await self.rate_limited_request(
-                    self.blockfrost_client.health_clock
-                )
-                embed.add_field(
-                    name="API Rate Limits",
-                    value=f"""
-                    • Remaining Calls: {limits.server_time}
-                    • Reset in: {limits.server_time_diff} seconds
-                    """.strip(),
-                    inline=False
-                )
-            
-            # Add version info
-            embed.set_footer(text=f"Bot Version: {BOT_VERSION}")
-            
-            await interaction.response.send_message(embed=embed)
-            
-        except Exception as e:
-            logger.error(f"Error checking health: {str(e)}")
-            await interaction.response.send_message(
-                "❌ An error occurred while checking bot health.",
-                ephemeral=True
-            )
-
     async def _add_wallet(self, interaction: discord.Interaction, address: str):
         """Add a wallet to monitor"""
         try:
@@ -1602,7 +869,7 @@ class WalletBud(commands.Bot):
                 return
             
             # Add wallet to database
-            success = await add_wallet(str(interaction.user.id), address)
+            success = await add_wallet_to_db(address, interaction.user.id)
             if not success:
                 await interaction.response.send_message(
                     "❌ Failed to add wallet. Please try again later.",
@@ -1641,7 +908,7 @@ class WalletBud(commands.Bot):
             await reset_yummi_warning(wallet['id'])
             
             # Remove wallet
-            success = await remove_wallet(str(interaction.user.id), address)
+            success = await remove_wallet_from_db(address)
             if success:
                 await interaction.response.send_message("✅ Wallet removed successfully!", ephemeral=True)
             else:
@@ -1743,11 +1010,9 @@ class WalletBud(commands.Bot):
                     "**Notification Types:**\n"
                     "• `balance` - Low balance alerts\n"
                     "• `delegation` - Delegation status changes\n"
-                    "• `dapp` - DApp interactions\n"
                     "• `nft` - NFT updates\n"
                     "• `policy` - Policy expiry alerts\n"
                     "• `stake` - Stake key changes\n"
-                    "• `staking` - Staking rewards\n"
                     "• `token` - Token changes"
                 ),
                 inline=False
@@ -1793,7 +1058,7 @@ class WalletBud(commands.Bot):
             # Check Blockfrost API
             try:
                 # Test with a known address
-                test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
+                test_address = "addr1qy8ac7qqy0vtulyl7wntmsxc6wex80gvcyjy33qffrhm7sh927ysx5sftuw0dlft05dz3c7revpf527z2zf2p2czd2ps8k9liw"
                 async with self.rate_limiter:
                     await asyncio.to_thread(self.blockfrost_client.address, test_address)
                 blockfrost_status = "✅ Connected"
@@ -1885,7 +1150,7 @@ class WalletBud(commands.Bot):
                             int(amount.quantity)
                             for utxo in utxos
                             for amount in utxo.amount
-                            if amount.unit.lower() == YUMMI_TOKEN_ID.lower()
+                            if amount.unit.lower() == f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}".lower()
                         )
                         
                         # Get transaction count
@@ -1956,11 +1221,371 @@ class WalletBud(commands.Bot):
                 value = f"{emoji} **{display_name}**\n`/toggle {db_key}` to change"
                 embed.add_field(name=display_name, value=value, inline=True)
             
-            await self.send_response(interaction, embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             
         except Exception as e:
             logger.error(f"Error showing notification settings: {str(e)}")
-            await self.send_response(interaction, "❌ An error occurred while showing your notification settings.", ephemeral=True)
+            await interaction.response.send_message("❌ An error occurred while showing your notification settings.", ephemeral=True)
+
+    async def verify_webhook_signature(self, request, event_type: str):
+        """Verify Blockfrost webhook signature"""
+        try:
+            # Get webhook config based on event type
+            webhook_config = None
+            if event_type == "transaction":
+                webhook_config = config.WEBHOOKS["transaction"]
+            elif event_type == "delegation":
+                webhook_config = config.WEBHOOKS["delegation"]
+                
+            if not webhook_config:
+                logger.error(f"No webhook config found for {event_type}")
+                return False
+            
+            # Get request body
+            body = await request.text()
+            
+            # Get headers
+            webhook_id = request.headers.get('Webhook-Id')
+            auth_token = request.headers.get('Auth-Token')
+            signature = request.headers.get('Signature')
+            
+            # Log headers for debugging
+            logger.debug(f"Webhook verification headers:")
+            logger.debug(f"  Webhook-Id: {webhook_id}")
+            logger.debug(f"  Auth-Token: {auth_token}")
+            logger.debug(f"  Signature: {signature}")
+            
+            # Check webhook ID
+            if webhook_id != webhook_config['id']:
+                logger.error(f"Invalid webhook ID. Expected {webhook_config['id']}, got {webhook_id}")
+                return False
+            
+            # Check auth token
+            if auth_token != webhook_config['auth_token']:
+                logger.error(f"Invalid auth token for {event_type}")
+                return False
+            
+            # Verify signature
+            if not signature:
+                logger.error(f"Missing signature for {event_type}")
+                return False
+                
+            # Create expected signature
+            expected_sig = hmac.new(
+                webhook_config['auth_token'].encode(),
+                body.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            
+            # Compare signatures
+            if not hmac.compare_digest(signature, expected_sig):
+                logger.error(f"Invalid signature for {event_type}")
+                logger.debug(f"Expected signature: {expected_sig}")
+                logger.debug(f"Received signature: {signature}")
+                return False
+            
+            logger.info(f"Webhook verification successful for {event_type}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error verifying webhook signature: {str(e)}")
+            logger.error(f"Error details: {e}")
+            return False
+
+    async def handle_webhook(self, request):
+        """Handle incoming Blockfrost webhooks"""
+        try:
+            # Parse payload first to get event type
+            payload = await request.json()
+            event_type = payload.get('event_type')
+            
+            if not event_type:
+                return web.Response(status=400, text="Missing event type")
+                
+            # Check if event type is supported
+            if event_type not in ['transaction', 'delegation']:
+                return web.Response(status=400, text="Unsupported event type")
+                
+            # Verify webhook authentication
+            if not await self.verify_webhook_signature(request, event_type):
+                return web.Response(status=401, text="Invalid authentication")
+            
+            # Check confirmations
+            confirmations = payload.get('confirmations', 0)
+            required_confirmations = config.WEBHOOKS[event_type]['confirmations']
+            
+            if confirmations < required_confirmations:
+                return web.Response(status=202, text="Waiting for more confirmations")
+            
+            if event_type == 'transaction':
+                await self.handle_transaction_webhook(payload)
+            elif event_type == 'delegation':
+                await self.handle_delegation_webhook(payload)
+            
+            return web.Response(status=200)
+            
+        except Exception as e:
+            logger.error(f"Error handling webhook: {str(e)}")
+            return web.Response(status=500)
+
+    async def handle_transaction_webhook(self, payload):
+        """Handle transaction webhook events"""
+        try:
+            tx_hash = payload.get('tx_hash')
+            if not tx_hash:
+                logger.error("Missing tx_hash in webhook payload")
+                return
+                
+            # Get full transaction details
+            tx_details = await self.rate_limited_request(
+                self.blockfrost_client.transaction,
+                hash=tx_hash
+            )
+            
+            # Get affected addresses
+            affected_addresses = set()
+            for utxo in tx_details.utxos:
+                for addr in utxo.addresses:
+                    if addr in self.monitored_addresses:
+                        affected_addresses.add(addr)
+            
+            # Process transaction for each affected address
+            for address in affected_addresses:
+                user_id = await get_user_id_for_wallet(address)
+                if user_id:
+                    await self.process_transaction(address, user_id, tx_details)
+                    
+        except Exception as e:
+            logger.error(f"Error handling transaction webhook: {str(e)}")
+
+    async def handle_delegation_webhook(self, payload):
+        """Handle delegation webhook events"""
+        try:
+            stake_address = payload.get('stake_address')
+            if not stake_address or stake_address not in self.monitored_stake_addresses:
+                return
+                
+            pool_id = payload.get('pool_id')
+            action = payload.get('action')
+            
+            # Update stake address pool
+            if pool_id:
+                await update_pool_for_stake(stake_address, pool_id)
+            
+            # Get all addresses for this stake address
+            addresses = await get_addresses_for_stake(stake_address)
+            
+            # Get pool info if needed
+            pool_info = None
+            if pool_id:
+                pool_info = await self.rate_limited_request(
+                    self.blockfrost_client.pool,
+                    pool_id=pool_id
+                )
+            
+            # Notify users
+            for address in addresses:
+                user_id = await get_user_id_for_wallet(address)
+                if user_id:
+                    if action == 'delegation_started':
+                        message = (
+                            f"🏊‍♂️ Wallet {address[:8]}... delegated to "
+                            f"{pool_info.metadata.name if pool_info and pool_info.metadata else pool_id}"
+                        )
+                    else:
+                        message = f"⚠️ Wallet {address[:8]}... stopped delegation"
+                    
+                    await self.notify_user(user_id, message)
+                    
+        except Exception as e:
+            logger.error(f"Error handling delegation webhook: {str(e)}")
+
+    async def update_webhook_conditions(self):
+        """Update Blockfrost webhook conditions with current addresses"""
+        try:
+            # Get Blockfrost API client
+            project_id = os.getenv('BLOCKFROST_PROJECT_ID')
+            if not project_id:
+                logger.error("BLOCKFROST_PROJECT_ID not configured")
+                return
+
+            # Update transaction webhook conditions
+            tx_webhook_id = os.getenv('BLOCKFROST_TX_WEBHOOK_ID')
+            if tx_webhook_id:
+                conditions = {
+                    "addresses": list(self.monitored_addresses),
+                    "confirmations": 2
+                }
+                await self.rate_limited_request(
+                    self.blockfrost_client.webhook_update,
+                    webhook_id=tx_webhook_id,
+                    conditions=conditions
+                )
+
+            # Update delegation webhook conditions
+            del_webhook_id = os.getenv('BLOCKFROST_DEL_WEBHOOK_ID')
+            if del_webhook_id:
+                conditions = {
+                    "stake_addresses": list(self.monitored_stake_addresses),
+                    "confirmations": 1
+                }
+                await self.rate_limited_request(
+                    self.blockfrost_client.webhook_update,
+                    webhook_id=del_webhook_id,
+                    conditions=conditions
+                )
+
+        except Exception as e:
+            logger.error(f"Error updating webhook conditions: {str(e)}")
+
+    async def add_wallet(self, address: str, user_id: int):
+        """Add a wallet to monitoring"""
+        try:
+            # Existing wallet addition logic
+            stake_address = await self.get_stake_address(address)
+            if not stake_address:
+                return False, "Invalid wallet address"
+
+            # Add to database
+            success = await add_wallet_to_db(address, user_id, stake_address)
+            if not success:
+                return False, "Failed to add wallet to database"
+
+            # Add to memory sets for fast lookup
+            self.monitored_addresses.add(address)
+            self.monitored_stake_addresses.add(stake_address)
+
+            # Update webhook conditions
+            await self.update_webhook_conditions()
+
+            return True, "Wallet added successfully"
+
+        except Exception as e:
+            logger.error(f"Error adding wallet: {str(e)}")
+            return False, "Error adding wallet"
+
+    async def remove_wallet(self, address: str):
+        """Remove a wallet from monitoring"""
+        try:
+            # Get stake address before removal
+            stake_address = await self.get_stake_address(address)
+            
+            # Remove from database
+            success = await remove_wallet_from_db(address)
+            if not success:
+                return False
+
+            # Remove from memory sets
+            self.monitored_addresses.remove(address)
+            
+            # Only remove stake address if no other wallets use it
+            other_wallets = await get_addresses_for_stake(stake_address)
+            if not other_wallets:
+                self.monitored_stake_addresses.remove(stake_address)
+
+            # Update webhook conditions
+            await self.update_webhook_conditions()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error removing wallet: {str(e)}")
+            return False
+
+    async def start(self, *args, **kwargs):
+        """Start the bot and webhook server"""
+        try:
+            # Start webhook server
+            await self.runner.setup()
+            site = web.TCPSite(
+                self.runner, 
+                '0.0.0.0',
+                self.port
+            )
+            await site.start()
+            logger.info(f"Webhook server started on port {self.port}")
+            
+            # Initialize Blockfrost client
+            await self.init_blockfrost()
+            
+            # Update webhook conditions
+            if self.blockfrost_client:
+                await self.update_webhook_conditions()
+            
+            # Start the bot
+            await super().start(*args, **kwargs)
+            
+        except Exception as e:
+            logger.error(f"Error in setup: {str(e)}")
+            raise e
+
+    async def on_ready(self):
+        """Called when the bot is ready"""
+        try:
+            # Set up commands
+            @self.tree.command(name="help", description="Show bot help and commands")
+            async def help(interaction: discord.Interaction):
+                if not isinstance(interaction.channel, discord.DMChannel):
+                    await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                    return
+                await self._help(interaction)
+
+            @self.tree.command(name="health", description="Check bot health status")
+            async def health(interaction: discord.Interaction):
+                if not isinstance(interaction.channel, discord.DMChannel):
+                    await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                    return
+                await self._health(interaction)
+
+            @self.tree.command(name="balance", description="Get your wallet's current balance")
+            async def balance(interaction: discord.Interaction):
+                if not isinstance(interaction.channel, discord.DMChannel):
+                    await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                    return
+                await self._balance(interaction)
+
+            @self.tree.command(name="notifications", description="View your notification settings")
+            async def notifications(interaction: discord.Interaction):
+                if not isinstance(interaction.channel, discord.DMChannel):
+                    await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                    return
+                await self._notifications(interaction)
+
+            @self.tree.command(name="addwallet", description="Add a wallet to monitor")
+            @app_commands.describe(address="The wallet address to monitor")
+            async def addwallet(interaction: discord.Interaction, address: str):
+                if not isinstance(interaction.channel, discord.DMChannel):
+                    await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                    return
+                await self._add_wallet(interaction, address)
+
+            @self.tree.command(name="removewallet", description="Remove a wallet from monitoring")
+            @app_commands.describe(address="The wallet address to stop monitoring")
+            async def removewallet(interaction: discord.Interaction, address: str):
+                if not isinstance(interaction.channel, discord.DMChannel):
+                    await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                    return
+                await self._remove_wallet(interaction, address)
+
+            @self.tree.command(name="list", description="List your monitored wallets")
+            async def list_wallets(interaction: discord.Interaction):
+                if not isinstance(interaction.channel, discord.DMChannel):
+                    await interaction.response.send_message("This command can only be used in DMs!", ephemeral=True)
+                    return
+                await self._list_wallets(interaction)
+
+            # Sync commands
+            try:
+                logger.info("Syncing commands...")
+                await self.tree.sync()
+                logger.info("Bot is ready and commands are synced!")
+            except Exception as e:
+                logger.error(f"Error syncing commands: {str(e)}")
+                raise e
+            
+        except Exception as e:
+            logger.error(f"Error in on_ready: {str(e)}")
+            raise e
 
 if __name__ == "__main__":
     try:
@@ -1977,7 +1602,7 @@ if __name__ == "__main__":
             
         # Run the bot
         logger.info("Running bot...")
-        bot.run(token, log_handler=None)  # Disable default discord.py logging
+        bot.run(token, reconnect=True, log_handler=None)  # Disable default discord.py logging
         
     except Exception as e:
         logger.error(f"Failed to start bot: {str(e)}")

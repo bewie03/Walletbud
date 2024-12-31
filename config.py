@@ -48,7 +48,9 @@ def validate_url(value: str, name: str) -> str:
 
 def validate_discord_token(value: str, name: str) -> str:
     """Validate Discord token format"""
-    if not value or not re.match(r'^[A-Za-z0-9_-]{24}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27}$', value):
+    # Strip quotes and whitespace
+    value = value.strip().strip('"\'')
+    if not value or not re.match(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', value):
         raise ValueError(f"{name} must be a valid Discord token")
     return value
 
@@ -86,16 +88,28 @@ ENV_VARS = {
         validator=validate_url,
         description="Blockfrost API base URL"
     ),
+    'BLOCKFROST_TX_WEBHOOK_ID': EnvVar(
+        name="Blockfrost Transaction Webhook ID",
+        description="Transaction webhook ID from Blockfrost dashboard"
+    ),
+    'BLOCKFROST_DEL_WEBHOOK_ID': EnvVar(
+        name="Blockfrost Delegation Webhook ID",
+        description="Delegation webhook ID from Blockfrost dashboard"
+    ),
+    'BLOCKFROST_WEBHOOK_SECRET': EnvVar(
+        name="Blockfrost Webhook Secret",
+        description="Webhook secret from Blockfrost dashboard"
+    ),
     
     # YUMMI Token Configuration
     'YUMMI_POLICY_ID': EnvVar(
         name="YUMMI Policy ID",
-        validator=lambda x: bool(re.match(r'^[0-9a-f]{56}$', x.lower())),
+        validator=lambda x, n: validate_hex(x, 56, n),
         description="YUMMI token policy ID (56-character hexadecimal string)"
     ),
     'YUMMI_TOKEN_NAME': EnvVar(
         name="YUMMI Token Name",
-        validator=lambda x: bool(re.match(r'^[0-9a-f]{9}$', x.lower())),
+        validator=lambda x, n: validate_hex(x, 9, n),
         description="YUMMI token name (9-character hexadecimal string)"
     ),
     
@@ -199,31 +213,46 @@ try:
     # Blockfrost Configuration
     BLOCKFROST_PROJECT_ID = env['BLOCKFROST_PROJECT_ID']
     BLOCKFROST_BASE_URL = env['BLOCKFROST_BASE_URL']
-    
+    BLOCKFROST_TX_WEBHOOK_ID = env['BLOCKFROST_TX_WEBHOOK_ID']
+    BLOCKFROST_DEL_WEBHOOK_ID = env['BLOCKFROST_DEL_WEBHOOK_ID']
+    BLOCKFROST_WEBHOOK_SECRET = env['BLOCKFROST_WEBHOOK_SECRET']
+
     # YUMMI Token Configuration
     YUMMI_POLICY_ID = env['YUMMI_POLICY_ID']
     YUMMI_TOKEN_NAME = env['YUMMI_TOKEN_NAME']
-    YUMMI_TOKEN_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}"
-    REQUIRED_YUMMI_TOKENS = 25000
-    
-    # API Rate Limiting
+    MINIMUM_YUMMI = 25000  # Minimum YUMMI tokens required
+    WEBHOOK_IDENTIFIER = "WalletBud"
+    WEBHOOK_AUTH_TOKEN = env['BLOCKFROST_WEBHOOK_SECRET']
+    WEBHOOK_CONFIRMATIONS = 3
+
+    # Rate Limiting
     MAX_REQUESTS_PER_SECOND = int(env['MAX_REQUESTS_PER_SECOND'])
     BURST_LIMIT = int(env['BURST_LIMIT'])
     RATE_LIMIT_COOLDOWN = int(env['RATE_LIMIT_COOLDOWN'])
-    
+
     # Wallet Monitoring
     WALLET_CHECK_INTERVAL = int(env['WALLET_CHECK_INTERVAL'])
-    
-    # Wallet Monitoring Configuration
     MIN_ADA_BALANCE = int(env['MIN_ADA_BALANCE'])
     MAX_TX_PER_HOUR = int(env['MAX_TX_PER_HOUR'])
     MONITORING_INTERVAL = int(env['MONITORING_INTERVAL'])
-    
-    logger.info("Environment variables validated successfully")
-    
-except ValueError as e:
+
+except Exception as e:
     logger.error(f"Environment validation failed:\n{str(e)}")
-    raise SystemExit(1)
+    raise
+
+# Webhook Configuration
+WEBHOOKS = {
+    "transaction": {
+        "id": BLOCKFROST_TX_WEBHOOK_ID,
+        "auth_token": BLOCKFROST_WEBHOOK_SECRET,
+        "confirmations": 2  # Wait for 2 confirmations to avoid rollbacks
+    },
+    "delegation": {
+        "id": BLOCKFROST_DEL_WEBHOOK_ID,
+        "auth_token": BLOCKFROST_WEBHOOK_SECRET,
+        "confirmations": 1  # Delegation changes need only 1 confirmation
+    }
+}
 
 # Error Messages
 ERROR_MESSAGES = {
@@ -243,7 +272,7 @@ ERROR_MESSAGES = {
 # Load configuration
 logger.info(
     "Loaded configuration:\n"
-    f"  REQUIRED_YUMMI_TOKENS: {REQUIRED_YUMMI_TOKENS}\n"
+    f"  MINIMUM_YUMMI: {MINIMUM_YUMMI}\n"
     f"  MAX_REQUESTS_PER_SECOND: {MAX_REQUESTS_PER_SECOND}\n"
     f"  BURST_LIMIT: {BURST_LIMIT}\n"
     f"  RATE_LIMIT_COOLDOWN: {RATE_LIMIT_COOLDOWN}\n"

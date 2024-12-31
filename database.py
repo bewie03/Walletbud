@@ -43,7 +43,12 @@ DROP TABLE IF EXISTS processed_rewards CASCADE;
 DROP TABLE IF EXISTS policy_expiry CASCADE;
 DROP TABLE IF EXISTS dapp_interactions CASCADE;
 DROP TABLE IF EXISTS failed_transactions CASCADE;
-DROP TABLE IF EXISTS asset_history CASCADE;
+DROP TABLE IF EXISTS stake_addresses CASCADE;
+DROP TABLE IF EXISTS db_version CASCADE;
+
+CREATE TABLE IF NOT EXISTS db_version (
+    version INTEGER PRIMARY KEY
+);
 
 CREATE TABLE IF NOT EXISTS wallets (
     id SERIAL PRIMARY KEY,
@@ -52,6 +57,8 @@ CREATE TABLE IF NOT EXISTS wallets (
     stake_address TEXT,
     ada_balance DECIMAL DEFAULT 0,
     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_policy_check TIMESTAMP,
+    monitoring_since TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, address)
 );
 
@@ -65,8 +72,7 @@ CREATE TABLE IF NOT EXISTS notification_settings (
     policy_expiry BOOLEAN DEFAULT TRUE,
     delegation_status BOOLEAN DEFAULT TRUE,
     dapp_interactions BOOLEAN DEFAULT TRUE,
-    failed_transactions BOOLEAN DEFAULT TRUE,
-    asset_history BOOLEAN DEFAULT TRUE
+    failed_transactions BOOLEAN DEFAULT TRUE
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
@@ -130,20 +136,10 @@ CREATE TABLE IF NOT EXISTS failed_transactions (
     UNIQUE(wallet_id, tx_hash)
 );
 
-CREATE TABLE IF NOT EXISTS asset_history (
-    id SERIAL PRIMARY KEY,
-    wallet_id INTEGER REFERENCES wallets(id),
-    asset_id TEXT NOT NULL,
-    tx_hash TEXT NOT NULL,
-    action TEXT NOT NULL,  -- 'mint', 'burn', 'transfer_in', 'transfer_out'
-    quantity DECIMAL NOT NULL,
-    metadata JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(wallet_id, asset_id, tx_hash)
-);
-
-CREATE TABLE IF NOT EXISTS db_version (
-    version INTEGER PRIMARY KEY
+CREATE TABLE IF NOT EXISTS stake_addresses (
+    stake_address TEXT PRIMARY KEY,
+    last_pool_id TEXT,
+    last_checked TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
@@ -156,7 +152,6 @@ CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewa
 CREATE INDEX IF NOT EXISTS idx_policy_expiry_policy_id ON policy_expiry(policy_id);
 CREATE INDEX IF NOT EXISTS idx_dapp_interactions_address ON dapp_interactions(address);
 CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet_id ON failed_transactions(wallet_id);
-CREATE INDEX IF NOT EXISTS idx_asset_history_wallet_id ON asset_history(wallet_id);
 
 CREATE TABLE IF NOT EXISTS transactions_by_month (
     LIKE transactions INCLUDING ALL
@@ -178,7 +173,7 @@ END $$;
 """
 
 # Database version tracking
-CURRENT_VERSION = 1
+CURRENT_VERSION = 3
 
 # Migration scripts
 MIGRATIONS = {
@@ -186,6 +181,26 @@ MIGRATIONS = {
     -- Version 1: Initial schema
     INSERT INTO db_version (version) VALUES ($1);
     """,
+    2: [
+        """
+        -- Version 2: Add last_policy_check column to wallets table
+        ALTER TABLE wallets
+        ADD COLUMN IF NOT EXISTS last_policy_check TIMESTAMP;
+        """,
+        """
+        UPDATE db_version SET version = $1 WHERE version = $1 - 1;
+        """
+    ],
+    3: [
+        """
+        -- Version 3: Remove asset_history column from notification_settings table
+        ALTER TABLE notification_settings 
+        DROP COLUMN IF EXISTS asset_history;
+        """,
+        """
+        UPDATE db_version SET version = $1 WHERE version = $1 - 1;
+        """
+    ]
 }
 
 async def get_db_version() -> int:
@@ -225,12 +240,24 @@ async def run_migrations():
         pool = await get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
+                # Reset version if needed
+                if current > 0:
+                    await conn.execute("DELETE FROM db_version")
+                    current = 0
+                    logger.info("Reset database version")
+                
                 # Run all migrations in order
                 for version in range(current + 1, CURRENT_VERSION + 1):
                     if version in MIGRATIONS:
                         logger.info(f"Running migration to version {version}")
-                        await conn.execute(MIGRATIONS[version], version)
-                        
+                        migration = MIGRATIONS[version]
+                        if isinstance(migration, list):
+                            for statement in migration[:-1]:  # Execute all but the last statement
+                                await conn.execute(statement)
+                            # Execute the version update statement with parameter
+                            await conn.execute(migration[-1], version)
+                        else:
+                            await conn.execute(migration, version)
                         logger.info(f"Completed migration to version {version}")
                     
                 logger.info("All migrations completed successfully")
@@ -246,6 +273,14 @@ async def init_db():
         # Get connection pool
         pool = await get_pool()
         
+        # Create db_version table if it doesn't exist
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS db_version (
+                    version INTEGER PRIMARY KEY
+                );
+            """)
+        
         # Run migrations
         if not await run_migrations():
             raise Exception("Failed to run database migrations")
@@ -255,7 +290,7 @@ async def init_db():
             required_tables = [
                 'wallets', 'notification_settings', 'transactions', 'token_balances',
                 'delegation_status', 'processed_rewards', 'policy_expiry', 'dapp_interactions',
-                'failed_transactions', 'asset_history', 'db_version'
+                'failed_transactions', 'db_version', 'stake_addresses'
             ]
             
             for table in required_tables:
@@ -272,39 +307,27 @@ async def init_db():
             
             logger.info("All required tables verified")
             
-            # Set up connection pool with optimal settings
+            # Set up connection pool with safe settings
             await conn.execute("""
                 SET SESSION work_mem = '50MB';  -- More memory for complex queries
                 SET SESSION maintenance_work_mem = '256MB';  -- More memory for maintenance
-                SET SESSION effective_cache_size = '4GB';  -- Assume larger cache
-                SET SESSION effective_io_concurrency = 200;  -- More concurrent I/O
                 SET SESSION random_page_cost = 1.1;  -- Assume SSD storage
-                SET SESSION checkpoint_completion_target = 0.9;  -- Spread checkpoints
                 SET SESSION max_parallel_workers_per_gather = 4;  -- Use parallel queries
                 SET SESSION max_parallel_workers = 8;  -- Maximum parallel workers
             """)
             
-            # Enable connection pooling in transaction mode
-            await conn.execute("""
-                ALTER SYSTEM SET max_connections = '200';
-                ALTER SYSTEM SET shared_buffers = '1GB';
-                ALTER SYSTEM SET effective_cache_size = '4GB';
-            """)
-            
-            logger.info("Database optimization settings applied")
-        
-        return pool
-        
+        return True
     except Exception as e:
         logger.error(f"Failed to initialize database: {str(e)}")
         raise
 
-async def add_wallet(user_id: str, address: str) -> bool:
+async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
     """Add a wallet to monitor
     
     Args:
         user_id (str): Discord user ID
         address (str): Wallet address to monitor
+        stake_address (str): Stake address
         
     Returns:
         bool: Success status
@@ -316,11 +339,11 @@ async def add_wallet(user_id: str, address: str) -> bool:
             # First, ensure user exists
             await conn.execute(
                 """
-                INSERT INTO wallets (user_id, address)
-                VALUES ($1, $2)
+                INSERT INTO wallets (user_id, address, stake_address, monitoring_since)
+                VALUES ($1, $2, $3, NOW())
                 ON CONFLICT (user_id, address) DO NOTHING
                 """,
-                user_id, address
+                user_id, address, stake_address
             )
             logger.debug(f"User {user_id} ensured in database")
             
@@ -668,8 +691,7 @@ async def get_notification_settings(user_id: str):
                     "policy_expiry": row['policy_expiry'],
                     "delegation_status": row['delegation_status'],
                     "dapp_interactions": row['dapp_interactions'],
-                    "failed_transactions": row['failed_transactions'],
-                    "asset_history": row['asset_history']
+                    "failed_transactions": row['failed_transactions']
                 }
             else:
                 return None
@@ -898,62 +920,44 @@ async def update_utxo_state(address: str, utxo_state: dict):
             return False
 
 async def get_stake_address(address: str):
-    """Get the stake address for a wallet address
+    """Get cached stake address for a wallet
     
     Args:
         address (str): Wallet address
         
     Returns:
-        str: Stake address or None if not found
+        Optional[str]: Stake address if cached, None otherwise
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        try:
-            logger.debug(f"Fetching stake address for wallet {address[:20]}...")
-            result = await conn.fetchval(
-                """
-                SELECT stake_address
-                FROM wallets
-                WHERE address = $1
-                """,
-                address
-            )
-            return result
-        except Exception as e:
-            logger.error(f"Error getting stake address for {address[:20]}: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            return None
+        row = await conn.fetchrow(
+            """
+            SELECT stake_address
+            FROM wallets
+            WHERE address = $1 AND stake_address IS NOT NULL
+            """,
+            address
+        )
+        return row['stake_address'] if row else None
 
 async def update_stake_address(address: str, stake_address: str):
-    """Update the stake address for a wallet
+    """Update stake address for a wallet
     
     Args:
         address (str): Wallet address
         stake_address (str): Stake address
-        
-    Returns:
-        bool: Success status
     """
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Updating stake address for wallet {address[:20]}...")
-            await conn.execute(
-                """
-                UPDATE wallets
-                SET stake_address = $2
-                WHERE address = $1
-                """,
-                address,
-                stake_address
-            )
-            return True
-    except Exception as e:
-        logger.error(f"Error updating stake address for {address[:20]}: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        return False
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE wallets
+            SET stake_address = $2
+            WHERE address = $1
+            """,
+            address,
+            stake_address
+        )
 
 async def is_reward_processed(stake_address: str, epoch: int):
     """Check if a staking reward has been processed
@@ -1619,15 +1623,14 @@ async def initialize_notification_settings(user_id: str):
                 "policy_expiry": True,
                 "delegation_status": True,
                 "dapp_interactions": True,
-                "failed_transactions": True,
-                "asset_history": True
+                "failed_transactions": True
             }
             
             # Insert into users table with default settings
             await conn.execute(
                 """
-                INSERT INTO notification_settings (user_id, ada_transactions, token_changes, nft_updates, staking_rewards, stake_changes, policy_expiry, delegation_status, dapp_interactions, failed_transactions, asset_history)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                INSERT INTO notification_settings (user_id, ada_transactions, token_changes, nft_updates, staking_rewards, stake_changes, policy_expiry, delegation_status, dapp_interactions, failed_transactions)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT (user_id) DO UPDATE 
                 SET ada_transactions = EXCLUDED.ada_transactions,
                     token_changes = EXCLUDED.token_changes,
@@ -1637,8 +1640,7 @@ async def initialize_notification_settings(user_id: str):
                     policy_expiry = EXCLUDED.policy_expiry,
                     delegation_status = EXCLUDED.delegation_status,
                     dapp_interactions = EXCLUDED.dapp_interactions,
-                    failed_transactions = EXCLUDED.failed_transactions,
-                    asset_history = EXCLUDED.asset_history
+                    failed_transactions = EXCLUDED.failed_transactions
                 """,
                 user_id,
                 default_settings['ada_transactions'],
@@ -1649,8 +1651,7 @@ async def initialize_notification_settings(user_id: str):
                 default_settings['policy_expiry'],
                 default_settings['delegation_status'],
                 default_settings['dapp_interactions'],
-                default_settings['failed_transactions'],
-                default_settings['asset_history']
+                default_settings['failed_transactions']
             )
             
             logger.info(f"Initialized notification settings for user {user_id}")
@@ -1659,6 +1660,206 @@ async def initialize_notification_settings(user_id: str):
         logger.error(f"Error initializing notification settings: {e}")
         if hasattr(e, '__dict__'):
             logger.error(f"Error details: {e.__dict__}")
+
+async def get_last_policy_check(address: str):
+    """Get the last time policy expiry was checked
+    
+    Args:
+        address (str): Wallet address
+        
+    Returns:
+        Optional[datetime]: Last check time or None if never checked
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT last_policy_check
+            FROM wallets
+            WHERE address = $1
+            """,
+            address
+        )
+        return row['last_policy_check'] if row else None
+
+async def update_last_policy_check(address: str):
+    """Update the last policy check time
+    
+    Args:
+        address (str): Wallet address
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE wallets
+            SET last_policy_check = NOW()
+            WHERE address = $1
+            """,
+            address
+        )
+
+async def get_monitoring_since(address: str) -> datetime:
+    """Get when monitoring started for a wallet
+    
+    Args:
+        address (str): Wallet address
+        
+    Returns:
+        datetime: When monitoring started
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            """
+            SELECT monitoring_since
+            FROM wallets
+            WHERE address = $1
+            """,
+            address
+        )
+
+async def get_all_monitored_addresses():
+    """Get all monitored addresses and stake addresses"""
+    try:
+        addresses = []
+        stake_addresses = []
+        
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # Get all addresses and stake addresses
+                query = 'SELECT address, stake_address FROM wallets'
+                rows = await conn.fetch(query)
+                
+                for row in rows:
+                    addresses.append(row['address'])
+                    if row['stake_address']:
+                        stake_addresses.append(row['stake_address'])
+                        
+        return addresses, stake_addresses
+        
+    except Exception as e:
+        logger.error(f"Error getting monitored addresses: {str(e)}")
+        return [], []
+
+async def get_addresses_for_stake(stake_address: str) -> list[str]:
+    """Get all addresses for a stake address"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.execute(
+                """
+                SELECT address
+                FROM wallets
+                WHERE stake_address = $1
+                """,
+                stake_address
+            ) as cursor:
+                return [row[0] async for row in cursor]
+    except Exception as e:
+        logger.error(f"Error getting addresses for stake: {str(e)}")
+        return []
+
+async def update_pool_for_stake(stake_address: str, pool_id: str):
+    """Update the pool ID for a stake address"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                '''
+                UPDATE stake_addresses 
+                SET last_pool_id = ?, last_checked = CURRENT_TIMESTAMP 
+                WHERE stake_address = ?
+                ''',
+                pool_id, stake_address
+            )
+            await conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error updating pool for stake address: {str(e)}")
+        return False
+
+async def get_wallet_info(address: str) -> dict:
+    """Get wallet information including stake address"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.execute(
+                """
+                SELECT w.address, w.user_id, w.stake_address, w.monitoring_since,
+                       s.last_pool_id, s.last_checked
+                FROM wallets w
+                LEFT JOIN stake_addresses s ON w.stake_address = s.stake_address
+                WHERE w.address = $1
+                """,
+                address
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return {
+                        'address': row[0],
+                        'user_id': row[1],
+                        'stake_address': row[2],
+                        'monitoring_since': row[3],
+                        'last_pool_id': row[4],
+                        'last_checked': row[5]
+                    }
+                return None
+    except Exception as e:
+        logger.error(f"Error getting wallet info: {str(e)}")
+        return None
+
+async def get_user_wallets(user_id: int) -> list:
+    """Get all wallets for a user with their stake and delegation info"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.execute(
+                """
+                SELECT w.address, w.stake_address, w.monitoring_since,
+                       s.last_pool_id, s.last_checked
+                FROM wallets w
+                LEFT JOIN stake_addresses s ON w.stake_address = s.stake_address
+                WHERE w.user_id = $1
+                ORDER BY w.monitoring_since DESC
+                """,
+                user_id
+            ) as cursor:
+                return [
+                    {
+                        'address': row[0],
+                        'stake_address': row[1],
+                        'monitoring_since': row[2],
+                        'last_pool_id': row[3],
+                        'last_checked': row[4]
+                    }
+                    async for row in cursor
+                ]
+    except Exception as e:
+        logger.error(f"Error getting user wallets: {str(e)}")
+        return []
+
+async def update_stake_pool(stake_address: str, pool_id: str) -> bool:
+    """Update stake pool for an address"""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO stake_addresses (stake_address, last_pool_id, last_checked)
+                VALUES ($1, $2, NOW())
+                ON CONFLICT (stake_address) 
+                DO UPDATE SET 
+                    last_pool_id = EXCLUDED.last_pool_id,
+                    last_checked = NOW()
+                """,
+                stake_address, pool_id
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Error updating stake pool: {str(e)}")
+        return False
 
 async def main():
     """Example usage of database functions"""
