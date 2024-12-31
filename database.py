@@ -4,7 +4,7 @@ import logging
 import asyncio
 import asyncpg
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Union
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -29,7 +29,7 @@ async def init_db():
         if _pool is None:
             try:
                 _pool = await asyncpg.create_pool(
-                    dsn=os.getenv('DATABASE_URL'),
+                    dsn=DATABASE_URL,
                     min_size=1,
                     max_size=20,
                     command_timeout=60,
@@ -54,11 +54,7 @@ async def close_db():
 
 async def cleanup_pool():
     """Clean up the database connection pool"""
-    global _pool
-    if _pool is not None:
-        await _pool.close()
-        _pool = None
-        logger.info("Database connection pool closed")
+    await close_db()
 
 async def get_pool() -> asyncpg.Pool:
     """Get database connection pool
@@ -70,8 +66,62 @@ async def get_pool() -> asyncpg.Pool:
         RuntimeError: If pool is not initialized
     """
     if _pool is None:
-        await init_db()
+        raise RuntimeError("Database pool not initialized")
     return _pool
+
+async def execute_query(query: str, *args) -> None:
+    """Execute a database query
+    
+    Args:
+        query (str): SQL query to execute
+        *args: Query parameters
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(query, *args)
+            logger.debug(f"Executed query: {query}")
+
+async def execute_many(query: str, args_list: list) -> None:
+    """Execute a database query with multiple sets of parameters
+    
+    Args:
+        query (str): SQL query to execute
+        args_list (list): List of parameter sets
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.executemany(query, args_list)
+            logger.debug(f"Executed batch query: {query}")
+
+async def fetch_all(query: str, *args) -> List[asyncpg.Record]:
+    """Fetch all rows from a database query
+    
+    Args:
+        query (str): SQL query to execute
+        *args: Query parameters
+        
+    Returns:
+        List[asyncpg.Record]: List of query results
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(query, *args)
+
+async def fetch_one(query: str, *args) -> Optional[asyncpg.Record]:
+    """Fetch a single row from a database query
+    
+    Args:
+        query (str): SQL query to execute
+        *args: Query parameters
+        
+    Returns:
+        Optional[asyncpg.Record]: Query result or None if not found
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(query, *args)
 
 # Database initialization SQL
 INIT_SQL = """
@@ -1722,14 +1772,17 @@ async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
     """
     try:
         pool = await get_pool()
-        query = """
-            SELECT DISTINCT user_id 
-            FROM wallets 
-            WHERE stake_address = $1
-            LIMIT 1
-        """
-        result = await pool.fetchval(query, stake_address)
-        return result
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                '''
+                SELECT DISTINCT user_id 
+                FROM wallets 
+                WHERE stake_address = $1
+                LIMIT 1
+                ''',
+                stake_address
+            )
+            return row['user_id'] if row else None
     except Exception as e:
         logger.error(f"Error getting user ID for stake address: {str(e)}")
         return None
@@ -2037,6 +2090,60 @@ async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"Error getting user ID for stake address {stake_address}: {str(e)}")
         return None
+
+async def execute_query(query: str, *args) -> None:
+    """Execute a database query
+    
+    Args:
+        query (str): SQL query to execute
+        *args: Query parameters
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(query, *args)
+            logger.debug(f"Executed query: {query}")
+
+async def execute_many(query: str, args_list: list) -> None:
+    """Execute a database query with multiple sets of parameters
+    
+    Args:
+        query (str): SQL query to execute
+        args_list (list): List of parameter sets
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.executemany(query, args_list)
+            logger.debug(f"Executed batch query: {query}")
+
+async def fetch_all(query: str, *args) -> list:
+    """Fetch all rows from a database query
+    
+    Args:
+        query (str): SQL query to execute
+        *args: Query parameters
+        
+    Returns:
+        list: List of query results
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(query, *args)
+
+async def fetch_one(query: str, *args) -> Optional[asyncpg.Record]:
+    """Fetch a single row from a database query
+    
+    Args:
+        query (str): SQL query to execute
+        *args: Query parameters
+        
+    Returns:
+        Optional[asyncpg.Record]: Query result or None if not found
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(query, *args)
 
 async def main():
     """Example usage of database functions"""

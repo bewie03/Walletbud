@@ -27,6 +27,10 @@ MAX_RETRIES = int(os.getenv('MAINTENANCE_MAX_RETRIES', '3'))  # Maximum retries 
 MAINTENANCE_HOUR = int(os.getenv('MAINTENANCE_HOUR', '2'))  # Hour to run maintenance (24-hour format)
 MAINTENANCE_MINUTE = int(os.getenv('MAINTENANCE_MINUTE', '0'))  # Minute to run maintenance
 
+class DatabaseMaintenanceError(Exception):
+    """Base exception for database maintenance errors"""
+    pass
+
 class DatabaseMaintenance:
     """Handles database maintenance tasks"""
     def __init__(self):
@@ -193,7 +197,7 @@ class DatabaseMaintenance:
             
         except Exception as e:
             logger.error(f"Error archiving transactions: {str(e)}")
-            raise
+            raise DatabaseMaintenanceError(f"Error archiving transactions: {str(e)}")
 
     async def _delete_old_archived_transactions(self, conn) -> int:
         """Delete archived transactions older than DELETE_AFTER_DAYS
@@ -244,7 +248,7 @@ class DatabaseMaintenance:
             
         except Exception as e:
             logger.error(f"Error deleting old transactions: {str(e)}")
-            raise
+            raise DatabaseMaintenanceError(f"Error deleting old transactions: {str(e)}")
 
     async def _optimize_tables(self, conn) -> int:
         """Optimize database tables
@@ -276,7 +280,7 @@ class DatabaseMaintenance:
             
         except Exception as e:
             logger.error(f"Error during table optimization: {str(e)}")
-            raise
+            raise DatabaseMaintenanceError(f"Error during table optimization: {str(e)}")
 
     async def get_maintenance_stats(self) -> Dict[str, Any]:
         """Get statistics about the last maintenance run

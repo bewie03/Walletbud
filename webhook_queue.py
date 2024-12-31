@@ -12,6 +12,15 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from collections import deque
 
+from config import (
+    RATE_LIMIT_WINDOW,
+    RATE_LIMIT_MAX_REQUESTS,
+    MAX_QUEUE_SIZE,
+    MAX_RETRIES,
+    MAX_EVENT_AGE,
+    BATCH_SIZE
+)
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -47,26 +56,6 @@ class WebhookEvent:
             return time_since_retry >= wait_time
             
         return True
-
-# Queue configuration
-MAX_QUEUE_SIZE = 10000  # Maximum events in queue
-MAX_RETRIES = 5  # Maximum retry attempts per event
-MAX_EVENT_AGE = 3600  # Maximum age of event in seconds (1 hour)
-MAX_EVENT_SIZE = 1048576  # Maximum event payload size (1MB)
-BATCH_SIZE = 10  # Process this many events at once
-PROCESS_INTERVAL = 1  # Process queue every N seconds
-MAX_ERROR_HISTORY = 1000  # Maximum number of errors to keep in history
-RATE_LIMIT_WINDOW = 60  # Rate limit window in seconds
-RATE_LIMIT_MAX_REQUESTS = 100  # Maximum requests per window per IP
-
-@dataclass
-class QueueError:
-    """Represents an error in the queue"""
-    timestamp: datetime
-    error_type: str
-    event_id: Optional[str]
-    message: str
-    details: Optional[Dict[str, Any]] = None
 
 class RateLimiter:
     """Rate limiter for webhook requests"""
@@ -129,7 +118,7 @@ class WebhookQueue:
         self.process_lock = asyncio.Lock()
         self.queue_lock = asyncio.Lock()  # Separate lock for queue operations
         self.rate_limiter = RateLimiter()
-        self.errors: deque[QueueError] = deque(maxlen=MAX_ERROR_HISTORY)
+        self.errors: deque[QueueError] = deque(maxlen=1000)
         self.stats = {
             'total_received': 0,
             'total_processed': 0,
@@ -155,7 +144,7 @@ class WebhookQueue:
         try:
             # Check payload size
             payload_size = len(json.dumps(payload).encode('utf-8'))
-            if payload_size > MAX_EVENT_SIZE:
+            if payload_size > 1048576:  # 1MB
                 logger.error(f"Event payload too large: {payload_size} bytes")
                 self.stats['total_oversized'] += 1
                 return False
@@ -384,3 +373,12 @@ class WebhookQueue:
             'newest_event': newest_event,
             'recent_errors': recent_errors
         }
+
+@dataclass
+class QueueError:
+    """Represents an error in the queue"""
+    timestamp: datetime
+    error_type: str
+    event_id: Optional[str]
+    message: str
+    details: Optional[Dict[str, Any]] = None
