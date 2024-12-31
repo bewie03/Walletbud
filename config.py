@@ -72,6 +72,9 @@ if not all([DISCORD_TOKEN, BLOCKFROST_PROJECT_ID, YUMMI_POLICY_ID]):
 BURST_COOLDOWN = BURST_LIMIT / MAX_REQUESTS_PER_SECOND  # 50 seconds
 
 # Wallet Monitoring Configuration
+MIN_ADA_BALANCE = 5  # Minimum ADA balance threshold (5 ADA)
+MAX_TX_PER_HOUR = 10  # Maximum transactions per hour before alerting
+MONITORING_INTERVAL = 60  # Check wallets every 60 seconds
 
 # API Retry Configuration
 
@@ -97,6 +100,9 @@ logger.info(
     f"  MAX_TX_HISTORY: {MAX_TX_HISTORY}\n"
     f"  API_RETRY_DELAY: {API_RETRY_DELAY}s\n"
     f"  WALLET_PROCESS_DELAY: {WALLET_PROCESS_DELAY}s\n"
+    f"  MIN_ADA_BALANCE: {MIN_ADA_BALANCE}\n"
+    f"  MAX_TX_PER_HOUR: {MAX_TX_PER_HOUR}\n"
+    f"  MONITORING_INTERVAL: {MONITORING_INTERVAL}s\n"
 )
 
 # Error Messages
