@@ -13,7 +13,12 @@ from discord.ext import commands, tasks
 from blockfrost import BlockFrostApi
 import aiohttp
 
-from config import *
+from config import (
+    DISCORD_TOKEN, BLOCKFROST_PROJECT_ID, BLOCKFROST_BASE_URL,
+    MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_DELAY,
+    MIN_ADA_BALANCE, WALLET_CHECK_INTERVAL, MAX_TX_PER_HOUR,
+    WALLET_PROCESS_DELAY, YUMMI_TOKEN_ID, YUMMI_REQUIREMENT
+)
 from database import (
     init_db,
     add_wallet,
@@ -288,7 +293,7 @@ class WalletBud(commands.Bot):
                 int(amount.quantity)
                 for utxo in utxos
                 for amount in utxo.amount
-                if amount.unit == '29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49'
+                if amount.unit == "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49"
             )
             
             meets_requirement = yummi_balance >= 25000
@@ -688,50 +693,60 @@ class WalletBud(commands.Bot):
         try:
             # Validate address format
             if not address.startswith('addr1'):
-                await interaction.response.send_message("❌ Invalid wallet address! Address must start with 'addr1'.", ephemeral=True)
+                await interaction.response.send_message("❌ Invalid wallet address! Address must start with 'addr1'", ephemeral=True)
                 return
-                
-            # Check if wallet exists and get UTXOs
+
+            # Check if wallet exists
+            if await wallet_exists(str(interaction.user.id), address):
+                await interaction.response.send_message("❌ This wallet is already being monitored!", ephemeral=True)
+                return
+
+            # Check YUMMI token requirement
             try:
+                # Get UTXOs
                 utxos = await self.rate_limited_request(
                     self.blockfrost_client.address_utxos,
                     address
                 )
-                if not utxos:
-                    await interaction.response.send_message("❌ Invalid wallet address! Could not find wallet on blockchain.", ephemeral=True)
-                    return
-
-                # Check YUMMI token requirement (25,000 minimum)
-                yummi_amount = 0
-                for utxo in utxos:
-                    for amount in utxo.amount:
-                        if amount.unit == '29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49':  # YUMMI
-                            yummi_amount += int(amount.quantity)
+                
+                # Calculate YUMMI balance
+                yummi_amount = sum(
+                    int(amount.quantity)
+                    for utxo in utxos
+                    for amount in utxo.amount
+                    if amount.unit == "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49"
+                )
 
                 if yummi_amount < 25000:
-                    await interaction.response.send_message("❌ Wallet must hold at least 25,000 YUMMI tokens!", ephemeral=True)
+                    await interaction.response.send_message(
+                        f"❌ Wallet must hold at least 25,000 YUMMI tokens!\n"
+                        f"Current balance: `{yummi_amount:,} YUMMI`", 
+                        ephemeral=True
+                    )
                     return
 
             except Exception as e:
-                logger.error(f"Error validating address: {str(e)}")
-                await interaction.response.send_message("❌ Invalid wallet address! Could not verify wallet on blockchain.", ephemeral=True)
+                logger.error(f"Error checking YUMMI balance: {str(e)}")
+                await interaction.response.send_message("❌ Error checking YUMMI balance. Please try again later.", ephemeral=True)
                 return
-            
-            # Check if wallet is already registered
-            if await get_wallet(str(interaction.user.id), address):
-                await interaction.response.send_message("❌ This wallet is already registered!", ephemeral=True)
-                return
-            
+
             # Add wallet to database
             success = await add_wallet(str(interaction.user.id), address)
-            if success:
-                await interaction.response.send_message("✅ Wallet added successfully!", ephemeral=True)
-            else:
-                await interaction.response.send_message("❌ Failed to add wallet.", ephemeral=True)
-            
+            if not success:
+                await interaction.response.send_message("❌ Failed to add wallet. Please try again later.", ephemeral=True)
+                return
+
+            # Send success message
+            await interaction.response.send_message(
+                f"✅ Successfully added wallet!\n"
+                f"Address: `{address[:8]}...{address[-8:]}`\n"
+                f"YUMMI Balance: `{yummi_amount:,}`",
+                ephemeral=True
+            )
+
         except Exception as e:
             logger.error(f"Error adding wallet: {str(e)}")
-            await interaction.response.send_message("❌ An error occurred while adding your wallet.", ephemeral=True)
+            await interaction.response.send_message("❌ An error occurred. Please try again later.", ephemeral=True)
 
     async def _remove_wallet(self, interaction: discord.Interaction, address: str):
         """Remove a wallet from monitoring"""
@@ -791,7 +806,7 @@ class WalletBud(commands.Bot):
                             int(amount.quantity)
                             for utxo in utxos
                             for amount in utxo.amount
-                            if amount.unit == '29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49'
+                            if amount.unit == "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c64d494d4d49"
                         )
                         
                         # Get transaction count
@@ -1121,11 +1136,9 @@ if __name__ == "__main__":
         logger.info("Starting WalletBud bot...")
         
         # Constants
-        REQUIRED_YUMMI_TOKENS = 25000
         WALLET_CHECK_INTERVAL = 60  # seconds
         MAX_TX_PER_HOUR = 10
         MIN_ADA_BALANCE = 2  # ADA
-        YUMMI_POLICY_ID = "f9f5af5a6c9df7c7f9c2f86c5e1f2a7c"
         
         # Create bot instance
         bot = WalletBud()

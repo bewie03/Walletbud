@@ -44,13 +44,12 @@ if not BLOCKFROST_PROJECT_ID or not BLOCKFROST_PROJECT_ID.strip():
     raise ValueError("No valid Blockfrost project ID found! Make sure BLOCKFROST_PROJECT_ID is set in .env")
 
 # YUMMI Token Configuration
-YUMMI_POLICY_ID = validate_hex(
-    os.getenv('YUMMI_POLICY_ID'),
-    56,
-    'YUMMI_POLICY_ID'
-)
+YUMMI_POLICY_ID = "29d222ce763455e3d7a09a665ce554f00ac89d2e99a1a83d267170c6"
+YUMMI_ASSET_NAME = "4d494d4d49"  # hex for "YUMMI"
+YUMMI_TOKEN_ID = f"{YUMMI_POLICY_ID}{YUMMI_ASSET_NAME}"
+YUMMI_REQUIREMENT = 25000
 
-REQUIRED_YUMMI_TOKENS = 25000  # Updated threshold
+REQUIRED_YUMMI_TOKENS = YUMMI_REQUIREMENT  # Updated threshold
 MAX_REQUESTS_PER_SECOND = int(os.getenv('MAX_REQUESTS_PER_SECOND', '10'))
 BURST_LIMIT = int(os.getenv('BURST_LIMIT', '20'))
 RATE_LIMIT_DELAY = float(os.getenv('RATE_LIMIT_DELAY', '0.1'))
@@ -65,7 +64,7 @@ API_RETRY_DELAY = float(os.getenv('API_RETRY_DELAY', '1.0'))
 WALLET_PROCESS_DELAY = float(os.getenv('WALLET_PROCESS_DELAY', '0.2'))
 
 # Validate required environment variables
-if not all([DISCORD_TOKEN, BLOCKFROST_PROJECT_ID, YUMMI_POLICY_ID]):
+if not all([DISCORD_TOKEN, BLOCKFROST_PROJECT_ID]):
     raise ValueError("Missing required environment variables")
 
 # Rate Limiting Configuration
