@@ -1388,7 +1388,6 @@ async def initialize_notification_settings(user_id: str):
 async def main():
     """Example usage of database functions"""
     try:
-        await init_db()
         await add_wallet("1234567890", "addr1...")
         print(await get_all_wallets())
         await remove_wallet("1234567890", "addr1...")

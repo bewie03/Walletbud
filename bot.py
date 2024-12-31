@@ -58,7 +58,8 @@ from database import (
     reset_yummi_warning,
     increment_yummi_warning,
     get_policy_expiry,
-    update_policy_expiry
+    update_policy_expiry,
+    init_db
 )
 
 # Configure logging
@@ -292,12 +293,13 @@ class WalletBud(commands.Bot):
         """Setup hook called before the bot starts"""
         try:
             # Initialize database
+            logger.info("Initializing database...")
             await init_db()
-            logger.info("Database initialized")
+            logger.info("Database initialization complete")
             
             # Initialize Blockfrost client
+            logger.info("Initializing Blockfrost client...")
             await self.init_blockfrost()
-            logger.info("Blockfrost client initialized")
             
             # Set up commands
             logger.info("Setting up commands...")
