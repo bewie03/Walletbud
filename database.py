@@ -3,6 +3,7 @@ import logging
 import asyncpg
 from datetime import datetime
 import json
+from typing import Optional
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -58,7 +59,6 @@ CREATE TABLE IF NOT EXISTS wallets (
     last_balance BIGINT,
     utxo_state JSONB,
     delegation_pool_id TEXT,
-    last_dapp_tx TEXT,
     UNIQUE(user_id, address)
 );
 
@@ -108,6 +108,45 @@ CREATE TABLE IF NOT EXISTS policy_expiry (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Transactions table for storing transactions
+CREATE TABLE IF NOT EXISTS transactions (
+    id SERIAL PRIMARY KEY,
+    wallet_id INTEGER REFERENCES wallets(id) ON DELETE CASCADE,
+    tx_hash TEXT NOT NULL,
+    metadata JSONB,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(wallet_id, tx_hash)
+);
+
+-- Add last_dapp_tx column to wallets table if it doesn't exist
+DO $$ 
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 
+        FROM information_schema.columns 
+        WHERE table_name = 'wallets' 
+        AND column_name = 'last_dapp_tx'
+    ) THEN
+        ALTER TABLE wallets ADD COLUMN last_dapp_tx TEXT;
+    END IF;
+END $$;
+
+-- Create transactions table if it doesn't exist
+CREATE TABLE IF NOT EXISTS transactions (
+    id SERIAL PRIMARY KEY,
+    wallet_id INTEGER REFERENCES wallets(id) ON DELETE CASCADE,
+    tx_hash TEXT NOT NULL,
+    metadata JSONB,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(wallet_id, tx_hash)
+);
+
+-- Create index on tx_hash for faster lookups
+CREATE INDEX IF NOT EXISTS idx_transactions_tx_hash ON transactions(tx_hash);
+
+-- Create index on wallet_id for faster lookups
+CREATE INDEX IF NOT EXISTS idx_transactions_wallet_id ON transactions(wallet_id);
 """
 
 async def init_db():
@@ -346,13 +385,13 @@ async def get_wallet_id(user_id: str, address: str):
         logger.error(f"Error getting wallet ID: {str(e)}")
         return None
 
-async def add_transaction(wallet_id: int, tx_hash: str, timestamp: datetime = None):
-    """Add a transaction to the database
+async def add_transaction(wallet_id: int, tx_hash: str, metadata: dict = None) -> bool:
+    """Add a transaction to the database with metadata
     
     Args:
         wallet_id (int): Wallet ID
         tx_hash (str): Transaction hash
-        timestamp (datetime, optional): Transaction timestamp. Defaults to current time.
+        metadata (dict, optional): Transaction metadata. Defaults to None.
         
     Returns:
         bool: Success status
@@ -360,18 +399,42 @@ async def add_transaction(wallet_id: int, tx_hash: str, timestamp: datetime = No
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO transactions (wallet_id, tx_hash, timestamp)
+            query = """
+                INSERT INTO transactions (wallet_id, tx_hash, metadata)
                 VALUES ($1, $2, $3)
-                ON CONFLICT (wallet_id, tx_hash) DO NOTHING
-                """,
-                wallet_id, tx_hash, timestamp or datetime.utcnow()
-            )
+                ON CONFLICT (wallet_id, tx_hash) DO UPDATE
+                SET metadata = EXCLUDED.metadata
+                RETURNING id
+            """
+            await conn.fetchval(query, wallet_id, tx_hash, json.dumps(metadata) if metadata else None)
             return True
     except Exception as e:
         logger.error(f"Error adding transaction: {str(e)}")
         return False
+
+async def get_transaction_metadata(wallet_id: int, tx_hash: str) -> Optional[dict]:
+    """Get transaction metadata from the database
+    
+    Args:
+        wallet_id (int): Wallet ID
+        tx_hash (str): Transaction hash
+        
+    Returns:
+        Optional[dict]: Transaction metadata or None if not found
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            query = """
+                SELECT metadata
+                FROM transactions
+                WHERE wallet_id = $1 AND tx_hash = $2
+            """
+            result = await conn.fetchval(query, wallet_id, tx_hash)
+            return json.loads(result) if result else None
+    except Exception as e:
+        logger.error(f"Error getting transaction metadata: {str(e)}")
+        return None
 
 async def get_notification_settings(user_id: str):
     """Get user's notification settings
@@ -1206,6 +1269,53 @@ async def update_dapp_interaction(address: str, tx_hash: str):
             return True
     except Exception as e:
         logger.error(f"Error updating DApp interaction: {str(e)}")
+        return False
+
+async def get_last_dapp_tx(address: str) -> Optional[str]:
+    """Get the last processed DApp transaction for a wallet
+    
+    Args:
+        address (str): Wallet address
+        
+    Returns:
+        Optional[str]: Transaction hash or None if not found
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            query = """
+                SELECT last_dapp_tx
+                FROM wallets
+                WHERE address = $1
+            """
+            result = await conn.fetchval(query, address)
+            return result
+    except Exception as e:
+        logger.error(f"Error getting last DApp transaction: {str(e)}")
+        return None
+
+async def update_last_dapp_tx(address: str, tx_hash: str) -> bool:
+    """Update the last processed DApp transaction for a wallet
+    
+    Args:
+        address (str): Wallet address
+        tx_hash (str): Transaction hash
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            query = """
+                UPDATE wallets
+                SET last_dapp_tx = $2
+                WHERE address = $1
+            """
+            await conn.execute(query, address, tx_hash)
+            return True
+    except Exception as e:
+        logger.error(f"Error updating last DApp transaction: {str(e)}")
         return False
 
 async def main():

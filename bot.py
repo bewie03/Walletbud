@@ -47,7 +47,8 @@ from database import (
     update_dapp_interaction,
     update_notification_setting,
     get_last_dapp_tx,
-    update_last_dapp_tx
+    update_last_dapp_tx,
+    add_transaction
 )
 
 # Configure logging
@@ -214,17 +215,20 @@ class WalletBud(commands.Bot):
 
     DAPP_IDENTIFIERS = {
         # DApp name -> List of identifiers in metadata
-        "SundaeSwap": ["sundae", "sundaeswap"],
-        "MuesliSwap": ["muesli", "muesliswap"],
-        "MinSwap": ["min", "minswap"],
-        "WingRiders": ["wing", "wingriders"],
-        "VyFinance": ["vyfi", "vyfinance"],
-        "Genius Yield": ["genius", "geniusyield"],
-        "Indigo Protocol": ["indigo", "indigoprotocol"],
-        "Liqwid Finance": ["liqwid", "liqwidfinance"],
-        "AADA Finance": ["aada", "aadafinance"],
-        "Djed": ["djed", "shen"],
-        "NFT/Token Contract": ["721", "20"]  # NFT and Token standards
+        "SundaeSwap": ["sundae", "sundaeswap", "sundaeswap.io"],
+        "MuesliSwap": ["muesli", "muesliswap", "muesliswap.com"],
+        "MinSwap": ["min", "minswap", "minswap.org"],
+        "WingRiders": ["wing", "wingriders", "wingriders.com"],
+        "VyFinance": ["vyfi", "vyfinance", "vyfi.io"],
+        "Genius Yield": ["genius", "geniusyield", "geniusyield.co"],
+        "Indigo Protocol": ["indigo", "indigoprotocol", "indigoprotocol.io"],
+        "Liqwid Finance": ["liqwid", "liqwidfinance", "liqwid.finance"],
+        "AADA Finance": ["aada", "aadafinance", "aada.finance"],
+        "Djed": ["djed", "shen", "djed.xyz"],
+        "Ardana": ["ardana", "ardana.io"],
+        "Optim Finance": ["optim", "optimfinance"],
+        "Spectrum": ["spectrum", "spectrum.fi"],
+        "NFT/Token Contract": ["721", "20", "nft", "token"]  # NFT and Token standards
     }
 
     def __init__(self):
@@ -742,7 +746,7 @@ class WalletBud(commands.Bot):
             txs = await self.rate_limited_request(
                 self.blockfrost_client.address_transactions,
                 address,
-                params={'order': 'desc'}
+                params={'order': 'desc', 'count': 20}
             )
             
             for tx in txs:
@@ -758,10 +762,21 @@ class WalletBud(commands.Bot):
                 
                 # Check for contract interactions (metadata with known DApp identifiers)
                 if tx_details.metadata:
+                    # Convert metadata to string for easier searching
                     metadata_str = str(tx_details.metadata).lower()
                     
                     for dapp_name, identifiers in self.DAPP_IDENTIFIERS.items():
                         if any(id.lower() in metadata_str for id in identifiers):
+                            # Store transaction metadata
+                            wallet_id = await get_wallet_id(str(user.id), address)
+                            if wallet_id:
+                                await add_transaction(
+                                    wallet_id=wallet_id,
+                                    tx_hash=tx.tx_hash,
+                                    metadata=tx_details.metadata
+                                )
+                            
+                            # Send notification if enabled
                             if await self.should_notify(int(user.id), "dapp_interactions"):
                                 await user.send(
                                     f"🔗 **DApp Interaction Detected**\n"
