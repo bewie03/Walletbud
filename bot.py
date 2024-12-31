@@ -50,7 +50,8 @@ from database import (
     get_last_yummi_check,
     update_last_yummi_check,
     get_yummi_warning_count,
-    increment_yummi_warning
+    increment_yummi_warning,
+    reset_yummi_warning
 )
 
 # Configure logging
@@ -351,12 +352,11 @@ class WalletBud(commands.Bot):
             finally:
                 await self.rate_limiter.release()
 
-    async def check_yummi_requirement(self, address: str, user_id: str = None):
+    async def check_yummi_requirement(self, address: str):
         """Check if wallet meets YUMMI token requirement
         
         Args:
             address (str): Wallet address to check
-            user_id (str, optional): User ID for notifications. Defaults to None.
             
         Returns:
             tuple: (bool, int) - (meets requirement, current balance)
@@ -375,28 +375,11 @@ class WalletBud(commands.Bot):
                 int(amount.quantity)
                 for utxo in utxos
                 for amount in utxo.amount
-                if amount.unit == YUMMI_TOKEN_ID
+                if amount.unit.lower() == YUMMI_TOKEN_ID.lower()  # Case-insensitive comparison
             )
             logger.info(f"Found YUMMI amount: {yummi_amount}")
             
-            meets_requirement = yummi_amount >= YUMMI_REQUIREMENT
-            
-            # If user_id provided and requirement not met, notify user
-            if user_id and not meets_requirement:
-                try:
-                    user = await self.fetch_user(int(user_id))
-                    if user:
-                        await user.send(
-                            f"⚠️ **YUMMI Requirement Not Met!**\n"
-                            f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                            f"Current YUMMI: `{yummi_amount:,}`\n"
-                            f"Required: `{YUMMI_REQUIREMENT:,}`\n\n"
-                            f"Your wallet will be removed from monitoring if the requirement is not met within 24 hours."
-                        )
-                except Exception as e:
-                    logger.error(f"Error notifying user about YUMMI requirement: {str(e)}")
-            
-            return meets_requirement, yummi_amount
+            return yummi_amount >= YUMMI_REQUIREMENT, yummi_amount
             
         except Exception as e:
             logger.error(f"Error checking YUMMI requirement: {str(e)}")
@@ -442,30 +425,25 @@ class WalletBud(commands.Bot):
                 # Check YUMMI requirement every 6 hours
                 last_check = await get_last_yummi_check(address)
                 if not last_check or (datetime.now() - last_check).total_seconds() > 21600:  # 6 hours
-                    meets_req, balance = await self.check_yummi_requirement(address, user_id)
+                    meets_req, balance = await self.check_yummi_requirement(address)
                     await update_last_yummi_check(address)
                     
                     if not meets_req:
-                        # Get current warning count
-                        warning_count = await get_yummi_warning_count(address)
-                        
-                        if warning_count >= 4:  # Remove wallet after 24 hours (4 warnings)
-                            await remove_wallet(user_id, address)
-                            try:
-                                user = await self.fetch_user(int(user_id))
-                                if user:
-                                    await user.send(
-                                        f"❌ **Wallet Removed**\n"
-                                        f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                                        f"Reason: YUMMI requirement not met for 24 hours\n"
-                                        f"Current YUMMI: `{balance:,}`\n"
-                                        f"Required: `{YUMMI_REQUIREMENT:,}`"
-                                    )
-                            except Exception as e:
-                                logger.error(f"Error notifying user about wallet removal: {str(e)}")
-                            return
-                        else:
-                            await increment_yummi_warning(address)
+                        # Remove wallet immediately if requirement not met
+                        await remove_wallet(user_id, address)
+                        try:
+                            user = await self.fetch_user(int(user_id))
+                            if user:
+                                await user.send(
+                                    f"❌ **Wallet Removed**\n"
+                                    f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                                    f"Reason: Insufficient YUMMI tokens\n"
+                                    f"Current YUMMI: `{balance:,}`\n"
+                                    f"Required: `{YUMMI_REQUIREMENT:,}`"
+                                )
+                        except Exception as e:
+                            logger.error(f"Error notifying user about wallet removal: {str(e)}")
+                        return
                 
                 # Get current wallet state
                 try:
@@ -800,7 +778,7 @@ class WalletBud(commands.Bot):
                     int(amount.quantity)
                     for utxo in utxos
                     for amount in utxo.amount
-                    if amount.unit == YUMMI_TOKEN_ID
+                    if amount.unit.lower() == YUMMI_TOKEN_ID.lower()  # Case-insensitive comparison
                 )
                 logger.info(f"Found YUMMI amount: {yummi_amount}")
 
@@ -893,7 +871,7 @@ class WalletBud(commands.Bot):
                             int(amount.quantity)
                             for utxo in utxos
                             for amount in utxo.amount
-                            if amount.unit == YUMMI_TOKEN_ID
+                            if amount.unit.lower() == YUMMI_TOKEN_ID.lower()
                         )
                         
                         # Get transaction count
@@ -911,8 +889,8 @@ class WalletBud(commands.Bot):
                             name=f"🏦 Wallet #{i}",
                             value=(
                                 f"**Address:** `{short_address}`\n"
-                                f"**Balance:** `{ada_balance:,.2f} ADA`\n"
-                                f"**YUMMI:** `{yummi_balance:,}`\n"
+                                f"**ADA Balance:** `{ada_balance:,.6f} ADA`\n"
+                                f"**YUMMI Balance:** `{yummi_balance:,}`\n"
                                 f"**Transactions:** `{tx_count}`\n"
                                 f"**Full Address:**\n`{address}`"
                             ),
@@ -1090,24 +1068,17 @@ class WalletBud(commands.Bot):
                         )
                         total_ada += ada_balance
                         
-                        # Get transaction count
-                        tx_info = await self.rate_limited_request(
-                            self.blockfrost_client.address_total,
-                            address
-                        )
-                        tx_count = tx_info.tx_count if tx_info else 0
-                        
                         # Add wallet info
                         embed.add_field(
-                            name=f"Wallet `{address[:20]}...`",
-                            value=f"Balance: `{ada_balance:,.6f} ADA`\nTransactions: `{tx_count}`",
+                            name=f"Wallet `{address[:8]}...{address[-8:]}`",
+                            value=f"Balance: `{ada_balance:,.2f} ADA`",
                             inline=False
                         )
                         
                 except Exception as e:
                     logger.error(f"Error getting balance for {address}: {str(e)}")
                     embed.add_field(
-                        name=f"Wallet `{address[:20]}...`",
+                        name=f"Wallet `{address[:8]}...{address[-8:]}`",
                         value="❌ Failed to get balance",
                         inline=False
                     )
@@ -1115,7 +1086,7 @@ class WalletBud(commands.Bot):
             # Add total balance
             embed.add_field(
                 name="Total ADA Balance",
-                value=f"`{total_ada:,.6f} ADA`",
+                value=f"`{total_ada:,.2f} ADA`",
                 inline=False
             )
             
