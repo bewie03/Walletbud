@@ -3,7 +3,7 @@ import logging
 import asyncpg
 from datetime import datetime
 import json
-from typing import Optional
+from typing import List, Optional
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -46,7 +46,18 @@ DROP TABLE IF EXISTS users CASCADE;
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     user_id TEXT UNIQUE NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    notification_settings JSONB DEFAULT '{
+        "ada_transactions": true,
+        "token_changes": true,
+        "nft_updates": true,
+        "staking_rewards": true,
+        "stake_changes": true,
+        "low_balance": true,
+        "policy_expiry": true,
+        "delegation_status": true,
+        "dapp_interactions": true
+    }'::jsonb
 );
 
 -- Wallets table for storing wallet addresses
@@ -55,7 +66,7 @@ CREATE TABLE IF NOT EXISTS wallets (
     user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
     address TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_check TIMESTAMP,
+    last_checked TIMESTAMP,
     last_yummi_check TIMESTAMP,
     last_balance BIGINT,
     utxo_state JSONB,
@@ -79,19 +90,6 @@ CREATE TABLE IF NOT EXISTS stake_addresses (
 
 -- Create index on stake_address for faster lookups
 CREATE INDEX IF NOT EXISTS idx_stake_addresses_stake_address ON stake_addresses(stake_address);
-
--- Notification settings table
-CREATE TABLE IF NOT EXISTS notification_settings (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
-    setting_key TEXT NOT NULL,
-    enabled BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, setting_key)
-);
-
--- Create index on user_id and setting_key for faster lookups
-CREATE INDEX IF NOT EXISTS idx_notification_settings_user_setting ON notification_settings(user_id, setting_key);
 
 -- Processed rewards table
 CREATE TABLE IF NOT EXISTS processed_rewards (
@@ -168,8 +166,8 @@ async def init_db():
                     
                     # Verify all required tables exist
                     required_tables = [
-                        'users', 'wallets', 'stake_addresses', 'notification_settings',
-                        'processed_rewards', 'yummi_warnings', 'policy_expiry', 'transactions'
+                        'users', 'wallets', 'stake_addresses', 'processed_rewards',
+                        'yummi_warnings', 'policy_expiry', 'transactions'
                     ]
                     
                     for table in required_tables:
@@ -297,11 +295,11 @@ async def get_wallet(user_id: str, address: str):
         logger.error(f"Error getting wallet: {str(e)}")
         return None
 
-async def get_all_wallets():
+async def get_all_wallets() -> List[asyncpg.Record]:
     """Get all monitored wallets
     
     Returns:
-        List[Record]: List of wallet records
+        List[asyncpg.Record]: List of wallet records
     """
     try:
         pool = await get_pool()
@@ -311,7 +309,7 @@ async def get_all_wallets():
         logger.error(f"Error getting all wallets: {str(e)}")
         return []
 
-async def get_all_wallets_for_user(user_id: str):
+async def get_all_wallets_for_user(user_id: str) -> List[str]:
     """Get all wallets for a specific user
     
     Args:
@@ -352,14 +350,14 @@ async def get_user_id_for_wallet(address: str):
         logger.error(f"Error getting user ID: {str(e)}")
         return None
 
-async def get_last_yummi_check(address: str):
+async def get_last_yummi_check(address: str) -> Optional[datetime]:
     """Get the last time YUMMI requirement was checked
     
     Args:
         address (str): Wallet address
         
     Returns:
-        datetime: Last check time or None if never checked
+        Optional[datetime]: Last check time or None if never checked
     """
     try:
         pool = await get_pool()
@@ -403,7 +401,7 @@ async def update_last_checked(wallet_id: int):
         async with pool.acquire() as conn:
             query = """
                 UPDATE wallets 
-                SET last_check = CURRENT_TIMESTAMP 
+                SET last_checked = CURRENT_TIMESTAMP 
                 WHERE id = $1
             """
             await conn.execute(query, wallet_id)
@@ -517,28 +515,11 @@ async def get_notification_settings(user_id: str):
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # First ensure user exists with default settings
-            await conn.execute(
-                """
-                INSERT INTO users (user_id, notification_settings)
-                VALUES ($1, $2)
-                ON CONFLICT (user_id) DO NOTHING
-                """,
-                user_id,
-                json.dumps({
-                    "ada_transactions": True,
-                    "staking_rewards": True,
-                    "stake_changes": True,
-                    "low_balance": True
-                })
-            )
-            
-            # Get settings
             row = await conn.fetchrow(
                 "SELECT notification_settings FROM users WHERE user_id = $1",
                 user_id
             )
-            return json.loads(row['notification_settings']) if row else None
+            return row['notification_settings'] if row else None
     except Exception as e:
         logger.error(f"Error getting notification settings: {str(e)}")
         return None
@@ -557,24 +538,8 @@ async def update_notification_setting(user_id: str, setting: str, enabled: bool)
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # First ensure user exists with default settings
-            await conn.execute(
-                """
-                INSERT INTO users (user_id, notification_settings)
-                VALUES ($1, $2)
-                ON CONFLICT (user_id) DO NOTHING
-                """,
-                user_id,
-                json.dumps({
-                    "ada_transactions": True,
-                    "staking_rewards": True,
-                    "stake_changes": True,
-                    "low_balance": True
-                })
-            )
-            
-            # Update specific setting
-            await conn.execute(
+            # Update specific setting using jsonb_set
+            result = await conn.execute(
                 """
                 UPDATE users 
                 SET notification_settings = jsonb_set(
@@ -586,10 +551,10 @@ async def update_notification_setting(user_id: str, setting: str, enabled: bool)
                 WHERE user_id = $1
                 """,
                 user_id, 
-                setting,
-                json.dumps(enabled)
+                '{' + setting + '}',  # Convert setting to proper JSONB path
+                'true' if enabled else 'false'
             )
-            return True
+            return result == "UPDATE 1"
     except Exception as e:
         logger.error(f"Error updating notification setting: {str(e)}")
         return False
@@ -613,7 +578,7 @@ async def should_notify(user_id: str, notification_type: str) -> bool:
         logger.error(f"Error checking notification settings: {str(e)}")
         return True  # Default to notify on error
 
-async def get_recent_transactions(address: str, hours: int = 1) -> list:
+async def get_recent_transactions(address: str, hours: int = 1) -> List[asyncpg.Record]:
     """Get transactions in the last N hours
     
     Args:
@@ -621,7 +586,7 @@ async def get_recent_transactions(address: str, hours: int = 1) -> list:
         hours (int): Number of hours to look back
         
     Returns:
-        list: List of transactions
+        List[asyncpg.Record]: List of transactions
     """
     try:
         pool = await get_pool()
@@ -765,9 +730,6 @@ async def update_utxo_state(address: str, utxo_state: dict):
             logger.error(f"Error updating UTxO state for {address}: {str(e)}")
             return False
 
-# Alias for backward compatibility
-store_utxo_state = update_utxo_state
-
 async def get_stake_address(address: str):
     """Get the stake address for a wallet address
     
@@ -909,7 +871,7 @@ async def add_processed_reward(stake_address: str, epoch: int, amount: int):
             logger.error(f"Error adding processed reward: {str(e)}")
             return False
 
-async def get_last_transactions(address: str):
+async def get_last_transactions(address: str) -> List[str]:
     """Retrieve the last set of processed transactions for a wallet
     
     Args:
@@ -947,14 +909,14 @@ async def get_last_transactions(address: str):
             logger.error(f"Error getting last transactions for {address}: {str(e)}")
             return []
 
-async def get_utxo_state(address: str):
+async def get_utxo_state(address: str) -> Optional[dict]:
     """Get the UTxO state for a wallet address
     
     Args:
         address (str): Wallet address
         
     Returns:
-        dict: Dictionary containing UTxO state or None if not found
+        Optional[dict]: Dictionary containing UTxO state or None if not found
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -972,7 +934,7 @@ async def get_utxo_state(address: str):
             logger.error(f"Error getting UTxO state for {address}: {str(e)}")
             return None
 
-async def get_wallet_for_user(user_id: str, address: str):
+async def get_wallet_for_user(user_id: str, address: str) -> Optional[asyncpg.Record]:
     """Get wallet details for a specific user and address
     
     Args:
@@ -980,7 +942,7 @@ async def get_wallet_for_user(user_id: str, address: str):
         address (str): Wallet address
         
     Returns:
-        Record: Wallet record with all details or None if not found
+        Optional[asyncpg.Record]: Wallet record with all details or None if not found
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1051,14 +1013,14 @@ async def add_processed_token_change(wallet_id: int, tx_hash: str) -> bool:
         logger.error(f"Error adding processed token change: {str(e)}")
         return False
 
-async def get_new_tokens(address: str) -> list:
+async def get_new_tokens(address: str) -> List[str]:
     """Get new tokens added to a wallet
     
     Args:
         address (str): Wallet address
         
     Returns:
-        list: List of new token IDs
+        List[str]: List of new token IDs
     """
     try:
         pool = await get_pool()
@@ -1078,14 +1040,14 @@ async def get_new_tokens(address: str) -> list:
         logger.error(f"Error getting new tokens: {str(e)}")
         return []
 
-async def get_removed_nfts(address: str) -> list:
+async def get_removed_nfts(address: str) -> List[str]:
     """Get NFTs removed from a wallet
     
     Args:
         address (str): Wallet address
         
     Returns:
-        list: List of removed NFT IDs
+        List[str]: List of removed NFT IDs
     """
     try:
         pool = await get_pool()
@@ -1288,7 +1250,7 @@ async def update_policy_expiry(policy_id: str, expiry_slot: int):
         logger.error(f"Error updating policy expiry: {str(e)}")
         return False
 
-async def get_dapp_interactions(address: str):
+async def get_dapp_interactions(address: str) -> str:
     """Get the last processed DApp interaction for a wallet
     
     Args:
@@ -1297,10 +1259,10 @@ async def get_dapp_interactions(address: str):
     Returns:
         str: Last processed tx hash or None
     """
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            result = await conn.fetchval(
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
                 """
                 SELECT last_dapp_tx
                 FROM wallets
@@ -1308,12 +1270,12 @@ async def get_dapp_interactions(address: str):
                 """,
                 address
             )
-            return result
-    except Exception as e:
-        logger.error(f"Error getting DApp interactions: {str(e)}")
-        return None
+            return row['last_dapp_tx'] if row else None
+        except Exception as e:
+            logger.error(f"Error getting DApp interactions for {address}: {str(e)}")
+            return None
 
-async def update_dapp_interaction(address: str, tx_hash: str):
+async def update_dapp_interaction(address: str, tx_hash: str) -> bool:
     """Update the last processed DApp interaction
     
     Args:
@@ -1323,22 +1285,21 @@ async def update_dapp_interaction(address: str, tx_hash: str):
     Returns:
         bool: Success status
     """
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
             await conn.execute(
                 """
                 UPDATE wallets
                 SET last_dapp_tx = $2
                 WHERE address = $1
                 """,
-                address,
-                tx_hash
+                address, tx_hash
             )
             return True
-    except Exception as e:
-        logger.error(f"Error updating DApp interaction: {str(e)}")
-        return False
+        except Exception as e:
+            logger.error(f"Error updating DApp interaction for {address}: {str(e)}")
+            return False
 
 async def get_last_dapp_tx(address: str) -> Optional[str]:
     """Get the last processed DApp transaction for a wallet
@@ -1409,13 +1370,17 @@ async def initialize_notification_settings(user_id: str):
                 "dapp_interactions": True
             }
             
-            for setting, enabled in default_settings.items():
-                query = """
-                    INSERT INTO notification_settings (user_id, setting_key, enabled)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (user_id, setting_key) DO NOTHING
+            # Insert into users table with default settings
+            await conn.execute(
                 """
-                await conn.execute(query, user_id, setting, enabled)
+                INSERT INTO users (user_id, notification_settings)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE 
+                SET notification_settings = EXCLUDED.notification_settings
+                """,
+                user_id,
+                json.dumps(default_settings)
+            )
                 
     except Exception as e:
         logger.error(f"Error initializing notification settings: {str(e)}")
