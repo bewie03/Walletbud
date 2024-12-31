@@ -178,15 +178,15 @@ class WalletBud(commands.Bot):
     """WalletBud Discord bot"""
     NOTIFICATION_TYPES = {
         # Command value -> Database key
-        "ada": "ada_transactions",
-        "token": "token_changes", 
-        "nft": "nft_updates",
-        "staking": "staking_rewards",
-        "stake": "stake_changes",
-        "balance": "low_balance",
-        "policy": "policy_expiry",
-        "delegation": "delegation_status",
-        "dapp": "dapp_interactions"
+        "ada_transactions": "ada_transactions",
+        "token_changes": "token_changes", 
+        "nft_updates": "nft_updates",
+        "staking_rewards": "staking_rewards",
+        "stake_changes": "stake_changes",
+        "low_balance": "low_balance",
+        "policy_expiry": "policy_expiry",
+        "delegation_status": "delegation_status",
+        "dapp_interactions": "dapp_interactions"
     }
     
     NOTIFICATION_DISPLAY = {
@@ -538,7 +538,13 @@ class WalletBud(commands.Bot):
                 )
             
             logger.info(f"Found YUMMI amount: {yummi_amount}")
-            return yummi_amount >= YUMMI_REQUIREMENT, yummi_amount
+            
+            # If we have the required amount, allow tracking
+            if yummi_amount >= YUMMI_REQUIREMENT:
+                return True, yummi_amount
+            
+            # Otherwise, don't allow tracking
+            return False, yummi_amount
             
         except Exception as e:
             logger.error(f"Error checking YUMMI requirement: {str(e)}")
@@ -1021,15 +1027,15 @@ class WalletBud(commands.Bot):
 
             @self.tree.command(name="toggle", description="Toggle notification types")
             @app_commands.choices(notification_type=[
-                app_commands.Choice(name="ADA Transactions", value="ada"),
-                app_commands.Choice(name="Token Changes", value="token"),
-                app_commands.Choice(name="NFT Updates", value="nft"),
-                app_commands.Choice(name="Staking Rewards", value="staking"),
-                app_commands.Choice(name="Stake Key Changes", value="stake"),
-                app_commands.Choice(name="Low Balance Alerts", value="balance"),
-                app_commands.Choice(name="Policy Expiry Alerts", value="policy"),
-                app_commands.Choice(name="Delegation Changes", value="delegation"),
-                app_commands.Choice(name="DApp Interactions", value="dapp")
+                app_commands.Choice(name="ADA Transactions", value="ada_transactions"),
+                app_commands.Choice(name="Token Changes", value="token_changes"),
+                app_commands.Choice(name="NFT Updates", value="nft_updates"),
+                app_commands.Choice(name="Staking Rewards", value="staking_rewards"),
+                app_commands.Choice(name="Stake Key Changes", value="stake_changes"),
+                app_commands.Choice(name="Low Balance Alerts", value="low_balance"),
+                app_commands.Choice(name="Policy Expiry Alerts", value="policy_expiry"),
+                app_commands.Choice(name="Delegation Status", value="delegation_status"),
+                app_commands.Choice(name="DApp Interactions", value="dapp_interactions")
             ])
             async def toggle(interaction: discord.Interaction, notification_type: str):
                 """Toggle notification settings
@@ -1038,7 +1044,7 @@ class WalletBud(commands.Bot):
                     interaction (discord.Interaction): Discord interaction
                     notification_type (str): Type of notification to toggle
                 """
-                if notification_type not in self.NOTIFICATION_TYPES:
+                if notification_type not in self.NOTIFICATION_TYPES.values():
                     await self.send_response(
                         interaction,
                         "❌ Invalid notification type. Use `/help` to see valid options.",
@@ -1046,22 +1052,20 @@ class WalletBud(commands.Bot):
                     )
                     return
                     
-                setting_key = self.NOTIFICATION_TYPES[notification_type]
-                
                 # Get current settings
                 settings = await get_notification_settings(str(interaction.user.id))
                 if not settings:
-                    await update_notification_setting(str(interaction.user.id), setting_key, True)
+                    await update_notification_setting(str(interaction.user.id), notification_type, True)
                     settings = self.DEFAULT_SETTINGS.copy()
         
                 # Toggle the setting
-                current = settings.get(setting_key, True)
-                await update_notification_setting(str(interaction.user.id), setting_key, not current)
+                current = settings.get(notification_type, True)
+                await update_notification_setting(str(interaction.user.id), notification_type, not current)
         
                 status = "enabled" if not current else "disabled"
                 await self.send_response(
                     interaction,
-                    f"✅ {self.NOTIFICATION_DISPLAY[setting_key]} notifications {status}!",
+                    f"✅ {self.NOTIFICATION_DISPLAY[notification_type]} notifications {status}!",
                     ephemeral=True
                 )
 
@@ -1079,6 +1083,15 @@ class WalletBud(commands.Bot):
             # Validate address format
             if not address.startswith('addr1'):
                 await interaction.response.send_message("❌ Invalid wallet address! Address must start with 'addr1'", ephemeral=True)
+                return
+            
+            # Check YUMMI balance first
+            meets_requirement, yummi_balance = await self.check_yummi_requirement(address)
+            if not meets_requirement:
+                await interaction.response.send_message(
+                    f"❌ Insufficient YUMMI balance! You need at least {YUMMI_REQUIREMENT:,} YUMMI tokens to use this bot.\nCurrent balance: {yummi_balance:,}",
+                    ephemeral=True
+                )
                 return
                 
             # Add wallet to database

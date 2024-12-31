@@ -1398,12 +1398,15 @@ async def initialize_notification_settings(user_id: str):
         async with pool.acquire() as conn:
             # Default settings - all notifications enabled
             default_settings = {
-                "balance_changes": True,
+                "ada_transactions": True,
                 "token_changes": True,
-                "nft_changes": True,
+                "nft_updates": True,
                 "staking_rewards": True,
-                "dapp_interactions": True,
-                "policy_expiry": True
+                "stake_changes": True,
+                "low_balance": True,
+                "policy_expiry": True,
+                "delegation_status": True,
+                "dapp_interactions": True
             }
             
             for setting, enabled in default_settings.items():
