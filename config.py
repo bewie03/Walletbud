@@ -54,8 +54,8 @@ def validate_discord_token(value: str, name: str) -> str:
 
 def validate_blockfrost_id(value: str, name: str) -> str:
     """Validate Blockfrost project ID format"""
-    if not value or not re.match(r'^[A-Za-z0-9]{32}$', value):
-        raise ValueError(f"{name} must be a valid Blockfrost project ID (32 characters)")
+    if not value or not re.match(r'^(mainnet|preprod|preview)[0-9a-zA-Z]{32}$', value):
+        raise ValueError(f"{name} must be a valid Blockfrost project ID (should start with network type followed by 32 characters)")
     return value
 
 # Define required environment variables
