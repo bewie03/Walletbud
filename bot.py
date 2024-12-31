@@ -509,6 +509,7 @@ class WalletBud(commands.Bot):
         """
         try:
             # First try getting UTXOs
+            logger.info(f"Getting UTXOs for address: {address}")
             utxos = await self._rate_limited_request(
                 self.blockfrost_client.address_utxos,
                 address
@@ -517,6 +518,12 @@ class WalletBud(commands.Bot):
             # Calculate YUMMI balance from UTXOs
             logger.info(f"Checking YUMMI balance for address {address}")
             logger.info(f"YUMMI Token ID: {YUMMI_TOKEN_ID}")
+            
+            # Log all token units found
+            for utxo in utxos:
+                for amount in utxo.amount:
+                    logger.info(f"Found token: {amount.unit} = {amount.quantity}")
+            
             yummi_amount = sum(
                 int(amount.quantity)
                 for utxo in utxos
@@ -531,6 +538,11 @@ class WalletBud(commands.Bot):
                     self.blockfrost_client.address_assets,
                     address
                 )
+                
+                # Log all assets found
+                for asset in assets:
+                    logger.info(f"Found asset: {asset.unit} = {asset.quantity}")
+                
                 yummi_amount = sum(
                     int(asset.quantity)
                     for asset in assets
@@ -538,12 +550,15 @@ class WalletBud(commands.Bot):
                 )
             
             logger.info(f"Found YUMMI amount: {yummi_amount}")
+            logger.info(f"Required amount: {YUMMI_REQUIREMENT}")
             
             # If we have the required amount, allow tracking
             if yummi_amount >= YUMMI_REQUIREMENT:
+                logger.info("YUMMI requirement met!")
                 return True, yummi_amount
             
             # Otherwise, don't allow tracking
+            logger.info("YUMMI requirement not met")
             return False, yummi_amount
             
         except Exception as e:
@@ -686,7 +701,8 @@ class WalletBud(commands.Bot):
 
                 # Check for balance changes
                 if await self.should_notify(int(user_id), 'balance'):
-                    previous_balance = await check_ada_balance(address)
+                    previous_balance_tuple = await check_ada_balance(address)
+                    previous_balance = previous_balance_tuple[1]  # Get the balance value
                     if previous_balance is not None and abs(current_balance - previous_balance) > 1:  # 1 ADA threshold
                         change = current_balance - previous_balance
                         direction = "received" if change > 0 else "sent"

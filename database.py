@@ -401,16 +401,16 @@ async def update_last_checked(wallet_id: int):
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE wallets
-                SET last_checked = NOW()
+            query = """
+                UPDATE wallets 
+                SET last_check = CURRENT_TIMESTAMP 
                 WHERE id = $1
-                """,
-                wallet_id
-            )
+            """
+            await conn.execute(query, wallet_id)
+            return True
     except Exception as e:
         logger.error(f"Error updating last checked: {str(e)}")
+        return False
 
 async def get_wallet_id(user_id: str, address: str):
     """Get wallet ID for a user's wallet
