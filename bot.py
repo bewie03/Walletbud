@@ -396,26 +396,28 @@ class WalletBud(commands.Bot):
             # Test connection with health endpoint
             logger.info("Testing Blockfrost connection...")
             try:
-                health = await self.rate_limited_request(self.blockfrost_client.health)
+                health = await self.rate_limited_request(self.blockfrost_client.root)
                 logger.info(f"Health check response: {health}")
                 
-                # Also get network info as additional verification
-                network = await self.rate_limited_request(self.blockfrost_client.network)
-                logger.info(f"Network info: {network}")
+                # Test address lookup
+                test_address = os.getenv('TEST_ADDRESS', 'addr1qxqs59lphg8g6qnplr8q6kw2hyzn8c8e3r5jlnwjqppn8k2vllp6xf5qvjgclau0t2q5jz7c7vyvs3x4u2xqm7gaex0s6dd9ay')
+                logger.info(f"Testing address lookup with: {test_address[:20]}...")
                 
-                logger.info("✅ Blockfrost connection test successful")
+                address_info = await self.rate_limited_request(
+                    self.blockfrost_client.address,
+                    address=test_address
+                )
+                logger.info("Address lookup successful")
+                
+                logger.info("✅ Connection test passed")
                 return True
                 
             except Exception as e:
-                logger.error(f"❌ Connection test failed: {str(e)}")
+                logger.error(f"Error type: {type(e).__name__}")
+                logger.error(f"Error message: {str(e)}")
                 if hasattr(e, '__dict__'):
                     logger.error(f"Error details: {e.__dict__}")
-                if "Invalid project token" in str(e):
-                    logger.error("Invalid Blockfrost API key. Please check your BLOCKFROST_PROJECT_ID")
-                elif "Forbidden" in str(e):
-                    logger.error("API key doesn't have required permissions")
-                else:
-                    logger.error(f"Error details: {e}")
+                logger.error("❌ Connection test failed: " + str(e))
                 return False
                 
         except Exception as e:
