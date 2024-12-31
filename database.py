@@ -31,6 +31,7 @@ async def get_pool():
 CREATE_TABLES_SQL = """
 -- Drop existing tables if they exist
 DROP TABLE IF EXISTS transactions;
+DROP TABLE IF EXISTS rewards;
 DROP TABLE IF EXISTS wallets;
 DROP TABLE IF EXISTS users;
 
@@ -46,20 +47,31 @@ CREATE TABLE IF NOT EXISTS wallets (
     wallet_id SERIAL PRIMARY KEY,
     user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
     address TEXT NOT NULL,
+    stake_address TEXT,
     last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_yummi_check TIMESTAMP,
     last_balance BIGINT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    utxo_state JSONB,
     UNIQUE(user_id, address)
 );
 
--- Transactions table for tracking wallet transactions
+-- Transactions table for storing transaction history
 CREATE TABLE IF NOT EXISTS transactions (
     tx_id SERIAL PRIMARY KEY,
     wallet_id INTEGER REFERENCES wallets(wallet_id) ON DELETE CASCADE,
     tx_hash TEXT NOT NULL,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(wallet_id, tx_hash)
+);
+
+-- Rewards table for tracking processed staking rewards
+CREATE TABLE IF NOT EXISTS rewards (
+    reward_id SERIAL PRIMARY KEY,
+    stake_address TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    amount BIGINT NOT NULL,
+    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(stake_address, epoch)
 );
 """
 
@@ -530,6 +542,228 @@ async def get_wallet_balance(address: str) -> int:
     except Exception as e:
         logger.error(f"Error getting wallet balance: {str(e)}")
         return 0
+
+async def update_utxo_state(address: str, utxo_state: dict):
+    """Update the UTxO state for a wallet address
+    
+    Args:
+        address (str): Wallet address
+        utxo_state (dict): New UTxO state
+        
+    Returns:
+        bool: Success status
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute(
+                """
+                UPDATE wallets
+                SET utxo_state = $1
+                WHERE address = $2
+                """,
+                utxo_state, address
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error updating UTxO state for {address}: {str(e)}")
+            return False
+
+# Alias for backward compatibility
+store_utxo_state = update_utxo_state
+
+async def get_stake_address(address: str):
+    """Get the stake address for a wallet address
+    
+    Args:
+        address (str): Wallet address
+        
+    Returns:
+        str: Stake address or None if not found
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT stake_address
+                FROM wallets
+                WHERE address = $1
+                """,
+                address
+            )
+            return row['stake_address'] if row else None
+        except Exception as e:
+            logger.error(f"Error getting stake address for {address}: {str(e)}")
+            return None
+
+async def update_stake_address(address: str, stake_address: str):
+    """Update the stake address for a wallet
+    
+    Args:
+        address (str): Wallet address
+        stake_address (str): Stake address
+        
+    Returns:
+        bool: Success status
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute(
+                """
+                UPDATE wallets
+                SET stake_address = $1
+                WHERE address = $2
+                """,
+                stake_address, address
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error updating stake address for {address}: {str(e)}")
+            return False
+
+async def is_reward_processed(stake_address: str, epoch: int):
+    """Check if a staking reward has been processed
+    
+    Args:
+        stake_address (str): Stake address
+        epoch (int): Epoch number
+        
+    Returns:
+        bool: True if reward was processed
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT reward_id
+                FROM rewards
+                WHERE stake_address = $1 AND epoch = $2
+                """,
+                stake_address, epoch
+            )
+            return bool(row)
+        except Exception as e:
+            logger.error(f"Error checking reward for {stake_address} epoch {epoch}: {str(e)}")
+            return False
+
+async def add_processed_reward(stake_address: str, epoch: int, amount: int):
+    """Add a processed staking reward
+    
+    Args:
+        stake_address (str): Stake address
+        epoch (int): Epoch number
+        amount (int): Reward amount in lovelace
+        
+    Returns:
+        bool: Success status
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute(
+                """
+                INSERT INTO rewards (stake_address, epoch, amount)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (stake_address, epoch) DO NOTHING
+                """,
+                stake_address, epoch, amount
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error adding reward for {stake_address} epoch {epoch}: {str(e)}")
+            return False
+
+async def get_last_transactions(address: str):
+    """Retrieve the last set of processed transactions for a wallet
+    
+    Args:
+        address (str): Wallet address
+        
+    Returns:
+        List[str]: List of transaction hashes
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            wallet_id = await conn.fetchval(
+                """
+                SELECT wallet_id
+                FROM wallets
+                WHERE address = $1
+                """,
+                address
+            )
+            if not wallet_id:
+                return []
+                
+            rows = await conn.fetch(
+                """
+                SELECT tx_hash
+                FROM transactions
+                WHERE wallet_id = $1
+                ORDER BY timestamp DESC
+                LIMIT 10
+                """,
+                wallet_id
+            )
+            return [row['tx_hash'] for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting last transactions for {address}: {str(e)}")
+            return []
+
+async def get_utxo_state(address: str):
+    """Get the UTxO state for a wallet address
+    
+    Args:
+        address (str): Wallet address
+        
+    Returns:
+        dict: Dictionary containing UTxO state or None if not found
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT utxo_state
+                FROM wallets
+                WHERE address = $1
+                """,
+                address
+            )
+            return row['utxo_state'] if row else None
+        except Exception as e:
+            logger.error(f"Error getting UTxO state for {address}: {str(e)}")
+            return None
+
+async def get_wallet_for_user(user_id: str, address: str):
+    """Get wallet details for a specific user and address
+    
+    Args:
+        user_id (str): Discord user ID
+        address (str): Wallet address
+        
+    Returns:
+        Record: Wallet record with all details or None if not found
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT *
+                FROM wallets
+                WHERE user_id = $1 AND address = $2
+                """,
+                user_id, address
+            )
+            return row
+        except Exception as e:
+            logger.error(f"Error getting wallet for user {user_id} address {address}: {str(e)}")
+            return None
 
 async def main():
     """Example usage of database functions"""
