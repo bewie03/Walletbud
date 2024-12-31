@@ -32,6 +32,7 @@ CREATE_TABLES_SQL = """
 -- Drop existing tables if they exist
 DROP TABLE IF EXISTS transactions;
 DROP TABLE IF EXISTS rewards;
+DROP TABLE IF EXISTS yummi_warnings;
 DROP TABLE IF EXISTS wallets;
 DROP TABLE IF EXISTS users;
 
@@ -72,6 +73,15 @@ CREATE TABLE IF NOT EXISTS rewards (
     amount BIGINT NOT NULL,
     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(stake_address, epoch)
+);
+
+-- YUMMI warning table for tracking warning counts
+CREATE TABLE IF NOT EXISTS yummi_warnings (
+    warning_id SERIAL PRIMARY KEY,
+    wallet_id INTEGER REFERENCES wallets(wallet_id) ON DELETE CASCADE,
+    warning_count INTEGER DEFAULT 0,
+    last_warning_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(wallet_id)
 );
 """
 
@@ -499,12 +509,15 @@ async def check_ada_balance(address: str) -> tuple[bool, int]:
         logger.error(f"Error checking ADA balance: {str(e)}")
         return False, 0
 
-async def update_wallet_balance(address: str, balance: int):
+async def update_ada_balance(address: str, balance: float) -> bool:
     """Update wallet's ADA balance
     
     Args:
         address (str): Wallet address
-        balance (int): Current ADA balance in lovelace
+        balance (float): Current ADA balance
+        
+    Returns:
+        bool: Success status
     """
     try:
         pool = await get_pool()
@@ -512,15 +525,41 @@ async def update_wallet_balance(address: str, balance: int):
             await conn.execute(
                 """
                 UPDATE wallets 
-                SET last_balance = $1,
-                    last_checked = NOW()
-                WHERE address = $2
+                SET last_balance = $2 
+                WHERE address = $1
                 """,
-                balance,
-                address
+                address, int(balance * 1_000_000)  # Convert to lovelace
             )
+            return True
     except Exception as e:
-        logger.error(f"Error updating wallet balance: {str(e)}")
+        logger.error(f"Error updating ADA balance: {str(e)}")
+        return False
+
+async def update_token_balances(address: str, token_balances: dict) -> bool:
+    """Update wallet's token balances
+    
+    Args:
+        address (str): Wallet address
+        token_balances (dict): Dictionary of token_id -> amount
+        
+    Returns:
+        bool: Success status
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE wallets 
+                SET utxo_state = $2 
+                WHERE address = $1
+                """,
+                address, json.dumps(token_balances)
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Error updating token balances: {str(e)}")
+        return False
 
 async def get_wallet_balance(address: str) -> int:
     """Get wallet's current ADA balance
@@ -764,6 +803,190 @@ async def get_wallet_for_user(user_id: str, address: str):
         except Exception as e:
             logger.error(f"Error getting wallet for user {user_id} address {address}: {str(e)}")
             return None
+
+async def is_token_change_processed(wallet_id: int, tx_hash: str) -> bool:
+    """Check if a token change has been processed
+    
+    Args:
+        wallet_id (int): Wallet ID
+        tx_hash (str): Transaction hash
+        
+    Returns:
+        bool: True if change was processed
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval(
+                """
+                SELECT EXISTS(
+                    SELECT 1 FROM transactions 
+                    WHERE wallet_id = $1 AND tx_hash = $2
+                )
+                """,
+                wallet_id, tx_hash
+            )
+            return bool(result)
+    except Exception as e:
+        logger.error(f"Error checking processed token change: {str(e)}")
+        return False
+
+async def add_processed_token_change(wallet_id: int, tx_hash: str) -> bool:
+    """Add a processed token change
+    
+    Args:
+        wallet_id (int): Wallet ID
+        tx_hash (str): Transaction hash
+        
+    Returns:
+        bool: Success status
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO transactions (wallet_id, tx_hash)
+                VALUES ($1, $2)
+                ON CONFLICT DO NOTHING
+                """,
+                wallet_id, tx_hash
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Error adding processed token change: {str(e)}")
+        return False
+
+async def get_new_tokens(address: str) -> list:
+    """Get new tokens added to a wallet
+    
+    Args:
+        address (str): Wallet address
+        
+    Returns:
+        list: List of new token IDs
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            old_state = await get_utxo_state(address)
+            if not old_state:
+                return []
+                
+            old_tokens = set(old_state.get('tokens', {}).keys())
+            current_state = await get_utxo_state(address)
+            if not current_state:
+                return []
+                
+            current_tokens = set(current_state.get('tokens', {}).keys())
+            return list(current_tokens - old_tokens)
+    except Exception as e:
+        logger.error(f"Error getting new tokens: {str(e)}")
+        return []
+
+async def get_removed_nfts(address: str) -> list:
+    """Get NFTs removed from a wallet
+    
+    Args:
+        address (str): Wallet address
+        
+    Returns:
+        list: List of removed NFT IDs
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            old_state = await get_utxo_state(address)
+            if not old_state:
+                return []
+                
+            old_nfts = set(old_state.get('nfts', []))
+            current_state = await get_utxo_state(address)
+            if not current_state:
+                return []
+                
+            current_nfts = set(current_state.get('nfts', []))
+            return list(old_nfts - current_nfts)
+    except Exception as e:
+        logger.error(f"Error getting removed NFTs: {str(e)}")
+        return []
+
+async def get_yummi_warning_count(wallet_id: int) -> int:
+    """Get the number of YUMMI warnings for a wallet
+    
+    Args:
+        wallet_id (int): Wallet ID
+        
+    Returns:
+        int: Number of warnings (0 if no warnings)
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval(
+                """
+                SELECT warning_count 
+                FROM yummi_warnings 
+                WHERE wallet_id = $1
+                """,
+                wallet_id
+            )
+            return result or 0
+    except Exception as e:
+        logger.error(f"Error getting YUMMI warning count: {str(e)}")
+        return 0
+
+async def increment_yummi_warning(wallet_id: int) -> int:
+    """Increment the YUMMI warning count for a wallet
+    
+    Args:
+        wallet_id (int): Wallet ID
+        
+    Returns:
+        int: New warning count
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.fetchval(
+                """
+                INSERT INTO yummi_warnings (wallet_id, warning_count)
+                VALUES ($1, 1)
+                ON CONFLICT (wallet_id) DO UPDATE
+                SET warning_count = yummi_warnings.warning_count + 1,
+                    last_warning_at = CURRENT_TIMESTAMP
+                RETURNING warning_count
+                """,
+                wallet_id
+            )
+            return result
+    except Exception as e:
+        logger.error(f"Error incrementing YUMMI warning: {str(e)}")
+        return 0
+
+async def reset_yummi_warning(wallet_id: int) -> bool:
+    """Reset the YUMMI warning count for a wallet
+    
+    Args:
+        wallet_id (int): Wallet ID
+        
+    Returns:
+        bool: Success status
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM yummi_warnings
+                WHERE wallet_id = $1
+                """,
+                wallet_id
+            )
+            return True
+    except Exception as e:
+        logger.error(f"Error resetting YUMMI warning: {str(e)}")
+        return False
 
 async def main():
     """Example usage of database functions"""

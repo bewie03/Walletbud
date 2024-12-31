@@ -1,23 +1,21 @@
 import os
-import sys
-import json
-import time
-import asyncio
 import logging
+import sys
 from datetime import datetime, timedelta
 from uuid import uuid4
+import time
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 from blockfrost import BlockFrostApi
-import aiohttp
+import asyncio
 
 from config import (
-    DISCORD_TOKEN, BLOCKFROST_PROJECT_ID, BLOCKFROST_BASE_URL,
+    BLOCKFROST_PROJECT_ID,
     MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_COOLDOWN,
-    MIN_ADA_BALANCE, WALLET_CHECK_INTERVAL, MAX_TX_PER_HOUR,
-    WALLET_PROCESS_DELAY, YUMMI_TOKEN_ID, YUMMI_REQUIREMENT,
+    WALLET_CHECK_INTERVAL,
+    YUMMI_TOKEN_ID, YUMMI_REQUIREMENT,
     API_RETRY_ATTEMPTS, API_RETRY_DELAY
 )
 from database import (
@@ -27,23 +25,12 @@ from database import (
     get_wallet,
     get_all_wallets,
     update_last_checked,
-    add_transaction,
     get_user_id_for_wallet,
-    get_utxo_state,
-    store_utxo_state,
     is_reward_processed,
     add_processed_reward,
     get_stake_address,
     update_stake_address,
     get_notification_settings,
-    update_notification_setting,
-    get_wallet_for_user,
-    get_wallet_balance,
-    is_token_change_processed,
-    add_processed_token_change,
-    get_recent_transactions,
-    get_new_tokens,
-    get_removed_nfts,
     check_ada_balance,
     get_all_wallets_for_user,
     get_wallet_id,
@@ -429,47 +416,52 @@ class WalletBud(commands.Bot):
                     await update_last_yummi_check(address)
                     
                     if not meets_req:
-                        # Remove wallet immediately if requirement not met
-                        await remove_wallet(user_id, address)
-                        try:
-                            user = await self.fetch_user(int(user_id))
-                            if user:
-                                await user.send(
-                                    f"❌ **Wallet Removed**\n"
-                                    f"Wallet: `{address[:8]}...{address[-8:]}`\n"
-                                    f"Reason: Insufficient YUMMI tokens\n"
-                                    f"Current YUMMI: `{balance:,}`\n"
-                                    f"Required: `{YUMMI_REQUIREMENT:,}`"
-                                )
-                        except Exception as e:
-                            logger.error(f"Error notifying user about wallet removal: {str(e)}")
-                        return
-                
-                # Get current wallet state
-                try:
-                    # Get UTXOs
-                    utxos = await self.rate_limited_request(
-                        self.blockfrost_client.address_utxos,
-                        address
-                    )
-                    
-                    # Calculate current balance
-                    current_balance = sum(
-                        int(utxo.amount[0].quantity) / 1_000_000 
-                        for utxo in utxos 
-                        if utxo.amount and utxo.amount[0].unit == 'lovelace'
-                    )
-                    
-                    # Calculate current token amounts
-                    current_tokens = {}
-                    for utxo in utxos:
-                        for amount in utxo.amount:
-                            if amount.unit != 'lovelace':
-                                current_tokens[amount.unit] = current_tokens.get(amount.unit, 0) + int(amount.quantity)
-                
-                except Exception as e:
-                    logger.error(f"Error getting wallet state: {str(e)}")
-                    return
+                        # Get wallet ID for warning tracking
+                        wallet_id = await get_wallet_id(str(user_id), address)
+                        if not wallet_id:
+                            logger.error(f"Could not find wallet ID for {address}")
+                            return
+
+                        # Increment warning count
+                        warning_count = await increment_yummi_warning(wallet_id)
+                        
+                        # Remove wallet after 3 warnings
+                        if warning_count >= 3:
+                            await remove_wallet(user_id, address)
+                            try:
+                                user = await self.fetch_user(int(user_id))
+                                if user:
+                                    await user.send(
+                                        f"❌ **Wallet Removed**\n"
+                                        f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                                        f"Reason: Insufficient YUMMI tokens after 3 warnings\n"
+                                        f"Current YUMMI: `{balance:,}`\n"
+                                        f"Required: `{YUMMI_REQUIREMENT:,}`"
+                                    )
+                            except Exception as e:
+                                logger.error(f"Error notifying user about wallet removal: {str(e)}")
+                            return
+                        else:
+                            # Send warning message
+                            try:
+                                user = await self.fetch_user(int(user_id))
+                                if user:
+                                    await user.send(
+                                        f"⚠️ **YUMMI Balance Warning ({warning_count}/3)**\n"
+                                        f"Wallet: `{address[:8]}...{address[-8:]}`\n"
+                                        f"Your YUMMI balance is too low!\n"
+                                        f"Current YUMMI: `{balance:,}`\n"
+                                        f"Required: `{YUMMI_REQUIREMENT:,}`\n\n"
+                                        f"Your wallet will be removed after {3-warning_count} more warning{'s' if 3-warning_count > 1 else ''}. "
+                                        f"Please restore your YUMMI balance."
+                                    )
+                            except Exception as e:
+                                logger.error(f"Error sending warning message: {str(e)}")
+                    else:
+                        # Reset warnings if requirement is met
+                        wallet_id = await get_wallet_id(str(user_id), address)
+                        if wallet_id:
+                            await reset_yummi_warning(wallet_id)
 
                 # Get user for notifications
                 try:
@@ -489,6 +481,30 @@ class WalletBud(commands.Bot):
 
                 # Update last checked timestamp
                 await update_last_checked(wallet_id)
+
+                # Get current balances
+                try:
+                    # Get UTXOs for balance calculation
+                    utxos = await self.rate_limited_request(
+                        self.blockfrost_client.address_utxos,
+                        address
+                    )
+                    
+                    # Calculate ADA balance
+                    current_balance = sum(
+                        sum(int(amount.quantity) for amount in utxo.amount if amount.unit == 'lovelace')
+                        for utxo in utxos
+                    ) / 1_000_000  # Convert to ADA
+                    
+                    # Calculate token balances
+                    current_tokens = {}
+                    for utxo in utxos:
+                        for amount in utxo.amount:
+                            if amount.unit != 'lovelace':
+                                current_tokens[amount.unit] = current_tokens.get(amount.unit, 0) + int(amount.quantity)
+                except Exception as e:
+                    logger.error(f"Error getting wallet balances: {str(e)}")
+                    return
 
                 # Check for balance changes
                 if await self.should_notify(int(user_id), 'balance'):
@@ -796,19 +812,23 @@ class WalletBud(commands.Bot):
                 return
 
             # Add wallet to database
-            success = await add_wallet(str(interaction.user.id), address)
-            if not success:
-                await interaction.response.send_message("❌ Failed to add wallet. Please try again later.", ephemeral=True)
-                return
-
-            # Send success message
-            await interaction.response.send_message(
-                f"✅ Successfully added wallet!\n"
-                f"Address: `{address[:8]}...{address[-8:]}`\n"
-                f"YUMMI Balance: `{yummi_amount:,}`",
-                ephemeral=True
-            )
-
+            if await add_wallet(str(interaction.user.id), address):
+                # Initialize warning count to 0 since they meet the requirement
+                wallet_id = await get_wallet_id(str(interaction.user.id), address)
+                if wallet_id:
+                    await reset_yummi_warning(wallet_id)
+                    
+                await interaction.response.send_message(
+                    f"✅ Now monitoring wallet: `{address[:8]}...{address[-8:]}`\n"
+                    f"Current YUMMI balance: `{yummi_amount:,}`\n"
+                    f"Required YUMMI: `{YUMMI_REQUIREMENT:,}`\n"
+                    f"Status: ✅ Meets requirement",
+                    ephemeral=True
+                )
+                logger.info(f"Added wallet {address} for user {interaction.user.id}")
+            else:
+                await interaction.response.send_message("❌ Failed to add wallet. Please try again.", ephemeral=True)
+            
         except Exception as e:
             logger.error(f"Error adding wallet: {str(e)}")
             await interaction.response.send_message("❌ An error occurred. Please try again later.", ephemeral=True)
@@ -821,6 +841,11 @@ class WalletBud(commands.Bot):
             if not wallet:
                 await interaction.response.send_message("❌ Wallet not found!", ephemeral=True)
                 return
+            
+            # Get wallet ID for cleanup
+            wallet_id = await get_wallet_id(str(interaction.user.id), address)
+            if wallet_id:
+                await reset_yummi_warning(wallet_id)
             
             # Remove wallet
             success = await remove_wallet(str(interaction.user.id), address)
@@ -881,6 +906,10 @@ class WalletBud(commands.Bot):
                         )
                         tx_count = tx_info.tx_count if tx_info else 0
                         
+                        # Get warning count
+                        wallet_id = await get_wallet_id(str(interaction.user.id), address)
+                        warning_count = await get_yummi_warning_count(wallet_id) if wallet_id else 0
+                        
                         # Format address for display
                         short_address = f"{address[:8]}...{address[-8:]}"
                         
@@ -891,6 +920,7 @@ class WalletBud(commands.Bot):
                                 f"**Address:** `{short_address}`\n"
                                 f"**ADA Balance:** `{ada_balance:,.6f} ADA`\n"
                                 f"**YUMMI Balance:** `{yummi_balance:,}`\n"
+                                f"**YUMMI Warnings:** `{warning_count}/3`\n"
                                 f"**Transactions:** `{tx_count}`\n"
                                 f"**Full Address:**\n`{address}`"
                             ),
@@ -916,7 +946,11 @@ class WalletBud(commands.Bot):
         try:
             embed = discord.Embed(
                 title="🤖 WalletBud Help",
-                description="Monitor your Cardano wallets and receive notifications about important events!",
+                description=(
+                    "Monitor your Cardano wallets and receive notifications about important events!\n\n"
+                    "**Note:** You must maintain the required YUMMI token balance to use this bot. "
+                    "After 3 warnings for insufficient YUMMI balance, your wallet will be automatically removed."
+                ),
                 color=discord.Color.blue()
             )
             
@@ -1068,10 +1102,26 @@ class WalletBud(commands.Bot):
                         )
                         total_ada += ada_balance
                         
+                        # Get warning count
+                        wallet_id = await get_wallet_id(str(interaction.user.id), address)
+                        warning_count = await get_yummi_warning_count(wallet_id) if wallet_id else 0
+                        
+                        # Calculate YUMMI balance
+                        yummi_amount = sum(
+                            int(amount.quantity)
+                            for utxo in utxos
+                            for amount in utxo.amount
+                            if amount.unit.lower() == YUMMI_TOKEN_ID.lower()
+                        )
+                        
                         # Add wallet info
                         embed.add_field(
                             name=f"Wallet `{address[:8]}...{address[-8:]}`",
-                            value=f"Balance: `{ada_balance:,.2f} ADA`",
+                            value=(
+                                f"Balance: `{ada_balance:,.2f} ADA`\n"
+                                f"YUMMI: `{yummi_amount:,}`\n"
+                                f"YUMMI Warnings: `{warning_count}/3`"
+                            ),
                             inline=False
                         )
                         
