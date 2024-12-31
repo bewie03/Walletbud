@@ -255,6 +255,29 @@ async def get_all_wallets_for_user(user_id: str):
         logger.error(f"Error getting wallets for user: {str(e)}")
         return []
 
+async def get_wallet_id(user_id: str, address: str):
+    """Get wallet ID for a user's wallet
+    
+    Args:
+        user_id (str): Discord user ID
+        address (str): Wallet address
+        
+    Returns:
+        int: Wallet ID if found, None otherwise
+    """
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            return await conn.fetchval(
+                'SELECT wallet_id FROM wallets WHERE user_id = $1 AND address = $2',
+                user_id,
+                address
+            )
+            
+    except Exception as e:
+        logger.error(f"Error getting wallet ID: {str(e)}")
+        return None
+
 async def update_last_checked(wallet_id: int, timestamp: datetime = None):
     """Update last checked timestamp for a wallet
     

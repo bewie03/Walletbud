@@ -822,19 +822,36 @@ class WalletBud(commands.Bot):
     async def _add_wallet(self, interaction: discord.Interaction, address: str):
         """Add a wallet to monitor"""
         try:
+            # Validate address format
+            if not address.startswith('addr1'):
+                await interaction.response.send_message("❌ Invalid wallet address! Address must start with 'addr1'.", ephemeral=True)
+                return
+                
+            # Check if wallet exists
+            try:
+                address_info = await self.rate_limited_request(
+                    self.blockfrost_client.address,
+                    address
+                )
+                if not address_info:
+                    await interaction.response.send_message("❌ Invalid wallet address! Could not find wallet on blockchain.", ephemeral=True)
+                    return
+            except Exception as e:
+                logger.error(f"Error validating address: {str(e)}")
+                await interaction.response.send_message("❌ Invalid wallet address! Could not verify wallet on blockchain.", ephemeral=True)
+                return
+            
             # Check if wallet is already registered
-            existing_wallet = await get_wallet_for_user(str(interaction.user.id), address)
-            if existing_wallet:
-                await interaction.response.send_message("❌ Wallet already registered!", ephemeral=True)
+            if await get_wallet(str(interaction.user.id), address):
+                await interaction.response.send_message("❌ This wallet is already registered!", ephemeral=True)
                 return
             
             # Add wallet to database
-            await add_wallet(str(interaction.user.id), address)
-            
-            # Update last checked timestamp
-            await update_last_checked(address)
-            
-            await interaction.response.send_message("✅ Wallet added successfully!", ephemeral=True)
+            success = await add_wallet(str(interaction.user.id), address)
+            if success:
+                await interaction.response.send_message("✅ Wallet added successfully!", ephemeral=True)
+            else:
+                await interaction.response.send_message("❌ Failed to add wallet.", ephemeral=True)
             
         except Exception as e:
             logger.error(f"Error adding wallet: {str(e)}")
@@ -863,28 +880,60 @@ class WalletBud(commands.Bot):
     async def _list_wallets(self, interaction: discord.Interaction):
         """List all registered wallets"""
         try:
-            # Get all wallets for user
-            wallets = await get_all_wallets()
-            user_wallets = [w for w in wallets if w['user_id'] == str(interaction.user.id)]
-            
-            if not user_wallets:
-                await interaction.response.send_message("❌ No wallets registered!", ephemeral=True)
+            # Get user's wallets
+            addresses = await get_all_wallets_for_user(str(interaction.user.id))
+            if not addresses:
+                await interaction.response.send_message("❌ You don't have any registered wallets! Use `/addwallet` first.", ephemeral=True)
                 return
             
             # Create embed
             embed = discord.Embed(
-                title="📝 Registered Wallets",
-                description="Your registered wallets:",
+                title="📋 Your Registered Wallets",
+                description=f"You have {len(addresses)} registered wallet(s):",
                 color=discord.Color.blue()
             )
             
-            # Add each wallet
-            for wallet in user_wallets:
-                embed.add_field(
-                    name="Wallet",
-                    value=f"`{wallet['address']}`",
-                    inline=False
-                )
+            # Add each wallet with its details
+            for address in addresses:
+                try:
+                    # Get wallet info
+                    utxos = await self.rate_limited_request(
+                        self.blockfrost_client.address_utxos,
+                        address
+                    )
+                    
+                    # Calculate balance
+                    ada_balance = sum(
+                        int(utxo.amount[0].quantity) / 1_000_000 
+                        for utxo in utxos 
+                        if utxo.amount and utxo.amount[0].unit == 'lovelace'
+                    )
+                    
+                    # Get transaction count
+                    tx_info = await self.rate_limited_request(
+                        self.blockfrost_client.address_total,
+                        address
+                    )
+                    tx_count = tx_info.tx_count if tx_info else 0
+                    
+                    # Add wallet field
+                    embed.add_field(
+                        name=f"Wallet `{address[:20]}...`",
+                        value=(
+                            f"Balance: `{ada_balance:,.6f} ADA`\n"
+                            f"Transactions: `{tx_count}`\n"
+                            f"Full Address: `{address}`"
+                        ),
+                        inline=False
+                    )
+                    
+                except Exception as e:
+                    logger.error(f"Error getting wallet info: {str(e)}")
+                    embed.add_field(
+                        name=f"Wallet `{address[:20]}...`",
+                        value="❌ Failed to get wallet info",
+                        inline=False
+                    )
             
             await interaction.response.send_message(embed=embed, ephemeral=True)
             
@@ -895,20 +944,52 @@ class WalletBud(commands.Bot):
     async def _help(self, interaction: discord.Interaction):
         """Show bot help and commands"""
         try:
-            # Create embed
             embed = discord.Embed(
-                title="🤔 Help and Commands",
-                description="Available commands:",
+                title="🤖 WalletBud Help",
+                description="Monitor your Cardano wallets and receive notifications about important events!",
                 color=discord.Color.blue()
             )
             
-            # Add each command
-            for command in self.tree.get_commands():
-                embed.add_field(
-                    name=f"/{command.name}",
-                    value=command.description,
-                    inline=False
-                )
+            # Wallet Management
+            embed.add_field(
+                name="📝 Wallet Management",
+                value=(
+                    "`/addwallet <address>` - Register a wallet to monitor\n"
+                    "`/removewallet <address>` - Stop monitoring a wallet\n"
+                    "`/listwallets` - List your registered wallets\n"
+                    "`/balance` - View current balance of all wallets"
+                ),
+                inline=False
+            )
+            
+            # Notifications
+            embed.add_field(
+                name="🔔 Notifications",
+                value=(
+                    "`/notifications` - View your notification settings\n"
+                    "`/toggle <type>` - Toggle a notification type on/off\n\n"
+                    "**Notification Types:**\n"
+                    "• `balance` - ADA balance changes\n"
+                    "• `tokens` - Token transfers\n"
+                    "• `nfts` - NFT transfers\n"
+                    "• `staking` - Staking rewards\n"
+                    "• `stake_key` - Stake key changes"
+                ),
+                inline=False
+            )
+            
+            # System
+            embed.add_field(
+                name="🔧 System",
+                value=(
+                    "`/help` - Show this help message\n"
+                    "`/health` - Check bot and API status"
+                ),
+                inline=False
+            )
+            
+            # Footer
+            embed.set_footer(text="WalletBud is monitoring the Cardano blockchain 24/7!")
             
             await interaction.response.send_message(embed=embed, ephemeral=True)
             
@@ -919,37 +1000,67 @@ class WalletBud(commands.Bot):
     async def _health(self, interaction: discord.Interaction):
         """Check bot and API status"""
         try:
-            # Check Blockfrost API status
-            blockfrost_status = await self.rate_limited_request(
-                self.blockfrost_client.health
-            )
-            
             # Create embed
             embed = discord.Embed(
-                title="🏥 Bot and API Status",
-                description="Current status:",
-                color=discord.Color.blue()
+                title="🏥 System Health",
+                description="Current status of WalletBud systems:",
+                color=discord.Color.green()
             )
             
-            # Add Blockfrost API status
+            # Check Discord connection
+            discord_status = "✅ Connected" if self.is_ready() else "❌ Disconnected"
+            embed.add_field(
+                name="Discord Bot",
+                value=f"{discord_status}\nLatency: `{round(self.latency * 1000)}ms`",
+                inline=False
+            )
+            
+            # Check Blockfrost API
+            try:
+                # Test with a known address
+                test_address = "addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz"
+                await self.rate_limited_request(
+                    self.blockfrost_client.address,
+                    test_address
+                )
+                blockfrost_status = "✅ Connected"
+            except Exception as e:
+                logger.error(f"Blockfrost health check failed: {str(e)}")
+                blockfrost_status = "❌ Error"
+                
             embed.add_field(
                 name="Blockfrost API",
-                value=f"`{blockfrost_status.is_healthy}`",
+                value=blockfrost_status,
                 inline=False
             )
             
-            # Add bot status
+            # Add monitoring status
+            monitoring_status = "✅ Active" if not self.monitoring_paused else "⏸️ Paused"
             embed.add_field(
-                name="Bot",
-                value="✅ Online",
+                name="Wallet Monitoring",
+                value=monitoring_status,
                 inline=False
             )
+            
+            # Add uptime if available
+            if hasattr(self, 'start_time'):
+                uptime = datetime.now() - self.start_time
+                days = uptime.days
+                hours, remainder = divmod(uptime.seconds, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                
+                uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
+                embed.add_field(
+                    name="Uptime",
+                    value=f"`{uptime_str}`",
+                    inline=False
+                )
             
             await interaction.response.send_message(embed=embed, ephemeral=True)
             
         except Exception as e:
             logger.error(f"Error checking health: {str(e)}")
-            await interaction.response.send_message("❌ An error occurred while checking status.", ephemeral=True)
+            await interaction.response.send_message("❌ An error occurred while checking system health.", ephemeral=True)
 
     async def _balance(self, interaction: discord.Interaction):
         """Get your wallet's current balance"""
