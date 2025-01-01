@@ -150,9 +150,9 @@ def validate_discord_token(value: str, name: str) -> str:
     if not value:
         raise ValueError(f"{name} cannot be empty")
         
-    # Check basic format (just length and characters)
-    if not re.match(r'^[A-Za-z0-9._-]{50,100}$', value):
-        raise ValueError(f"{name} has invalid format")
+    # Just check that it's not empty and has reasonable length
+    if len(value) < 10:
+        raise ValueError(f"{name} is too short")
         
     return value
 
@@ -457,9 +457,9 @@ def validate_discord_token(value: str, name: str) -> str:
     if not value:
         raise ValueError(f"{name} cannot be empty")
         
-    # Check basic format (just length and characters)
-    if not re.match(r'^[A-Za-z0-9._-]{50,100}$', value):
-        raise ValueError(f"{name} has invalid format")
+    # Just check that it's not empty and has reasonable length
+    if len(value) < 10:
+        raise ValueError(f"{name} is too short")
         
     return value
 
