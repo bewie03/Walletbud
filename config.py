@@ -208,7 +208,111 @@ ENV_VARS = {
         'ADMIN_CHANNEL_ID',
         'Discord admin channel ID',
         validator=lambda x, _: str(int(x))  # Ensure it's a valid integer
-    )
+    ),
+    'MAX_REQUESTS_PER_SECOND': EnvVar(
+        'MAX_REQUESTS_PER_SECOND',
+        'Max Requests Per Second',
+        default="10",
+        validator=validate_positive_int,
+        required=False,
+        description="Maximum number of requests allowed per second"
+    ),
+    'BURST_LIMIT': EnvVar(
+        'BURST_LIMIT',
+        'Burst Limit',
+        default="50",
+        validator=validate_positive_int,
+        required=False,
+        description="Maximum burst requests allowed"
+    ),
+    'RATE_LIMIT_COOLDOWN': EnvVar(
+        'RATE_LIMIT_COOLDOWN',
+        'Rate Limit Cooldown',
+        default="60",
+        validator=validate_positive_int,
+        required=False,
+        description="Cooldown period in seconds after rate limit"
+    ),
+    'RATE_LIMIT_WINDOW': EnvVar(
+        'RATE_LIMIT_WINDOW',
+        'Rate Limit Window',
+        default="60",
+        validator=validate_positive_int,
+        required=False,
+        description="Time window in seconds for rate limiting"
+    ),
+    'RATE_LIMIT_MAX_REQUESTS': EnvVar(
+        'RATE_LIMIT_MAX_REQUESTS',
+        'Rate Limit Max Requests',
+        default="100",
+        validator=validate_positive_int,
+        required=False,
+        description="Maximum requests allowed in rate limit window"
+    ),
+    'MAX_QUEUE_SIZE': EnvVar(
+        'MAX_QUEUE_SIZE',
+        'Max Queue Size',
+        default="1000",
+        validator=validate_positive_int,
+        required=False,
+        description="Maximum size of the webhook queue"
+    ),
+    'MAX_RETRIES': EnvVar(
+        'MAX_RETRIES',
+        'Max Retries',
+        default="3",
+        validator=validate_positive_int,
+        required=False,
+        description="Maximum number of retry attempts"
+    ),
+    'MAX_EVENT_AGE': EnvVar(
+        'MAX_EVENT_AGE',
+        'Max Event Age',
+        default="3600",
+        validator=validate_positive_int,
+        required=False,
+        description="Maximum age of events in seconds"
+    ),
+    'BATCH_SIZE': EnvVar(
+        'BATCH_SIZE',
+        'Batch Size',
+        default="10",
+        validator=validate_positive_int,
+        required=False,
+        description="Number of events to process in a batch"
+    ),
+    'MAX_WEBHOOK_SIZE': EnvVar(
+        'MAX_WEBHOOK_SIZE',
+        'Max Webhook Size',
+        default="1048576",  # 1MB
+        validator=validate_positive_int,
+        required=False,
+        description="Maximum webhook payload size in bytes"
+    ),
+    'WEBHOOK_RATE_LIMIT': EnvVar(
+        'WEBHOOK_RATE_LIMIT',
+        'Webhook Rate Limit',
+        default="60",
+        validator=validate_positive_int,
+        required=False,
+        description="Maximum webhook requests per minute"
+    ),
+    'PROCESS_INTERVAL': EnvVar(
+        'PROCESS_INTERVAL',
+        'Process Interval',
+        default="5",
+        validator=validate_positive_int,
+        required=False,
+        description="Interval in seconds between processing batches"
+    ),
+    'MAX_ERROR_HISTORY': EnvVar(
+        'MAX_ERROR_HISTORY',
+        'Max Error History',
+        default="1000",
+        validator=validate_positive_int,
+        required=False,
+        description="Maximum number of errors to keep in history"
+    ),
 }
 
 # Error messages with detailed descriptions
@@ -336,17 +440,20 @@ ENV = os.getenv('ENV', 'development')
 LOG_LEVEL = logging.DEBUG if ENV == 'development' else logging.INFO
 
 # Rate limits and timeouts
-RATE_LIMITS = {
-    'blockfrost': {
-        'calls_per_second': 10,
-        'burst': 50,
-        'timeout': 30
-    },
-    'discord': {
-        'global_rate_limit': 50,  # commands per minute
-        'command_rate_limit': 5    # commands per user per minute
-    }
-}
+MAX_REQUESTS_PER_SECOND = int(os.getenv('MAX_REQUESTS_PER_SECOND', '10'))
+BURST_LIMIT = int(os.getenv('BURST_LIMIT', '50'))
+RATE_LIMIT_COOLDOWN = int(os.getenv('RATE_LIMIT_COOLDOWN', '60'))
+RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '60'))
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv('RATE_LIMIT_MAX_REQUESTS', '100'))
+
+MAX_QUEUE_SIZE = int(os.getenv('MAX_QUEUE_SIZE', '1000'))
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
+MAX_EVENT_AGE = int(os.getenv('MAX_EVENT_AGE', '3600'))
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', '10'))
+MAX_WEBHOOK_SIZE = int(os.getenv('MAX_WEBHOOK_SIZE', '1048576'))  # 1MB
+WEBHOOK_RATE_LIMIT = int(os.getenv('WEBHOOK_RATE_LIMIT', '60'))
+PROCESS_INTERVAL = int(os.getenv('PROCESS_INTERVAL', '5'))
+MAX_ERROR_HISTORY = int(os.getenv('MAX_ERROR_HISTORY', '1000'))
 
 # Retry configuration
 WEBHOOK_RETRY_ATTEMPTS = 3
@@ -763,30 +870,35 @@ ENV_VARS = {
         name='MAX_REQUESTS_PER_SECOND',
         default="10",
         validator=validate_positive_int,
+        required=False,
         description="Maximum API requests per second"
     ),
     'BURST_LIMIT': EnvVar(
         name='BURST_LIMIT',
         default="500",
         validator=validate_positive_int,
+        required=False,
         description="Maximum burst requests allowed"
     ),
     'RATE_LIMIT_COOLDOWN': EnvVar(
         name='RATE_LIMIT_COOLDOWN',
         default="60",
         validator=validate_positive_int,
+        required=False,
         description="Rate limit cooldown in seconds"
     ),
     'RATE_LIMIT_WINDOW': EnvVar(
         name='RATE_LIMIT_WINDOW',
         default="60",
         validator=validate_positive_int,
+        required=False,
         description="Rate limit window in seconds"
     ),
     'RATE_LIMIT_MAX_REQUESTS': EnvVar(
         name='RATE_LIMIT_MAX_REQUESTS',
         default="100",
         validator=validate_positive_int,
+        required=False,
         description="Maximum requests per window"
     ),
 
@@ -795,48 +907,56 @@ ENV_VARS = {
         name='MAX_QUEUE_SIZE',
         default="10000",
         validator=validate_positive_int,
+        required=False,
         description="Maximum events in queue"
     ),
     'MAX_RETRIES': EnvVar(
         name='MAX_RETRIES',
         default="5",
         validator=validate_positive_int,
+        required=False,
         description="Maximum retry attempts per event"
     ),
     'MAX_EVENT_AGE': EnvVar(
         name='MAX_EVENT_AGE',
         default="3600",
         validator=validate_positive_int,
+        required=False,
         description="Maximum age of event in seconds"
     ),
     'BATCH_SIZE': EnvVar(
         name='BATCH_SIZE',
         default="10",
         validator=validate_positive_int,
+        required=False,
         description="Process this many events at once"
     ),
     'MAX_WEBHOOK_SIZE': EnvVar(
         name='MAX_WEBHOOK_SIZE',
         default="1048576",  # 1MB
         validator=validate_positive_int,
+        required=False,
         description="Maximum webhook payload size in bytes"
     ),
     'WEBHOOK_RATE_LIMIT': EnvVar(
         name='WEBHOOK_RATE_LIMIT',
         default="100",
         validator=validate_positive_int,
+        required=False,
         description="Maximum webhooks per minute"
     ),
     'PROCESS_INTERVAL': EnvVar(
         name='PROCESS_INTERVAL',
         default="1",
         validator=validate_positive_int,
+        required=False,
         description="Process queue every N seconds"
     ),
     'MAX_ERROR_HISTORY': EnvVar(
         name='MAX_ERROR_HISTORY',
         default="1000",
         validator=validate_positive_int,
+        required=False,
         description="Maximum number of errors to keep in history"
     ),
 
@@ -845,18 +965,21 @@ ENV_VARS = {
         name='WALLET_CHECK_INTERVAL',
         default="300",
         validator=validate_positive_int,
+        required=False,
         description="Interval to check wallets in seconds"
     ),
     'MIN_ADA_BALANCE': EnvVar(
         name='MIN_ADA_BALANCE',
         default="5",
         validator=validate_positive_int,
+        required=False,
         description="Minimum ADA balance for alerts"
     ),
     'MAX_TX_PER_HOUR': EnvVar(
         name='MAX_TX_PER_HOUR',
         default="10",
         validator=validate_positive_int,
+        required=False,
         description="Maximum transactions per hour"
     ),
     'MINIMUM_YUMMI': EnvVar(
@@ -872,12 +995,14 @@ ENV_VARS = {
         name='MAINTENANCE_HOUR',
         default="2",
         validator=validate_hour,
+        required=False,
         description="Hour to run maintenance (24-hour format)"
     ),
     'MAINTENANCE_MINUTE': EnvVar(
         name='MAINTENANCE_MINUTE',
         default="0",
         validator=validate_minute,
+        required=False,
         description="Minute to run maintenance"
     ),
 
@@ -885,16 +1010,19 @@ ENV_VARS = {
     'ASSET_ID': EnvVar(
         name='ASSET_ID',
         validator=validate_asset_id,
+        required=False,
         description="Cardano asset ID to monitor"
     ),
     'YUMMI_POLICY_ID': EnvVar(
         name="YUMMI Policy ID",
         validator=validate_policy_id,
+        required=False,
         description="Cardano policy ID for YUMMI token"
     ),
     'YUMMI_TOKEN_NAME': EnvVar(
         name='YUMMI_TOKEN_NAME',
         validator=validate_token_name,
+        required=False,
         description="YUMMI token name (hex encoded)"
     ),
     'WEBHOOK_IDENTIFIER': EnvVar(
@@ -966,39 +1094,39 @@ try:
     DATABASE_URL = env['DATABASE_URL']
 
     # Rate Limiting Configuration
-    MAX_REQUESTS_PER_SECOND = int(env['MAX_REQUESTS_PER_SECOND'])
-    BURST_LIMIT = int(env['BURST_LIMIT'])
-    RATE_LIMIT_COOLDOWN = int(env['RATE_LIMIT_COOLDOWN'])
-    RATE_LIMIT_WINDOW = int(env['RATE_LIMIT_WINDOW'])
-    RATE_LIMIT_MAX_REQUESTS = int(env['RATE_LIMIT_MAX_REQUESTS'])
+    MAX_REQUESTS_PER_SECOND = int(env.get('MAX_REQUESTS_PER_SECOND', '10'))
+    BURST_LIMIT = int(env.get('BURST_LIMIT', '50'))
+    RATE_LIMIT_COOLDOWN = int(env.get('RATE_LIMIT_COOLDOWN', '60'))
+    RATE_LIMIT_WINDOW = int(env.get('RATE_LIMIT_WINDOW', '60'))
+    RATE_LIMIT_MAX_REQUESTS = int(env.get('RATE_LIMIT_MAX_REQUESTS', '100'))
 
     # Queue Configuration
-    MAX_QUEUE_SIZE = int(env['MAX_QUEUE_SIZE'])
-    MAX_RETRIES = int(env['MAX_RETRIES'])
-    MAX_EVENT_AGE = int(env['MAX_EVENT_AGE'])
-    BATCH_SIZE = int(env['BATCH_SIZE'])
-    MAX_WEBHOOK_SIZE = int(env['MAX_WEBHOOK_SIZE'])
-    WEBHOOK_RATE_LIMIT = int(env['WEBHOOK_RATE_LIMIT'])
-    PROCESS_INTERVAL = int(env['PROCESS_INTERVAL'])
-    MAX_ERROR_HISTORY = int(env['MAX_ERROR_HISTORY'])
+    MAX_QUEUE_SIZE = int(env.get('MAX_QUEUE_SIZE', '1000'))
+    MAX_RETRIES = int(env.get('MAX_RETRIES', '3'))
+    MAX_EVENT_AGE = int(env.get('MAX_EVENT_AGE', '3600'))
+    BATCH_SIZE = int(env.get('BATCH_SIZE', '10'))
+    MAX_WEBHOOK_SIZE = int(env.get('MAX_WEBHOOK_SIZE', '1048576'))  # 1MB
+    WEBHOOK_RATE_LIMIT = int(env.get('WEBHOOK_RATE_LIMIT', '60'))
+    PROCESS_INTERVAL = int(env.get('PROCESS_INTERVAL', '5'))
+    MAX_ERROR_HISTORY = int(env.get('MAX_ERROR_HISTORY', '1000'))
 
     # Wallet Monitoring Configuration
-    WALLET_CHECK_INTERVAL = int(env['WALLET_CHECK_INTERVAL'])
-    MIN_ADA_BALANCE = int(env['MIN_ADA_BALANCE'])
-    MAX_TX_PER_HOUR = int(env['MAX_TX_PER_HOUR'])
-    MINIMUM_YUMMI = int(env['MINIMUM_YUMMI'])
+    WALLET_CHECK_INTERVAL = int(env.get('WALLET_CHECK_INTERVAL', '300'))
+    MIN_ADA_BALANCE = int(env.get('MIN_ADA_BALANCE', '5'))
+    MAX_TX_PER_HOUR = int(env.get('MAX_TX_PER_HOUR', '10'))
+    MINIMUM_YUMMI = int(env.get('MINIMUM_YUMMI', '1000'))
 
     # Maintenance Configuration
-    MAINTENANCE_HOUR = int(env['MAINTENANCE_HOUR'])
-    MAINTENANCE_MINUTE = int(env['MAINTENANCE_MINUTE'])
+    MAINTENANCE_HOUR = int(env.get('MAINTENANCE_HOUR', '2'))
+    MAINTENANCE_MINUTE = int(env.get('MAINTENANCE_MINUTE', '0'))
 
     # Asset Configuration
-    ASSET_ID = env['ASSET_ID']
-    YUMMI_POLICY_ID = env['YUMMI_POLICY_ID']
-    YUMMI_TOKEN_NAME = env['YUMMI_TOKEN_NAME']
-    WEBHOOK_IDENTIFIER = env['WEBHOOK_IDENTIFIER']
-    WEBHOOK_AUTH_TOKEN = env['WEBHOOK_AUTH_TOKEN']
-    WEBHOOK_CONFIRMATIONS = int(env['WEBHOOK_CONFIRMATIONS'])
+    ASSET_ID = env.get('ASSET_ID')
+    YUMMI_POLICY_ID = env.get('YUMMI_POLICY_ID')
+    YUMMI_TOKEN_NAME = env.get('YUMMI_TOKEN_NAME')
+    WEBHOOK_IDENTIFIER = env.get('WEBHOOK_IDENTIFIER', 'walletbud_webhook')
+    WEBHOOK_AUTH_TOKEN = env.get('WEBHOOK_AUTH_TOKEN', 'your_webhook_auth_token')
+    WEBHOOK_CONFIRMATIONS = int(env.get('WEBHOOK_CONFIRMATIONS', '3'))
 
 except Exception as e:
     logger.error(f"Environment validation failed:\n{str(e)}")
