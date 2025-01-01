@@ -57,32 +57,60 @@ A Discord bot for monitoring Cardano wallets with comprehensive transaction trac
 
 ## Environment Variables
 
-### Required
+### Discord Configuration
 - `DISCORD_TOKEN` - Discord bot token
-- `BLOCKFROST_PROJECT_ID` - Blockfrost API project ID
-- `DATABASE_URL` - PostgreSQL connection string
-
-### Optional
 - `ADMIN_CHANNEL_ID` - Channel for admin notifications
-- `BLOCKFROST_BASE_URL` - Custom Blockfrost API URL
-- `MAX_REQUESTS_PER_SECOND` - API rate limit (default: 10)
-- `BURST_LIMIT` - API burst limit (default: 500)
-- `RATE_LIMIT_COOLDOWN` - Rate limit cooldown in seconds (default: 60)
-- `MAX_QUEUE_SIZE` - Maximum webhook queue size (default: 10000)
-- `MAX_RETRIES` - Maximum retry attempts (default: 5)
+- `APPLICATION_ID` - Discord application ID
+
+### Blockfrost Configuration
+- `BLOCKFROST_PROJECT_ID` - Blockfrost API project ID
+- `BLOCKFROST_BASE_URL` - Blockfrost API base URL (default: cardano-mainnet)
+- `BLOCKFROST_TX_WEBHOOK_ID` - Transaction webhook ID
+- `BLOCKFROST_DEL_WEBHOOK_ID` - Delegation webhook ID
+- `BLOCKFROST_WEBHOOK_SECRET` - Webhook secret for verification
+- `BLOCKFROST_IP_RANGES` - Allowed IP ranges for webhooks (JSON array)
+
+### Database Configuration
+- `DATABASE_URL` - PostgreSQL connection string
+- `DB_MIN_POOL_SIZE` - Minimum database pool size (default: 2)
+- `DB_MAX_POOL_SIZE` - Maximum database pool size (default: 10)
+- `DB_MAX_INACTIVE_CONNECTION_LIFETIME` - Max inactive connection lifetime in seconds (default: 300)
+- `DB_COMMAND_TIMEOUT` - Command timeout in seconds (default: 60)
+
+### YUMMI Token Configuration
+- `YUMMI_POLICY_ID` - YUMMI token policy ID
+- `YUMMI_TOKEN_NAME` - YUMMI token name (hex)
+- `MINIMUM_YUMMI` - Minimum YUMMI tokens required (default: 1000)
+
+### Rate Limiting
+- `RATE_LIMIT_WINDOW` - Rate limit window in seconds (default: 60)
+- `RATE_LIMIT_MAX_REQUESTS` - Max requests per window (default: 100)
+- `MAX_RETRIES` - Maximum retry attempts (default: 3)
+- `RETRY_DELAY` - Delay between retries in seconds (default: 5)
+- `MAX_QUEUE_SIZE` - Maximum webhook queue size (default: 1000)
 - `MAX_EVENT_AGE` - Maximum event age in seconds (default: 3600)
-- `BATCH_SIZE` - Process batch size (default: 10)
-- `MAX_WEBHOOK_SIZE` - Maximum webhook size in bytes (default: 1MB)
-- `WEBHOOK_RATE_LIMIT` - Maximum webhooks per minute (default: 100)
-- `PROCESS_INTERVAL` - Queue process interval in seconds (default: 1)
-- `MAX_ERROR_HISTORY` - Maximum errors to keep in history (default: 1000)
-- `WALLET_CHECK_INTERVAL` - Wallet check interval in seconds (default: 300)
-- `MIN_ADA_BALANCE` - Minimum ADA balance for alerts (default: 5)
-- `MAX_TX_PER_HOUR` - Maximum transactions per hour (default: 10)
+
+### Maintenance Configuration
 - `MAINTENANCE_HOUR` - Hour to run maintenance (default: 2)
 - `MAINTENANCE_MINUTE` - Minute to run maintenance (default: 0)
 - `ARCHIVE_AFTER_DAYS` - Days before archiving transactions (default: 90)
 - `DELETE_AFTER_DAYS` - Days before deleting archived data (default: 180)
+- `MAINTENANCE_BATCH_SIZE` - Batch size for maintenance tasks (default: 1000)
+- `MAINTENANCE_MAX_RETRIES` - Max retries for maintenance tasks (default: 3)
+
+### Health Monitoring
+- `HEALTH_CHECK_INTERVAL` - Health check interval in seconds (default: 300)
+- `MAX_ERRORS` - Maximum errors before alert (default: 100)
+- `ERROR_WINDOW` - Error tracking window in seconds (default: 3600)
+
+### Feature Flags
+- `ENABLE_WEBHOOKS` - Enable webhook processing (default: true)
+- `ENABLE_MONITORING` - Enable wallet monitoring (default: true)
+- `ENABLE_NOTIFICATIONS` - Enable user notifications (default: true)
+
+### Other Settings
+- `LOG_LEVEL` - Logging level (default: INFO)
+- `COMMAND_COOLDOWN` - Command cooldown in seconds (default: 60)
 
 ## Installation
 

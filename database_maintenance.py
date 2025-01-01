@@ -7,25 +7,22 @@ import os
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 
 from database import (
     get_pool,
-    execute_query,
-    execute_many,
-    fetch_all,
-    fetch_one
+    execute_many
+)
+from config import (
+    ARCHIVE_AFTER_DAYS,
+    DELETE_AFTER_DAYS,
+    MAINTENANCE_BATCH_SIZE as BATCH_SIZE,
+    MAINTENANCE_MAX_RETRIES as MAX_RETRIES,
+    MAINTENANCE_HOUR,
+    MAINTENANCE_MINUTE
 )
 
 logger = logging.getLogger(__name__)
-
-# Load maintenance configuration from environment
-ARCHIVE_AFTER_DAYS = int(os.getenv('ARCHIVE_AFTER_DAYS', '90'))  # Archive transactions older than 90 days
-DELETE_AFTER_DAYS = int(os.getenv('DELETE_AFTER_DAYS', '180'))  # Delete archived transactions older than 180 days
-BATCH_SIZE = int(os.getenv('MAINTENANCE_BATCH_SIZE', '1000'))  # Process records in batches
-MAX_RETRIES = int(os.getenv('MAINTENANCE_MAX_RETRIES', '3'))  # Maximum retries for failed operations
-MAINTENANCE_HOUR = int(os.getenv('MAINTENANCE_HOUR', '2'))  # Hour to run maintenance (24-hour format)
-MAINTENANCE_MINUTE = int(os.getenv('MAINTENANCE_MINUTE', '0'))  # Minute to run maintenance
 
 class DatabaseMaintenanceError(Exception):
     """Base exception for database maintenance errors"""
@@ -175,12 +172,7 @@ class DatabaseMaintenance:
                     RETURNING t.tx_hash
                 """
                 
-                result = await fetch_all(
-                    query,
-                    cutoff_date,
-                    BATCH_SIZE,
-                    conn=conn
-                )
+                result = await conn.fetch(query, cutoff_date, BATCH_SIZE)
                 
                 if not result:
                     break
@@ -225,12 +217,7 @@ class DatabaseMaintenance:
                     RETURNING t.tx_hash
                 """
                 
-                result = await fetch_all(
-                    query,
-                    cutoff_date,
-                    BATCH_SIZE,
-                    conn=conn
-                )
+                result = await conn.fetch(query, cutoff_date, BATCH_SIZE)
                 
                 if not result:
                     break
@@ -258,16 +245,13 @@ class DatabaseMaintenance:
         
         try:
             # Get list of tables
-            tables = await fetch_all(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
-                conn=conn
-            )
+            tables = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
             
             for table in tables:
                 table_name = table['tablename']
                 try:
                     # VACUUM ANALYZE each table
-                    await execute_query(f"VACUUM ANALYZE {table_name}", conn=conn)
+                    await conn.execute(f"VACUUM ANALYZE {table_name}")
                     tables_optimized += 1
                     logger.info(f"Optimized table: {table_name}")
                 except Exception as e:

@@ -6,6 +6,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Callable
 import traceback
+from config import MINIMUM_YUMMI
 
 logger = logging.getLogger(__name__)
 

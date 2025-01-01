@@ -63,14 +63,32 @@ RATE_LIMITS = {
     }
 }
 
-# Webhook rate limiting configuration
+# Webhook configuration
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')  # Secret for validating webhook signatures
+MAX_WEBHOOK_SIZE = int(os.getenv('MAX_WEBHOOK_SIZE', '1048576'))  # 1MB max payload size
+MAX_QUEUE_SIZE = int(os.getenv('MAX_QUEUE_SIZE', '10000'))  # Maximum number of events in queue
+MAX_EVENT_AGE = int(os.getenv('MAX_EVENT_AGE', '86400'))  # Maximum age of events in seconds (24 hours)
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', '100'))  # Number of events to process in a batch
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))  # Maximum number of retry attempts
+WEBHOOK_RATE_LIMIT = int(os.getenv('WEBHOOK_RATE_LIMIT', '100'))  # Max webhook requests per minute
+PROCESS_INTERVAL = int(os.getenv('PROCESS_INTERVAL', '5'))  # Webhook processing interval in seconds
+MAX_ERROR_HISTORY = int(os.getenv('MAX_ERROR_HISTORY', '1000'))  # Maximum number of errors to keep in history
+WEBHOOK_IDENTIFIER = os.getenv('WEBHOOK_IDENTIFIER', 'WalletBud')  # Identifier for webhook requests
+
+# Rate limiting configuration
 RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '60'))  # Window in seconds
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv('RATE_LIMIT_MAX_REQUESTS', '100'))  # Max requests per window
-MAX_QUEUE_SIZE = int(os.getenv('MAX_QUEUE_SIZE', '10000'))  # Maximum events in queue
-MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))  # Maximum retry attempts
-MAX_EVENT_AGE = int(os.getenv('MAX_EVENT_AGE', '86400'))  # Maximum age of events in seconds (24 hours)
-BATCH_SIZE = int(os.getenv('BATCH_SIZE', '100'))  # Process events in batches
-MAX_WEBHOOK_SIZE = int(os.getenv('MAX_WEBHOOK_SIZE', '1048576'))  # Maximum webhook payload size in bytes (1MB)
+
+# Wallet monitoring configuration
+WALLET_CHECK_INTERVAL = int(os.getenv('WALLET_CHECK_INTERVAL', '300'))  # Check wallets every 5 minutes
+MIN_ADA_BALANCE = float(os.getenv('MIN_ADA_BALANCE', '5.0'))  # Minimum ADA balance to maintain
+MAX_TX_PER_HOUR = int(os.getenv('MAX_TX_PER_HOUR', '100'))  # Maximum transactions per hour to process
+
+# YUMMI token configuration
+MINIMUM_YUMMI = int(os.getenv('MINIMUM_YUMMI', '1000000'))  # Minimum YUMMI tokens to hold
+YUMMI_POLICY_ID = os.getenv('YUMMI_POLICY_ID')  # YUMMI token policy ID
+YUMMI_TOKEN_NAME = os.getenv('YUMMI_TOKEN_NAME')  # YUMMI token name
+ASSET_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}" if YUMMI_POLICY_ID and YUMMI_TOKEN_NAME else None
 
 # Blockfrost network configuration
 BLOCKFROST_NETWORKS = {
@@ -241,26 +259,24 @@ def validate_asset_id(value: str, name: str) -> str:
     except (ValueError, AttributeError):
         raise ValueError(f"{name} must be a valid Cardano asset ID (hex format), got: {value}")
 
+def validate_policy_id(value: str, name: str) -> str:
+    """Validate policy ID format"""
+    if not value:
+        return value
+    if not re.match(r'^[0-9a-fA-F]{56}$', value):
+        raise ValueError(f"{name} must be a 56-character hexadecimal string")
+    return value
+
 def validate_token_name(value: str, name: str) -> str:
     """Validate token name format"""
+    if not value:
+        return value
     try:
-        value = value.strip()
-        # Check if it's a valid hex string and not too long
-        if not re.match(r'^[0-9a-fA-F]{1,64}$', value):
-            raise ValueError
-        return value.lower()
-    except (ValueError, AttributeError):
-        raise ValueError(f"{name} must be a valid hex-encoded token name, got: {value}")
-
-def validate_policy_id(value: str, name: str) -> str:
-    """Validate Cardano policy ID format"""
-    try:
-        value = value.strip()
-        if not re.match(r'^[0-9a-fA-F]{56}$', value):
-            raise ValueError
-        return value.lower()
-    except (ValueError, AttributeError):
-        raise ValueError(f"{name} must be a valid Cardano policy ID (56-character hex), got: {value}")
+        # Token name should be valid hex
+        bytes.fromhex(value)
+        return value
+    except ValueError:
+        raise ValueError(f"{name} must be a valid hexadecimal string")
 
 def validate_hex(value: str, length: int, name: str) -> str:
     """Validate hexadecimal string of specific length"""
@@ -423,6 +439,45 @@ ENV_VARS = {
         validator=validate_positive_int,
         required=False
     ),
+    'WALLET_CHECK_INTERVAL': EnvVar(
+        name='WALLET_CHECK_INTERVAL',
+        description="Wallet Check Interval",
+        default="300",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'MIN_ADA_BALANCE': EnvVar(
+        name='MIN_ADA_BALANCE',
+        description="Minimum ADA Balance",
+        default="5.0",
+        validator=lambda x, _: float(x)
+    ),
+    'MAX_TX_PER_HOUR': EnvVar(
+        name='MAX_TX_PER_HOUR',
+        description="Maximum Transactions per Hour",
+        default="100",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'MINIMUM_YUMMI': EnvVar(
+        name='MINIMUM_YUMMI',
+        description="Minimum YUMMI Tokens",
+        default="1000000",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'YUMMI_POLICY_ID': EnvVar(
+        name='YUMMI_POLICY_ID',
+        description="YUMMI Policy ID",
+        validator=validate_policy_id,
+        required=False
+    ),
+    'YUMMI_TOKEN_NAME': EnvVar(
+        name='YUMMI_TOKEN_NAME',
+        description="YUMMI Token Name",
+        validator=validate_token_name,
+        required=False
+    ),
 }
 
 def validate_config():
@@ -474,6 +529,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Database configuration
+DB_CONFIG = {
+    'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '2')),
+    'MAX_POOL_SIZE': int(os.getenv('DB_MAX_POOL_SIZE', '10')),
+    'MAX_INACTIVE_CONNECTION_LIFETIME': int(os.getenv('DB_MAX_INACTIVE_CONNECTION_LIFETIME', '300')),  # 5 minutes
+    'COMMAND_TIMEOUT': int(os.getenv('DB_COMMAND_TIMEOUT', '60')),  # 1 minute
+    'POOL_RECYCLE_INTERVAL': int(os.getenv('DB_POOL_RECYCLE_INTERVAL', '3600')),  # 1 hour
+    'MAX_QUERIES_PER_POOL': int(os.getenv('DB_MAX_QUERIES_PER_POOL', '50000')),  # Reset pool after 50k queries
+    'MAX_POOL_AGE': int(os.getenv('DB_MAX_POOL_AGE', '86400')),  # 24 hours
+    'RETRY_ATTEMPTS': int(os.getenv('DB_RETRY_ATTEMPTS', '3')),
+    'RETRY_DELAY': int(os.getenv('DB_RETRY_DELAY', '1')),  # 1 second
+    'MAX_RETRIES': int(os.getenv('DB_MAX_RETRIES', '3')),  # Maximum number of retries
+    'RETRY_DELAY_BASE': int(os.getenv('DB_RETRY_DELAY_BASE', '2')),  # Base for exponential backoff
+}
+
 DATABASE_POOL_MIN_SIZE = 10
 DATABASE_POOL_MAX_SIZE = 100
 DATABASE_MAX_QUERIES = 50000

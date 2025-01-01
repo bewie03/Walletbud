@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import re
 import ssl
 import certifi
+from config import DB_CONFIG
 
 # Load environment variables
 load_dotenv()
@@ -34,21 +35,6 @@ def validate_address(address: str, address_type: str = 'wallet') -> bool:
         return bool(STAKE_ADDRESS_PATTERN.match(address))
     else:
         raise ValueError(f"Invalid address type: {address_type}")
-
-# Database configuration constants
-DB_CONFIG = {
-    'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '2')),
-    'MAX_POOL_SIZE': int(os.getenv('DB_MAX_POOL_SIZE', '10')),
-    'MAX_QUERIES_PER_CONN': int(os.getenv('DB_MAX_QUERIES', '50000')),
-    'COMMAND_TIMEOUT': int(os.getenv('DB_COMMAND_TIMEOUT', '60')),
-    'TRANSACTION_TIMEOUT': int(os.getenv('DB_TRANSACTION_TIMEOUT', '60')),
-    'RETRY_ATTEMPTS': int(os.getenv('DB_RETRY_ATTEMPTS', '3')),
-    'RETRY_DELAY': int(os.getenv('DB_RETRY_DELAY', '1')),
-    'ALLOWED_COLUMNS': {
-        'notification_settings': {'ada_transactions', 'token_changes', 'nft_updates', 
-                                'delegation_status', 'policy_updates', 'balance_alerts'}
-    }
-}
 
 # Pool management with proper locking and recreation
 _pool_creation_time = None
@@ -98,11 +84,11 @@ async def get_pool():
                     db_url,
                     min_size=DB_CONFIG['MIN_POOL_SIZE'],
                     max_size=DB_CONFIG['MAX_POOL_SIZE'],
-                    max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
+                    max_inactive_connection_lifetime=DB_CONFIG['MAX_INACTIVE_CONNECTION_LIFETIME'],
                     command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
                     server_settings={
                         'application_name': 'walletbud',
-                        'statement_timeout': str(DB_CONFIG['TRANSACTION_TIMEOUT'] * 1000),
+                        'statement_timeout': str(DB_CONFIG['COMMAND_TIMEOUT'] * 1000),
                         'idle_in_transaction_session_timeout': '300000',  # 5 minutes
                         'client_encoding': 'UTF8'
                     }
