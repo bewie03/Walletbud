@@ -104,6 +104,7 @@ class DatabaseMaintenance:
                 
                 # Get a dedicated connection for maintenance
                 async with pool.acquire() as conn:
+                    # Archive and delete in a transaction
                     async with conn.transaction():
                         try:
                             # Archive old transactions
@@ -114,14 +115,18 @@ class DatabaseMaintenance:
                             deleted = await self._delete_old_archived_transactions(conn)
                             self._maintenance_stats['deleted_transactions'] = deleted
                             
-                            # Optimize tables
-                            optimized = await self._optimize_tables(conn)
-                            self._maintenance_stats['optimized_tables'] = optimized
-                            
                         except Exception as e:
-                            logger.error(f"Error during maintenance: {str(e)}")
+                            logger.error(f"Error during archive/delete: {str(e)}")
                             self._maintenance_stats['errors'].append(str(e))
                             raise
+                    
+                    # Optimize tables outside transaction
+                    try:
+                        optimized = await self._optimize_tables(conn)
+                        self._maintenance_stats['optimized_tables'] = optimized
+                    except Exception as e:
+                        logger.error(f"Error during optimization: {str(e)}")
+                        self._maintenance_stats['errors'].append(str(e))
                 
                 # Update completion time
                 self._maintenance_stats['completed_at'] = datetime.now()
@@ -245,18 +250,33 @@ class DatabaseMaintenance:
         
         try:
             # Get list of tables
-            tables = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+            tables = await conn.fetch("""
+                SELECT tablename 
+                FROM pg_tables 
+                WHERE schemaname = 'public'
+                AND tablename NOT LIKE 'pg_%'
+                AND tablename NOT LIKE 'sql_%'
+            """)
             
             for table in tables:
                 table_name = table['tablename']
                 try:
-                    # VACUUM ANALYZE each table
-                    await conn.execute(f"VACUUM ANALYZE {table_name}")
+                    # Run ANALYZE first
+                    await conn.execute(f"ANALYZE {table_name}")
+                    logger.info(f"Analyzed table: {table_name}")
+                    
+                    # Then try VACUUM
+                    await conn.execute(f"VACUUM {table_name}")
+                    logger.info(f"Vacuumed table: {table_name}")
+                    
                     tables_optimized += 1
-                    logger.info(f"Optimized table: {table_name}")
+                    
                 except Exception as e:
                     logger.error(f"Error optimizing table {table_name}: {str(e)}")
                     continue
+                
+                # Small delay between tables
+                await asyncio.sleep(0.1)
             
             return tables_optimized
             
