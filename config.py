@@ -37,6 +37,17 @@ LOG_PATHS = {
     'webhook': os.path.join(LOG_DIR, 'webhook.log')
 }
 
+# Logging configuration
+LOG_LEVELS = {
+    'bot': logging.INFO,
+    'system_commands': logging.INFO,
+    'wallet_commands': logging.INFO,
+    'webhook': logging.INFO,
+    'database': logging.INFO,
+    'blockfrost': logging.INFO,
+    'shutdown': logging.INFO
+}
+
 # Test addresses for different networks
 TEST_ADDRESSES = {
     'mainnet': os.getenv('TEST_ADDRESS_MAINNET', 'addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz'),
