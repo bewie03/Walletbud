@@ -79,7 +79,6 @@ from config import (
     YUMMI_POLICY_ID,
     YUMMI_TOKEN_NAME,
     WEBHOOK_IDENTIFIER,
-    WEBHOOK_AUTH_TOKEN,
     WEBHOOK_CONFIRMATIONS,
     ERROR_MESSAGES,
     WEBHOOK_RETRY_ATTEMPTS,
@@ -1293,85 +1292,85 @@ class WalletBudBot(commands.Bot):
         for k in expired:
             del self.webhook_rate_limits[k]
             
-    async def handle_webhook(self, request: web.Request):
+    async def handle_webhook(self, request: web.Request) -> web.Response:
         """Handle incoming webhooks with comprehensive validation and rate limiting"""
+        request_id = get_request_id()
+        self.log_sanitized('info', f"Received webhook request {request_id}")
+        
         try:
-            # Get client IP
-            peername = request.transport.get_extra_info('peername')
-            if peername is None:
-                logger.error("Could not get client IP")
-                return web.Response(status=400, text="Invalid request")
-            
-            client_ip = peername[0]
-            
-            # Validate IP
-            if not self.is_valid_ip(client_ip):
-                logger.warning(f"Invalid IP attempt: {client_ip}")
-                return web.Response(status=403, text="Forbidden")
-            
-            # Check rate limit
-            if not await self.check_webhook_rate_limit(client_ip):
-                logger.warning(f"Rate limit exceeded for IP: {client_ip}")
-                return web.Response(status=429, text="Too Many Requests")
-            
-            # Validate auth token
-            auth_header = request.headers.get('Authorization')
-            if not auth_header or auth_header != os.getenv('WEBHOOK_AUTH_TOKEN'):
-                logger.warning(f"Invalid auth token from IP: {client_ip}")
-                return web.Response(status=401, text="Unauthorized")
-            
-            try:
-                # Parse JSON body with size limit
-                if request.content_length and request.content_length > 1024 * 1024:  # 1MB limit
-                    logger.warning(f"Request too large from IP: {client_ip}")
-                    return web.Response(status=413, text="Payload Too Large")
-                    
-                body = await request.json()
-                
-            except json.JSONDecodeError:
-                logger.warning(f"Invalid JSON from IP: {client_ip}")
-                return web.Response(status=400, text="Invalid JSON")
-                
-            except Exception as e:
-                logger.error(f"Error reading request body: {e}")
-                return web.Response(status=400, text="Invalid request body")
-            
-            # Validate webhook identifier
-            if not body.get('identifier') == os.getenv('WEBHOOK_IDENTIFIER'):
-                logger.warning(f"Invalid webhook identifier from IP: {client_ip}")
-                return web.Response(status=400, text="Invalid webhook identifier")
-            
-            # Queue webhook for processing
-            try:
-                # Add request metadata
-                body['_metadata'] = {
-                    'ip': client_ip,
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'request_id': str(uuid.uuid4())
-                }
-                
-                # Put in queue with timeout
-                try:
-                    await asyncio.wait_for(
-                        self._webhook_queue.put(body),
-                        timeout=5.0
-                    )
-                except asyncio.TimeoutError:
-                    logger.error("Webhook queue is full")
-                    return web.Response(status=503, text="Service Unavailable")
-                
-                self.health_metrics['webhook_success'] += 1
-                return web.Response(status=202, text="Accepted")
-                
-            except Exception as e:
-                logger.error(f"Error queueing webhook: {e}")
-                self.health_metrics['webhook_failure'] += 1
-                return web.Response(status=500, text="Internal Server Error")
-            
-        except Exception as e:
-            logger.error(f"Webhook handler error: {e}")
-            return web.Response(status=500, text="Internal Server Error")
+            # Get client IP and check rate limit
+            client_ip = request.headers.get('X-Forwarded-For', request.remote).split(',')[0].strip()
+            if not self.check_webhook_rate_limit(client_ip):
+                self.log_sanitized('warning', f"Rate limit exceeded for IP {client_ip}")
+                return web.Response(status=429, text="Rate limit exceeded")
 
+            # Validate request method
+            if request.method != 'POST':
+                self.log_sanitized('warning', f"Invalid method {request.method} for webhook request {request_id}")
+                return web.Response(status=405, text="Method not allowed")
+
+            # Validate content type
+            content_type = request.headers.get('Content-Type', '')
+            if 'application/json' not in content_type.lower():
+                self.log_sanitized('warning', f"Invalid content type {content_type} for webhook request {request_id}")
+                return web.Response(status=400, text="Invalid content type")
+
+            # Validate request size
+            content_length = request.content_length
+            if content_length is None or content_length > MAX_WEBHOOK_SIZE:
+                self.log_sanitized('warning', f"Invalid content length {content_length} for webhook request {request_id}")
+                return web.Response(status=413, text="Payload too large")
+
+            # Validate Blockfrost signature
+            signature = request.headers.get('Webhook-Signature')
+            if not signature:
+                self.log_sanitized('warning', f"Missing Blockfrost signature for webhook request {request_id}")
+                return web.Response(status=401, text="Missing signature")
+
+            # Get webhook data
+            try:
+                webhook_data = await request.json()
+            except json.JSONDecodeError as e:
+                self.log_sanitized('error', f"Invalid JSON in webhook request {request_id}: {str(e)}")
+                return web.Response(status=400, text="Invalid JSON")
+
+            # Validate webhook structure
+            try:
+                self._validate_webhook_structure(webhook_data)
+            except ValueError as e:
+                self.log_sanitized('error', f"Invalid webhook structure in request {request_id}: {str(e)}")
+                return web.Response(status=400, text=str(e))
+
+            # Verify Blockfrost signature
+            try:
+                payload = await request.read()
+                expected_signature = hmac.new(
+                    os.getenv('WEBHOOK_SECRET').encode(),
+                    payload,
+                    hashlib.sha512
+                ).hexdigest()
+                
+                if not hmac.compare_digest(signature, expected_signature):
+                    self.log_sanitized('warning', f"Invalid signature for webhook request {request_id}")
+                    return web.Response(status=401, text="Invalid signature")
+            except Exception as e:
+                self.log_sanitized('error', f"Error verifying signature for webhook request {request_id}: {str(e)}")
+                return web.Response(status=500, text="Error verifying signature")
+
+            # Process webhook
+            await self._webhook_queue.put({
+                'data': webhook_data,
+                'request_id': request_id,
+                'timestamp': time.time()
+            })
+
+            self.log_sanitized('info', f"Successfully queued webhook request {request_id}")
+            return web.Response(status=202, text="Webhook accepted")
+
+        except Exception as e:
+            self.log_sanitized('error', f"Error processing webhook request {request_id}: {str(e)}")
+            return web.Response(status=500, text="Internal server error")
+            
     async def _process_webhook_queue(self):
         """Process webhooks from queue with error handling"""
         while True:
