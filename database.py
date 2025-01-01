@@ -42,59 +42,38 @@ _pool_max_age = timedelta(hours=1)  # Recreate pool every hour
 _pool_lock = asyncio.Lock()
 _pool = None
 
-async def get_pool() -> asyncpg.Pool:
-    """Get database connection pool with proper initialization and health check"""
-    global _pool, _pool_creation_time
-    
-    async with _pool_lock:
-        # Check if pool needs recreation
-        if (_pool is None or 
-            _pool_creation_time is None or 
-            datetime.now() - _pool_creation_time > _pool_max_age):
+async def get_pool():
+    """Get database connection pool with proper SSL configuration"""
+    global _pool
+    try:
+        if not _pool:
+            ssl_context = ssl.create_default_context(cafile=os.getenv('SSL_CERT_FILE', '/etc/ssl/certs/ca-certificates.crt'))
+            ssl_context.verify_mode = ssl.CERT_REQUIRED
             
-            # Clean up old pool if it exists
-            if _pool:
-                await _pool.close()
+            # Parse DATABASE_URL
+            db_url = os.getenv('DATABASE_URL')
+            if not db_url:
+                raise ValueError("DATABASE_URL environment variable not set")
             
-            try:
-                # Handle Heroku's postgres:// URL format
-                url = os.getenv('DATABASE_URL')
-                if url and url.startswith('postgres://'):
-                    url = url.replace('postgres://', 'postgresql://', 1)
-                
-                # Create SSL context for secure connections
-                ssl_context = ssl.create_default_context(cafile=certifi.where())
-                ssl_context.verify_mode = ssl.CERT_REQUIRED
-                
-                # Initialize pool with proper settings
-                _pool = await asyncpg.create_pool(
-                    url,
-                    min_size=DB_CONFIG['MIN_POOL_SIZE'],
-                    max_size=DB_CONFIG['MAX_POOL_SIZE'],
-                    max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
-                    command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
-                    ssl=ssl_context,
-                    server_settings={
-                        'application_name': 'WalletBud',
-                        'statement_timeout': str(DB_CONFIG['COMMAND_TIMEOUT'] * 1000),
-                        'idle_in_transaction_session_timeout': str(DB_CONFIG['TRANSACTION_TIMEOUT'] * 1000)
-                    }
-                )
-                
-                # Test connection
-                async with _pool.acquire() as conn:
-                    await conn.execute('SELECT 1')
-                
-                _pool_creation_time = datetime.now()
-                logger.info("Database pool initialized successfully")
-                
-            except Exception as e:
-                logger.error(f"Failed to initialize database pool: {e}")
-                _pool = None
-                _pool_creation_time = None
-                raise ConnectionError(f"Database connection failed: {str(e)}")
-        
+            # Add SSL mode to connection string if not present
+            if 'sslmode=' not in db_url.lower():
+                db_url += '?sslmode=verify-full'
+            
+            _pool = await asyncpg.create_pool(
+                db_url,
+                min_size=1,
+                max_size=10,
+                ssl=ssl_context,
+                command_timeout=60,
+                server_settings={'application_name': 'WalletBud'}
+            )
+            logger.info("Database pool created successfully")
         return _pool
+    except Exception as e:
+        logger.error(f"Failed to create database pool: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        raise ConnectionError(f"Database connection failed: {str(e)}")
 
 async def reset_pool():
     """Reset the connection pool with proper cleanup"""
@@ -2291,11 +2270,21 @@ async def main():
 def init_db_sync():
     """Synchronous version of init_db for Heroku release phase"""
     import asyncio
-    loop = asyncio.get_event_loop()
+    
+    # Configure SSL for the event loop
+    import ssl
+    ssl_context = ssl.create_default_context(cafile=os.getenv('SSL_CERT_FILE', '/etc/ssl/certs/ca-certificates.crt'))
+    ssl_context.verify_mode = ssl.CERT_REQUIRED
+    
+    # Create new event loop with SSL configuration
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     try:
         loop.run_until_complete(init_db())
+        logger.info("Database initialized successfully")
     except Exception as e:
-        logging.error(f"Failed to initialize database: {e}")
+        logger.error(f"Failed to initialize database: {e}")
         raise
     finally:
         loop.close()
