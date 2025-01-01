@@ -412,63 +412,63 @@ ENV_VARS = {
     ),
     'BATCH_SIZE': EnvVar(
         name='BATCH_SIZE',
-        description="Batch Size",
-        default="10",
+        description="Batch size for processing operations",
+        default="100",
         validator=validate_positive_int,
         required=False
     ),
     'MAX_WEBHOOK_SIZE': EnvVar(
         name='MAX_WEBHOOK_SIZE',
-        description="Max Webhook Size",
+        description="Max webhook size in bytes",
         default="1048576",  # 1MB
         validator=validate_positive_int,
         required=False
     ),
     'WEBHOOK_RATE_LIMIT': EnvVar(
         name='WEBHOOK_RATE_LIMIT',
-        description="Webhook Rate Limit",
-        default="60",
+        description="Maximum webhooks per minute",
+        default="100",
         validator=validate_positive_int,
         required=False
     ),
     'PROCESS_INTERVAL': EnvVar(
         name='PROCESS_INTERVAL',
-        description="Process Interval",
+        description="Queue processing interval in seconds",
         default="5",
         validator=validate_positive_int,
         required=False
     ),
     'MAX_ERROR_HISTORY': EnvVar(
         name='MAX_ERROR_HISTORY',
-        description="Max Error History",
+        description="Maximum errors to keep in history",
         default="1000",
         validator=validate_positive_int,
         required=False
     ),
     'WALLET_CHECK_INTERVAL': EnvVar(
         name='WALLET_CHECK_INTERVAL',
-        description="Wallet Check Interval",
+        description="Wallet check interval in seconds",
         default="300",
         validator=validate_positive_int,
         required=False
     ),
     'MIN_ADA_BALANCE': EnvVar(
         name='MIN_ADA_BALANCE',
-        description="Minimum ADA Balance",
+        description="Minimum ADA balance for alerts",
         default="5.0",
         validator=lambda x, _: float(x)
     ),
     'MAX_TX_PER_HOUR': EnvVar(
         name='MAX_TX_PER_HOUR',
-        description="Maximum Transactions per Hour",
+        description="Maximum transactions per hour",
         default="100",
         validator=validate_positive_int,
         required=False
     ),
     'MINIMUM_YUMMI': EnvVar(
         name='MINIMUM_YUMMI',
-        description="Minimum YUMMI Tokens",
-        default="1000000",
+        description="Minimum YUMMI tokens required",
+        default="1000",
         validator=validate_positive_int,
         required=False
     ),
@@ -486,7 +486,115 @@ ENV_VARS = {
         required=False,
         default=None
     ),
+    'RATE_LIMIT_WINDOW': EnvVar(
+        name='RATE_LIMIT_WINDOW',
+        description="Rate limit window in seconds",
+        default="60",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'RATE_LIMIT_MAX_REQUESTS': EnvVar(
+        name='RATE_LIMIT_MAX_REQUESTS',
+        description="Maximum requests per rate limit window",
+        default="100",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'MAX_QUEUE_SIZE': EnvVar(
+        name='MAX_QUEUE_SIZE',
+        description="Maximum webhook queue size",
+        default="1000",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'MAX_EVENT_AGE': EnvVar(
+        name='MAX_EVENT_AGE',
+        description="Maximum event age in seconds",
+        default="3600",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'COMMAND_COOLDOWN': EnvVar(
+        name='COMMAND_COOLDOWN',
+        description="Command cooldown in seconds",
+        default="60",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'ARCHIVE_AFTER_DAYS': EnvVar(
+        name='ARCHIVE_AFTER_DAYS',
+        description="Days after which to archive events",
+        default="30",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'DELETE_AFTER_DAYS': EnvVar(
+        name='DELETE_AFTER_DAYS',
+        description="Days after which to delete events",
+        default="90",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'MAINTENANCE_BATCH_SIZE': EnvVar(
+        name='MAINTENANCE_BATCH_SIZE',
+        description="Batch size for maintenance operations",
+        default="100",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'MAINTENANCE_MAX_RETRIES': EnvVar(
+        name='MAINTENANCE_MAX_RETRIES',
+        description="Maximum retries for maintenance operations",
+        default="3",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'MAINTENANCE_HOUR': EnvVar(
+        name='MAINTENANCE_HOUR',
+        description="Hour of the day to perform maintenance",
+        default="2",
+        validator=validate_hour,
+        required=False
+    ),
+    'MAINTENANCE_MINUTE': EnvVar(
+        name='MAINTENANCE_MINUTE',
+        description="Minute of the hour to perform maintenance",
+        default="0",
+        validator=validate_minute,
+        required=False
+    ),
 }
+
+# Export configuration variables
+DISCORD_TOKEN = ENV_VARS['DISCORD_TOKEN'].get_value()
+ADMIN_CHANNEL_ID = ENV_VARS['ADMIN_CHANNEL_ID'].get_value()
+BLOCKFROST_PROJECT_ID = ENV_VARS['BLOCKFROST_PROJECT_ID'].get_value()
+BLOCKFROST_BASE_URL = ENV_VARS['BLOCKFROST_BASE_URL'].get_value()
+WEBHOOK_SECRET = ENV_VARS['WEBHOOK_SECRET'].get_value()
+
+# Rate limiting and queue configuration
+RATE_LIMIT_WINDOW = ENV_VARS['RATE_LIMIT_WINDOW'].get_value()
+RATE_LIMIT_MAX_REQUESTS = ENV_VARS['RATE_LIMIT_MAX_REQUESTS'].get_value()
+MAX_QUEUE_SIZE = ENV_VARS['MAX_QUEUE_SIZE'].get_value()
+MAX_RETRIES = ENV_VARS['MAX_RETRIES'].get_value()
+MAX_EVENT_AGE = ENV_VARS['MAX_EVENT_AGE'].get_value()
+BATCH_SIZE = ENV_VARS['BATCH_SIZE'].get_value()
+
+# YUMMI token configuration
+MINIMUM_YUMMI = ENV_VARS['MINIMUM_YUMMI'].get_value()
+YUMMI_POLICY_ID = ENV_VARS['YUMMI_POLICY_ID'].get_value()
+YUMMI_TOKEN_NAME = ENV_VARS['YUMMI_TOKEN_NAME'].get_value()
+
+# Command settings
+COMMAND_COOLDOWN = ENV_VARS['COMMAND_COOLDOWN'].get_value()
+
+# Maintenance configuration
+ARCHIVE_AFTER_DAYS = ENV_VARS['ARCHIVE_AFTER_DAYS'].get_value()
+DELETE_AFTER_DAYS = ENV_VARS['DELETE_AFTER_DAYS'].get_value()
+MAINTENANCE_BATCH_SIZE = ENV_VARS['MAINTENANCE_BATCH_SIZE'].get_value()
+MAINTENANCE_MAX_RETRIES = ENV_VARS['MAINTENANCE_MAX_RETRIES'].get_value()
+MAINTENANCE_HOUR = ENV_VARS['MAINTENANCE_HOUR'].get_value()
+MAINTENANCE_MINUTE = ENV_VARS['MAINTENANCE_MINUTE'].get_value()
 
 def validate_config():
     """Validate entire configuration"""
