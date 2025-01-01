@@ -476,7 +476,7 @@ class WalletBudBot(commands.Bot):
         """Validate and initialize all critical dependencies"""
         try:
             # Check environment variables
-            self.check_environment()
+            await self.check_environment()
             logger.info("Environment variables validated")
             if self.admin_channel:
                 await self.admin_channel.send("✅ Environment variables validated")
@@ -1099,7 +1099,7 @@ class WalletBudBot(commands.Bot):
             )
             
             # Test connection with a simple endpoint
-            await self.blockfrost.info()
+            await self.blockfrost.health()
             logger.info("Blockfrost client initialized successfully")
             if self.admin_channel:
                 await self.admin_channel.send("✅ Blockfrost API connection established")
@@ -1750,7 +1750,7 @@ if __name__ == "__main__":
         bot = WalletBudBot()
         
         # Check environment variables
-        bot.check_environment()
+        await bot.check_environment()
         
         # Get port from environment for Heroku
         port = int(os.getenv('PORT', 8080))
