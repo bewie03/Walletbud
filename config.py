@@ -356,11 +356,10 @@ ENV_VARS = {
     ),
     'MAX_REQUESTS_PER_SECOND': EnvVar(
         'MAX_REQUESTS_PER_SECOND',
-        'Max Requests Per Second',
+        'Maximum number of requests allowed per second',
         default="10",
         validator=validate_positive_int,
-        required=False,
-        description="Maximum number of requests allowed per second"
+        required=False
     ),
     'BURST_LIMIT': EnvVar(
         'BURST_LIMIT',
@@ -674,14 +673,6 @@ NOTIFICATION_SETTINGS = {
 # Discord embed limits
 EMBED_CHAR_LIMIT = 4096
 EMBED_FIELD_LIMIT = 25
-
-@dataclass
-class EnvVar:
-    name: str
-    required: bool = True
-    default: Any = None
-    validator: Optional[callable] = None
-    description: str = ""
 
 def validate_hex(value: str, length: int, name: str) -> str:
     """Validate hexadecimal string of specific length"""
@@ -1003,142 +994,142 @@ ENV_VARS = {
     # Rate Limiting Configuration
     'MAX_REQUESTS_PER_SECOND': EnvVar(
         name='MAX_REQUESTS_PER_SECOND',
+        description="Maximum number of requests allowed per second",
         default="10",
         validator=validate_positive_int,
-        required=False,
-        description="Maximum API requests per second"
+        required=False
     ),
     'BURST_LIMIT': EnvVar(
         name='BURST_LIMIT',
+        description="Maximum burst requests allowed",
         default="500",
         validator=validate_positive_int,
-        required=False,
-        description="Maximum burst requests allowed"
+        required=False
     ),
     'RATE_LIMIT_COOLDOWN': EnvVar(
         name='RATE_LIMIT_COOLDOWN',
+        description="Rate limit cooldown in seconds",
         default="60",
         validator=validate_positive_int,
-        required=False,
-        description="Rate limit cooldown in seconds"
+        required=False
     ),
     'RATE_LIMIT_WINDOW': EnvVar(
         name='RATE_LIMIT_WINDOW',
+        description="Rate limit window in seconds",
         default="60",
         validator=validate_positive_int,
-        required=False,
-        description="Rate limit window in seconds"
+        required=False
     ),
     'RATE_LIMIT_MAX_REQUESTS': EnvVar(
         name='RATE_LIMIT_MAX_REQUESTS',
+        description="Maximum requests per window",
         default="100",
         validator=validate_positive_int,
-        required=False,
-        description="Maximum requests per window"
+        required=False
     ),
 
     # Queue Configuration
     'MAX_QUEUE_SIZE': EnvVar(
         name='MAX_QUEUE_SIZE',
+        description="Maximum events in queue",
         default="10000",
         validator=validate_positive_int,
-        required=False,
-        description="Maximum events in queue"
+        required=False
     ),
     'MAX_RETRIES': EnvVar(
         name='MAX_RETRIES',
+        description="Maximum retry attempts per event",
         default="5",
         validator=validate_positive_int,
-        required=False,
-        description="Maximum retry attempts per event"
+        required=False
     ),
     'MAX_EVENT_AGE': EnvVar(
         name='MAX_EVENT_AGE',
+        description="Maximum age of event in seconds",
         default="3600",
         validator=validate_positive_int,
-        required=False,
-        description="Maximum age of event in seconds"
+        required=False
     ),
     'BATCH_SIZE': EnvVar(
         name='BATCH_SIZE',
+        description="Process this many events at once",
         default="10",
         validator=validate_positive_int,
-        required=False,
-        description="Process this many events at once"
+        required=False
     ),
     'MAX_WEBHOOK_SIZE': EnvVar(
         name='MAX_WEBHOOK_SIZE',
+        description="Maximum webhook payload size in bytes",
         default="1048576",  # 1MB
         validator=validate_positive_int,
-        required=False,
-        description="Maximum webhook payload size in bytes"
+        required=False
     ),
     'WEBHOOK_RATE_LIMIT': EnvVar(
         name='WEBHOOK_RATE_LIMIT',
+        description="Maximum webhooks per minute",
         default="100",
         validator=validate_positive_int,
-        required=False,
-        description="Maximum webhooks per minute"
+        required=False
     ),
     'PROCESS_INTERVAL': EnvVar(
         name='PROCESS_INTERVAL',
+        description="Process queue every N seconds",
         default="1",
         validator=validate_positive_int,
-        required=False,
-        description="Process queue every N seconds"
+        required=False
     ),
     'MAX_ERROR_HISTORY': EnvVar(
         name='MAX_ERROR_HISTORY',
+        description="Maximum number of errors to keep in history",
         default="1000",
         validator=validate_positive_int,
-        required=False,
-        description="Maximum number of errors to keep in history"
+        required=False
     ),
 
     # Wallet Monitoring Configuration
     'WALLET_CHECK_INTERVAL': EnvVar(
         name='WALLET_CHECK_INTERVAL',
+        description="Interval to check wallets in seconds",
         default="300",
         validator=validate_positive_int,
-        required=False,
-        description="Interval to check wallets in seconds"
+        required=False
     ),
     'MIN_ADA_BALANCE': EnvVar(
         name='MIN_ADA_BALANCE',
+        description="Minimum ADA balance for alerts",
         default="5",
         validator=validate_positive_int,
-        required=False,
-        description="Minimum ADA balance for alerts"
+        required=False
     ),
     'MAX_TX_PER_HOUR': EnvVar(
         name='MAX_TX_PER_HOUR',
+        description="Maximum transactions per hour",
         default="10",
         validator=validate_positive_int,
-        required=False,
-        description="Maximum transactions per hour"
+        required=False
     ),
     'MINIMUM_YUMMI': EnvVar(
         name="Minimum YUMMI Balance",
+        description="Minimum YUMMI token balance required",
         default="1000",
         validator=validate_positive_int,
-        required=False,
-        description="Minimum YUMMI token balance required"
+        required=False
     ),
 
     # Maintenance Configuration
     'MAINTENANCE_HOUR': EnvVar(
         name='MAINTENANCE_HOUR',
+        description="Hour to run maintenance (24-hour format)",
         default="2",
         validator=validate_hour,
-        required=False,
-        description="Hour to run maintenance (24-hour format)"
+        required=False
     ),
     'MAINTENANCE_MINUTE': EnvVar(
         name='MAINTENANCE_MINUTE',
+        description="Minute to run maintenance",
         default="0",
         validator=validate_minute,
-        required=False,
-        description="Minute to run maintenance"
+        required=False
     ),
 
     # Asset Configuration
