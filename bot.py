@@ -46,56 +46,18 @@ from database import (
     execute_many,
     
     # Wallet management
-    validate_address,
     add_wallet,
     get_wallet_for_user,
     get_user_wallets,
-    get_wallet_info,
-    get_wallet_balance,
-    update_ada_balance,
     update_wallet_state,
     check_ada_balance,
+    update_ada_balance,
     update_token_balances,
-    
-    # Stake address management
+    get_wallet_balance,
+    update_utxo_state,
     get_stake_address,
     update_stake_address,
-    get_user_id_for_stake_address,
-    get_addresses_for_stake,
-    
-    # Pool management
-    update_pool_for_stake,
-    update_stake_pool,
-    get_delegation_status,
-    update_delegation_status,
-    
-    # Transaction management
-    add_transaction,
-    get_transaction_metadata,
-    add_failed_transaction,
-    add_asset_history,
-    get_last_transactions,
-    get_last_dapp_tx,
-    update_last_dapp_tx,
-    get_dapp_interactions,
-    update_dapp_interaction,
-    is_token_change_processed,
-    add_processed_token_change,
-    
-    # Policy management
-    get_policy_expiry,
-    update_policy_expiry,
-    get_last_policy_check,
-    update_last_policy_check,
-    
-    # Monitoring
-    get_monitoring_since,
-    get_all_monitored_addresses,
-    get_new_tokens,
-    get_removed_nfts,
-    get_yummi_warning_count,
-    increment_yummi_warning,
-    reset_yummi_warning,
+    remove_wallet_for_user,
     
     # Notification settings
     get_notification_settings,
@@ -109,8 +71,8 @@ from database import (
     QueryError
 )
 from database_maintenance import DatabaseMaintenance
+from cardano.address_validation import validate_cardano_address
 from utils import (
-    validate_cardano_address,
     format_ada_amount,
     get_asset_info,
     parse_asset_id,
@@ -118,18 +80,7 @@ from utils import (
     get_policy_info,
     get_token_info,
     validate_policy_id,
-    validate_token_name,
-    validate_asset_id,
-    format_policy_id,
-    format_token_name,
-    format_asset_id,
-    get_stake_address,
-    get_pool_id,
-    get_pool_name,
-    get_pool_ticker,
-    get_pool_description,
-    get_pool_homepage,
-    get_pool_metadata
+    validate_token_name
 )
 
 import random
