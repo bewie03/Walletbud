@@ -1749,50 +1749,19 @@ if __name__ == "__main__":
         # Create bot instance
         bot = WalletBudBot()
         
-        # Check environment variables
-        await bot.check_environment()
+        # Create async startup function
+        async def init_bot():
+            # Check environment variables
+            await bot.check_environment()
+            
+            # Get port from environment for Heroku
+            port = int(os.getenv('PORT', 8080))
+            
+            # Start webhook server
+            await bot.start_webhook()
         
-        # Get port from environment for Heroku
-        port = int(os.getenv('PORT', 8080))
-        
-        # Start webhook server on 0.0.0.0 for Heroku
-        async def start_webhook():
-            """Start the webhook server with proper error handling and Heroku compatibility"""
-            try:
-                # Initialize aiohttp app
-                app = web.Application()
-                app.router.add_post('/webhook', bot.handle_webhook)
-                
-                # Set up runner with proper cleanup
-                runner = web.AppRunner(app, access_log=None)  # Disable access logging for performance
-                await runner.setup()
-                
-                # Get port from environment (Heroku sets PORT)
-                port = int(os.getenv("PORT", 8080))
-                
-                # Bind to 0.0.0.0 for Heroku
-                site = web.TCPSite(runner, "0.0.0.0", port)
-                
-                try:
-                    await site.start()
-                    logger.info(f"Webhook server started on port {port}")
-                except OSError as e:
-                    logger.error(f"Failed to bind to port {port}: {e}")
-                    # Try alternative port if 8080 is taken
-                    if port == 8080:
-                        alt_port = 8081
-                        site = web.TCPSite(runner, "0.0.0.0", alt_port)
-                        await site.start()
-                        logger.info(f"Webhook server started on alternative port {alt_port}")
-                
-                return runner, site
-                
-            except Exception as e:
-                logger.error(f"Failed to start webhook server: {e}")
-                raise
-        
-        # Run the bot and webhook server
-        loop.create_task(start_webhook())
+        # Run the bot with async initialization
+        loop.create_task(init_bot())
         bot.run(DISCORD_TOKEN)
         
     except Exception as e:
