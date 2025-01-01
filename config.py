@@ -645,6 +645,22 @@ ENV_VARS = {
     ),
 }
 
+# Notification settings
+NOTIFICATION_SETTINGS = {
+    'balance_alerts': {
+        'display_name': 'Balance Alerts',
+        'description': 'Get notified when your wallet balance changes'
+    },
+    'yummi_alerts': {
+        'display_name': 'YUMMI Alerts',
+        'description': 'Get notified when your YUMMI balance is low'
+    },
+    'system_alerts': {
+        'display_name': 'System Alerts',
+        'description': 'Get notified about system status and maintenance'
+    }
+}
+
 # Export configuration variables
 DISCORD_TOKEN = ENV_VARS['DISCORD_TOKEN'].get_value()
 APPLICATION_ID = ENV_VARS['APPLICATION_ID'].get_value()
