@@ -402,7 +402,7 @@ CREATE TABLE IF NOT EXISTS db_version (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Main tables
+-- Create wallets table first since it's referenced by other tables
 CREATE TABLE IF NOT EXISTS wallets (
     id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -413,28 +413,54 @@ CREATE TABLE IF NOT EXISTS wallets (
     utxo_state JSONB DEFAULT '{}',
     delegation_pool TEXT,
     last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_policy_check TIMESTAMP WITH TIME ZONE
 );
 
--- Create indices for wallets table
-CREATE INDEX IF NOT EXISTS idx_wallets_id ON wallets(id);
-CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
-CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
-CREATE INDEX IF NOT EXISTS idx_wallets_stake_address ON wallets(stake_address);
-CREATE INDEX IF NOT EXISTS idx_wallets_delegation_pool ON wallets(delegation_pool);
-CREATE INDEX IF NOT EXISTS idx_wallets_last_checked ON wallets(last_checked);
+-- Create indices for wallets table after the table is fully created
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_id') THEN
+        CREATE INDEX idx_wallets_id ON wallets(id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_user_id') THEN
+        CREATE INDEX idx_wallets_user_id ON wallets(user_id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_address') THEN
+        CREATE INDEX idx_wallets_address ON wallets(address);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_stake_address') THEN
+        CREATE INDEX idx_wallets_stake_address ON wallets(stake_address);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_delegation_pool') THEN
+        CREATE INDEX idx_wallets_delegation_pool ON wallets(delegation_pool);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_last_checked') THEN
+        CREATE INDEX idx_wallets_last_checked ON wallets(last_checked);
+    END IF;
+END $$;
 
 -- Add GiST index for JSONB fields for faster querying
-CREATE INDEX IF NOT EXISTS idx_wallets_token_balances ON wallets USING gin (token_balances);
-CREATE INDEX IF NOT EXISTS idx_wallets_utxo_state ON wallets USING gin (utxo_state);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_token_balances') THEN
+        CREATE INDEX idx_wallets_token_balances ON wallets USING gin (token_balances);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_utxo_state') THEN
+        CREATE INDEX idx_wallets_utxo_state ON wallets USING gin (utxo_state);
+    END IF;
+END $$;
 
+-- Create other tables that reference wallets
 CREATE TABLE IF NOT EXISTS delegation_status (
     stake_address TEXT PRIMARY KEY,
     pool_id TEXT,
     last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_delegation_status_stake_address ON delegation_status(stake_address);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_delegation_status_stake_address') THEN
+        CREATE INDEX idx_delegation_status_stake_address ON delegation_status(stake_address);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS notification_settings (
     user_id TEXT PRIMARY KEY,
@@ -447,7 +473,11 @@ CREATE TABLE IF NOT EXISTS notification_settings (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_notification_settings_user_id ON notification_settings(user_id);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_notification_settings_user_id') THEN
+        CREATE INDEX idx_notification_settings_user_id ON notification_settings(user_id);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS processed_rewards (
     stake_address TEXT NOT NULL,
@@ -457,8 +487,14 @@ CREATE TABLE IF NOT EXISTS processed_rewards (
     PRIMARY KEY (stake_address, epoch)
 );
 
-CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewards(stake_address);
-CREATE INDEX IF NOT EXISTS idx_processed_rewards_epoch ON processed_rewards(epoch);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_processed_rewards_stake_address') THEN
+        CREATE INDEX idx_processed_rewards_stake_address ON processed_rewards(stake_address);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_processed_rewards_epoch') THEN
+        CREATE INDEX idx_processed_rewards_epoch ON processed_rewards(epoch);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS processed_token_changes (
     wallet_id INTEGER REFERENCES wallets(id),
@@ -467,8 +503,14 @@ CREATE TABLE IF NOT EXISTS processed_token_changes (
     PRIMARY KEY (wallet_id, tx_hash)
 );
 
-CREATE INDEX IF NOT EXISTS idx_processed_token_changes_wallet ON processed_token_changes(wallet_id);
-CREATE INDEX IF NOT EXISTS idx_processed_token_changes_tx ON processed_token_changes(tx_hash);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_processed_token_changes_wallet') THEN
+        CREATE INDEX idx_processed_token_changes_wallet ON processed_token_changes(wallet_id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_processed_token_changes_tx') THEN
+        CREATE INDEX idx_processed_token_changes_tx ON processed_token_changes(tx_hash);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS failed_transactions (
     id SERIAL PRIMARY KEY,
@@ -479,9 +521,17 @@ CREATE TABLE IF NOT EXISTS failed_transactions (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet ON failed_transactions(wallet_id);
-CREATE INDEX IF NOT EXISTS idx_failed_transactions_tx ON failed_transactions(tx_hash);
-CREATE INDEX IF NOT EXISTS idx_failed_transactions_error ON failed_transactions(error_type);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_failed_transactions_wallet') THEN
+        CREATE INDEX idx_failed_transactions_wallet ON failed_transactions(wallet_id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_failed_transactions_tx') THEN
+        CREATE INDEX idx_failed_transactions_tx ON failed_transactions(tx_hash);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_failed_transactions_error') THEN
+        CREATE INDEX idx_failed_transactions_error ON failed_transactions(error_type);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS asset_history (
     id SERIAL PRIMARY KEY,
@@ -494,10 +544,20 @@ CREATE TABLE IF NOT EXISTS asset_history (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_asset_history_wallet ON asset_history(wallet_id);
-CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id);
-CREATE INDEX IF NOT EXISTS idx_asset_history_tx ON asset_history(tx_hash);
-CREATE INDEX IF NOT EXISTS idx_asset_history_action ON asset_history(action);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_asset_history_wallet') THEN
+        CREATE INDEX idx_asset_history_wallet ON asset_history(wallet_id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_asset_history_asset') THEN
+        CREATE INDEX idx_asset_history_asset ON asset_history(asset_id);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_asset_history_tx') THEN
+        CREATE INDEX idx_asset_history_tx ON asset_history(tx_hash);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_asset_history_action') THEN
+        CREATE INDEX idx_asset_history_action ON asset_history(action);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS policy_expiry (
     policy_id TEXT PRIMARY KEY,
@@ -505,7 +565,11 @@ CREATE TABLE IF NOT EXISTS policy_expiry (
     last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_policy_expiry_slot ON policy_expiry(expiry_slot);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_policy_expiry_slot') THEN
+        CREATE INDEX idx_policy_expiry_slot ON policy_expiry(expiry_slot);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS dapp_interactions (
     wallet_id INTEGER REFERENCES wallets(id),
@@ -514,7 +578,11 @@ CREATE TABLE IF NOT EXISTS dapp_interactions (
     PRIMARY KEY (wallet_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_dapp_interactions_tx ON dapp_interactions(last_tx);
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_dapp_interactions_tx') THEN
+        CREATE INDEX idx_dapp_interactions_tx ON dapp_interactions(last_tx);
+    END IF;
+END $$;
 """
 
 # Database version tracking
@@ -1572,9 +1640,7 @@ async def get_yummi_warning_count(wallet_id: int) -> int:
         
         return await execute_with_retry(_get_yummi_warning_count, wallet_id)
     except Exception as e:
-        logger.error(f"Error getting YUMMI warning count: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error getting YUMMI warning count: {e}")
         return 0
 
 async def increment_yummi_warning(wallet_id: int) -> int:
@@ -1603,9 +1669,7 @@ async def increment_yummi_warning(wallet_id: int) -> int:
         
         return await execute_with_retry(_increment_yummi_warning, wallet_id)
     except Exception as e:
-        logger.error(f"Error incrementing YUMMI warning: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error incrementing YUMMI warning: {e}")
         return 0
 
 async def reset_yummi_warning(wallet_id: int) -> bool:
@@ -1630,9 +1694,7 @@ async def reset_yummi_warning(wallet_id: int) -> bool:
         
         return await execute_with_retry(_reset_yummi_warning, wallet_id)
     except Exception as e:
-        logger.error(f"Error resetting YUMMI warning: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error resetting YUMMI warning: {e}")
         return False
 
 async def get_delegation_status(address: str):
@@ -1658,9 +1720,7 @@ async def get_delegation_status(address: str):
         
         return await execute_with_retry(_get_delegation_status, address)
     except Exception as e:
-        logger.error(f"Error getting delegation status: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error getting delegation status: {e}")
         return None
 
 async def update_delegation_status(address: str, pool_id: str):
@@ -1689,9 +1749,7 @@ async def update_delegation_status(address: str, pool_id: str):
         
         return await execute_with_retry(_update_delegation_status, address, pool_id)
     except Exception as e:
-        logger.error(f"Error updating delegation status: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error updating delegation status: {e}")
         return False
 
 async def get_policy_expiry(policy_id: str):
@@ -1717,9 +1775,7 @@ async def get_policy_expiry(policy_id: str):
         
         return await execute_with_retry(_get_policy_expiry, policy_id)
     except Exception as e:
-        logger.error(f"Error getting policy expiry: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error getting policy expiry: {e}")
         return None
 
 async def update_policy_expiry(policy_id: str, expiry_slot: int):
@@ -1748,9 +1804,7 @@ async def update_policy_expiry(policy_id: str, expiry_slot: int):
         
         return await execute_with_retry(_update_policy_expiry, policy_id, expiry_slot)
     except Exception as e:
-        logger.error(f"Error updating policy expiry: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error updating policy expiry: {e}")
         return False
 
 async def get_dapp_interactions(address: str) -> str:
@@ -1778,9 +1832,7 @@ async def get_dapp_interactions(address: str) -> str:
         
         return await execute_with_retry(_get_dapp_interactions, address)
     except Exception as e:
-        logger.error(f"Error getting DApp interactions for {address[:20]}: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error getting DApp interactions for {address[:20]}: {e}")
         return None
 
 async def update_dapp_interaction(address: str, tx_hash: str) -> bool:
@@ -1808,9 +1860,7 @@ async def update_dapp_interaction(address: str, tx_hash: str) -> bool:
         
         return await execute_with_retry(_update_dapp_interaction, address, tx_hash)
     except Exception as e:
-        logger.error(f"Error updating DApp interaction for {address[:20]}: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error updating DApp interaction for {address[:20]}: {e}")
         return False
 
 async def get_last_dapp_tx(address: str) -> Optional[str]:
@@ -1836,9 +1886,7 @@ async def get_last_dapp_tx(address: str) -> Optional[str]:
         
         return await execute_with_retry(_get_last_dapp_tx, address)
     except Exception as e:
-        logger.error(f"Error getting last DApp transaction: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error getting last DApp transaction: {e}")
         return None
 
 async def update_last_dapp_tx(address: str, tx_hash: str) -> bool:
@@ -1864,9 +1912,7 @@ async def update_last_dapp_tx(address: str, tx_hash: str) -> bool:
         
         return await execute_with_retry(_update_last_dapp_tx, address, tx_hash)
     except Exception as e:
-        logger.error(f"Error updating last DApp transaction: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Error updating last DApp transaction: {e}")
         return False
 
 async def add_failed_transaction(wallet_id: int, tx_hash: str, error_type: str, error_details: dict) -> bool:
@@ -1886,7 +1932,7 @@ async def add_failed_transaction(wallet_id: int, tx_hash: str, error_type: str, 
         
         return await execute_with_retry(_add_failed_transaction, wallet_id, tx_hash, error_type, error_details)
     except Exception as e:
-        logger.error(f"Error adding failed transaction: {str(e)}")
+        logger.error(f"Error adding failed transaction: {e}")
         return False
 
 async def add_asset_history(
@@ -1917,7 +1963,7 @@ async def add_asset_history(
         
         return await execute_with_retry(_add_asset_history, wallet_id, asset_id, tx_hash, action, quantity, metadata)
     except Exception as e:
-        logger.error(f"Error adding asset history: {str(e)}")
+        logger.error(f"Error adding asset history: {e}")
         return False
 
 async def initialize_notification_settings(user_id: str):
@@ -2024,7 +2070,7 @@ async def get_last_policy_check(address: str):
         
         return await execute_with_retry(_get_last_policy_check, address)
     except Exception as e:
-        logger.error(f"Error getting last policy check: {str(e)}")
+        logger.error(f"Error getting last policy check: {e}")
         return None
 
 async def update_last_policy_check(address: str):
@@ -2046,7 +2092,7 @@ async def update_last_policy_check(address: str):
         
         await execute_with_retry(_update_last_policy_check, address)
     except Exception as e:
-        logger.error(f"Error updating last policy check: {str(e)}")
+        logger.error(f"Error updating last policy check: {e}")
 
 async def get_monitoring_since(address: str) -> datetime:
     """Get when monitoring started for a wallet
@@ -2070,7 +2116,7 @@ async def get_monitoring_since(address: str) -> datetime:
         
         return await execute_with_retry(_get_monitoring_since, address)
     except Exception as e:
-        logger.error(f"Error getting monitoring since: {str(e)}")
+        logger.error(f"Error getting monitoring since: {e}")
         return None
 
 async def get_all_monitored_addresses(pool):
@@ -2111,7 +2157,7 @@ async def get_addresses_for_stake(stake_address: str) -> list[str]:
         
         return await execute_with_retry(_get_addresses_for_stake, stake_address)
     except Exception as e:
-        logger.error(f"Error getting addresses for stake: {str(e)}")
+        logger.error(f"Error getting addresses for stake: {e}")
         return []
 
 async def update_pool_for_stake(stake_address: str, pool_id: str):
@@ -2131,7 +2177,7 @@ async def update_pool_for_stake(stake_address: str, pool_id: str):
         
         return await execute_with_retry(_update_pool_for_stake, stake_address, pool_id)
     except Exception as e:
-        logger.error(f"Error updating pool for stake address: {str(e)}")
+        logger.error(f"Error updating pool for stake address: {e}")
         return False
 
 async def get_wallet_info(address: str) -> dict:
@@ -2162,7 +2208,7 @@ async def get_wallet_info(address: str) -> dict:
         
         return await execute_with_retry(_get_wallet_info, address)
     except Exception as e:
-        logger.error(f"Error getting wallet info: {str(e)}")
+        logger.error(f"Error getting wallet info: {e}")
         return None
 
 async def get_user_wallets(user_id: int) -> list:
@@ -2193,7 +2239,7 @@ async def get_user_wallets(user_id: int) -> list:
         
         return await execute_with_retry(_get_user_wallets, user_id)
     except Exception as e:
-        logger.error(f"Error getting user wallets: {str(e)}")
+        logger.error(f"Error getting user wallets: {e}")
         return []
 
 async def update_stake_pool(stake_address: str, pool_id: str) -> bool:
@@ -2215,7 +2261,7 @@ async def update_stake_pool(stake_address: str, pool_id: str) -> bool:
         
         return await execute_with_retry(_update_stake_pool, stake_address, pool_id)
     except Exception as e:
-        logger.error(f"Error updating stake pool: {str(e)}")
+        logger.error(f"Error updating stake pool: {e}")
         return False
 
 async def add_wallet_for_user(user_id: str, address: str, stake_address: str = None):
@@ -2243,7 +2289,7 @@ async def add_wallet_for_user(user_id: str, address: str, stake_address: str = N
         
         return await execute_with_retry(_add_wallet_for_user, user_id, address, stake_address)
     except Exception as e:
-        logger.error(f"Failed to add wallet: {str(e)}")
+        logger.error(f"Failed to add wallet: {e}")
         return False
 
 async def remove_wallet_for_user(user_id: str, address: str):
@@ -2269,7 +2315,7 @@ async def remove_wallet_for_user(user_id: str, address: str):
         
         return await execute_with_retry(_remove_wallet_for_user, user_id, address)
     except Exception as e:
-        logger.error(f"Failed to remove wallet: {str(e)}")
+        logger.error(f"Failed to remove wallet: {e}")
         return False
 
 async def update_notification_settings(user_id: str, setting: str, enabled: bool):
@@ -2297,7 +2343,7 @@ async def update_notification_settings(user_id: str, setting: str, enabled: bool
         
         return await execute_with_retry(_update_notification_settings, user_id, setting, enabled)
     except Exception as e:
-        logger.error(f"Failed to update notification setting: {str(e)}")
+        logger.error(f"Failed to update notification setting: {e}")
         return False
 
 async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
@@ -2323,7 +2369,7 @@ async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
         
         return await execute_with_retry(_get_user_id_for_stake_address, stake_address)
     except Exception as e:
-        logger.error(f"Error getting user ID for stake address {stake_address}: {str(e)}")
+        logger.error(f"Error getting user ID for stake address {stake_address}: {e}")
         return None
 
 async def execute_query(query: str, *args) -> None:
