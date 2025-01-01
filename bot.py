@@ -346,13 +346,14 @@ class WalletBudBot(commands.Bot):
         
     async def _cleanup_database(self):
         """Cleanup database connections"""
-        try:
-            pool = await get_pool()
-            await pool.close()
-            logger.info("Database pool closed successfully")
-        except Exception as e:
-            logger.error(f"Error closing database pool: {e}")
-            
+        if hasattr(self, 'pool') and self.pool:
+            try:
+                await self.pool.close()
+                self.pool = None
+                logger.info("Database pool cleaned up")
+            except Exception as e:
+                logger.error(f"Error cleaning up database pool: {e}")
+                
     async def _cleanup_webhook(self):
         """Cleanup webhook server and queue"""
         try:
@@ -377,16 +378,16 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error cleaning up webhook components: {e}")
             
     async def _cleanup_session(self):
-        """Cleanup aiohttp session"""
-        try:
-            if self.session:
-                await self.session.close()
-            if self.connector:
-                await self.connector.close()
-            logger.info("HTTP session closed successfully")
-        except Exception as e:
-            logger.error(f"Error closing HTTP session: {e}")
-            
+        """Cleanup HTTP session"""
+        if hasattr(self, 'session') and self.session:
+            try:
+                if not self.session.closed:
+                    await self.session.close()
+                self.session = None
+                logger.info("HTTP session cleaned up")
+            except Exception as e:
+                logger.error(f"Error cleaning up HTTP session: {e}")
+
     async def _cleanup_tasks(self):
         """Cleanup background tasks"""
         try:
@@ -406,7 +407,8 @@ class WalletBudBot(commands.Bot):
         """Cleanup Blockfrost session"""
         if hasattr(self, 'blockfrost_session') and self.blockfrost_session:
             try:
-                await self.blockfrost_session.close()
+                if not self.blockfrost_session.closed:
+                    await self.blockfrost_session.close()
                 self.blockfrost_session = None
                 logger.info("Blockfrost session cleaned up")
             except Exception as e:
@@ -414,45 +416,44 @@ class WalletBudBot(commands.Bot):
 
     async def close(self):
         """Clean up resources and perform graceful shutdown"""
+        logger.info("Starting graceful shutdown...")
+        
         try:
-            logger.debug("Starting graceful shutdown...")
+            # Cancel background tasks first
+            await self._cancel_background_tasks()
             
-            # Cancel background tasks
-            if hasattr(self, '_webhook_task'):
-                self._webhook_task.cancel()
-                try:
-                    await self._webhook_task
-                except asyncio.CancelledError:
-                    pass
-                    
-            if hasattr(self, '_webhook_processor'):
-                self._webhook_processor.cancel()
-                try:
-                    await self._webhook_processor
-                except asyncio.CancelledError:
-                    pass
-                    
-            # Stop tasks
-            self.check_yummi_balances.cancel()
-            self.health_check_task.cancel()
+            # Cleanup components in order
+            await self._cleanup_blockfrost()
+            await self._cleanup_database()
+            await self._cleanup_session()
             
-            # Clean up resources
-            if hasattr(self, 'session') and self.session:
-                await self.session.close()
-                logger.info("HTTP session closed successfully")
-                
-            if hasattr(self, 'pool') and self.pool:
-                await self.pool.close()
-                logger.info("Database pool closed successfully")
-                
-            # Call parent's close method
+            # Finally call parent close
             await super().close()
             
-            logger.info("Graceful shutdown completed successfully")
+            logger.info("Graceful shutdown completed")
             
         except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
-            raise
+            logger.error(f"Error during graceful shutdown: {e}")
+            # Still try to call parent close
+            try:
+                await super().close()
+            except Exception as parent_error:
+                logger.error(f"Error in parent close: {parent_error}")
+
+    async def _cleanup(self):
+        """Cleanup handler that runs on bot shutdown"""
+        try:
+            logger.info("Running cleanup handler...")
+            
+            # Ensure all sessions are closed
+            await self._cleanup_blockfrost()
+            await self._cleanup_database()
+            await self._cleanup_session()
+            
+            logger.info("Cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
             
     async def setup_hook(self):
         """Set up the bot's background tasks and signal handlers"""
@@ -1487,6 +1488,37 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Environment validation failed: {e}")
             return False
+
+    async def _cancel_background_tasks(self):
+        """Cancel all background tasks"""
+        try:
+            logger.info("Cancelling background tasks...")
+            
+            # Cancel webhook tasks
+            if hasattr(self, '_webhook_task'):
+                self._webhook_task.cancel()
+                try:
+                    await self._webhook_task
+                except asyncio.CancelledError:
+                    pass
+                    
+            if hasattr(self, '_webhook_processor'):
+                self._webhook_processor.cancel()
+                try:
+                    await self._webhook_processor
+                except asyncio.CancelledError:
+                    pass
+            
+            # Cancel other background tasks
+            if hasattr(self, 'check_yummi_balances'):
+                self.check_yummi_balances.cancel()
+            if hasattr(self, 'health_check_task'):
+                self.health_check_task.cancel()
+                
+            logger.info("Background tasks cancelled")
+            
+        except Exception as e:
+            logger.error(f"Error cancelling background tasks: {e}")
 
     async def _check_yummi_balances(self):
         """Check YUMMI token balances with proper concurrency control"""
