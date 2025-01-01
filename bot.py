@@ -477,9 +477,17 @@ class WalletBudBot(commands.Bot):
             await self.setup_admin_channel()
             
             # Load cogs
-            self.load_extension("cogs.system_commands")
-            self.load_extension("cogs.wallet_commands")
+            await self.load_extension("cogs.system_commands")
+            await self.load_extension("cogs.wallet_commands")
             logger.info("Loaded all cogs")
+            
+            # Sync command tree with Discord
+            try:
+                await self.tree.sync()
+                logger.info("Synced command tree with Discord")
+            except Exception as e:
+                logger.error(f"Failed to sync command tree: {e}")
+                raise
             
             # Start background tasks
             self.health_check_task.start()
@@ -1102,7 +1110,7 @@ class WalletBudBot(commands.Bot):
                 type=discord.ActivityType.watching,
                 name="Cardano wallets | /help"
             )
-            await self.change_presence(status=discord.Status.online, activity=activity)
+            await self.change_presence(activity=activity, status=discord.Status.online)
             
             # Notify admin channel
             if self.admin_channel:

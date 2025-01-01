@@ -39,6 +39,13 @@ class WalletCommands(commands.Cog):
     def cog_unload(self):
         self.cleanup_cache.cancel()
 
+    async def cog_load(self):
+        """Register commands when cog is loaded"""
+        self.bot.tree.add_command(self.add)
+        self.bot.tree.add_command(self.remove)
+        self.bot.tree.add_command(self.list_wallets)
+        self.bot.tree.add_command(self.balance)
+
     @tasks.loop(minutes=5)
     async def cleanup_cache(self):
         """Cleanup expired cache entries"""
