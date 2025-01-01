@@ -225,6 +225,9 @@ class WalletBudBot(commands.Bot):
         """Initialize the bot with required intents"""
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.guilds = True
+        intents.guild_messages = True
+        intents.dm_messages = True
         
         # Initialize the bot with required parameters
         super().__init__(
@@ -302,42 +305,34 @@ class WalletBudBot(commands.Bot):
     async def setup_hook(self):
         """Set up the bot's background tasks"""
         try:
-            logger.debug("Starting background tasks...")
+            logger.info("Setting up bot...")
             
             # Initialize database
             await self.init_database()
+            logger.info("Database initialized")
             
-            # Wait for bot to be ready before setting up admin channel
-            await self.wait_until_ready()
+            # Initialize Blockfrost client
+            await self.init_blockfrost()
+            logger.info("Blockfrost client initialized")
             
             # Set up admin channel
-            if not await self.setup_admin_channel():
-                logger.error("Failed to set up admin channel")
-            
-            # Initialize Blockfrost
-            if not await self.init_blockfrost():
-                logger.error("Failed to initialize Blockfrost API")
+            if self.admin_channel_id:
+                await self.setup_admin_channel()
+                logger.info("Admin channel setup complete")
             
             # Start background tasks
-            if hasattr(self, 'pool') and self.pool:
-                try:
-                    self.check_yummi_balances.start()
-                    logger.info("YUMMI balance check task started")
-                except Exception as e:
-                    logger.error(f"Could not start YUMMI balance check: {e}")
-            
-            # Start connection check task
-            self.check_connection_task = self.loop.create_task(self._check_connection_loop())
-            logger.info("Connection check task started")
+            self._check_connection_loop.start()
+            self.check_yummi_balances.start()
+            logger.info("Background tasks started")
             
             # Update health metrics
-            await self.update_health_metrics('start_time', datetime.now().isoformat())
-            logger.info("Bot initialization complete")
+            self.health_metrics['start_time'] = datetime.now().isoformat()
+            logger.info("Bot setup complete")
             
         except Exception as e:
-            logger.error(f"Failed to start background tasks: {str(e)}")
-            logger.warning("Continuing without background tasks...")
-            
+            logger.error(f"Error in setup_hook: {str(e)}", exc_info=True)
+            raise
+
     async def close(self):
         """Clean up resources when the bot is shutting down."""
         try:
@@ -1909,7 +1904,7 @@ class WalletBudBot(commands.Bot):
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
             raise
-
+                
 if __name__ == "__main__":
     try:
         # Configure logging for production
