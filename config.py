@@ -149,21 +149,13 @@ def validate_blockfrost_id(value: str, name: str) -> str:
     return value
 
 def validate_blockfrost_project_id(value: str, name: str) -> str:
-    """Validate Blockfrost project ID format and network"""
-    networks = ['mainnet', 'testnet', 'preview', 'preprod']
-    if not any(value.startswith(network) for network in networks):
-        raise ValueError(f"{name}: Project ID must start with one of: {', '.join(networks)}")
+    """Validate Blockfrost project ID format"""
+    if not value:
+        raise ValueError(f"{name}: Project ID cannot be empty")
     
-    # Ensure URL matches project ID network
-    network = next(n for n in networks if value.startswith(n))
-    expected_url = f'https://cardano-{network}.blockfrost.io/api/v0'
-    current_url = os.getenv('BLOCKFROST_BASE_URL')
-    if current_url and current_url != expected_url:
-        raise ValueError(f"{name}: Project ID network ({network}) does not match base URL network")
-    
-    # Validate format
-    if not re.match(f'^({"|".join(networks)})[a-zA-Z0-9]{{32}}$', value):
-        raise ValueError(f"{name}: Invalid project ID format. Expected format: network + 32 alphanumeric characters")
+    # Only validate that it's not empty and contains valid characters
+    if not re.match('^[a-zA-Z0-9_-]+$', value):
+        raise ValueError(f"{name}: Project ID can only contain alphanumeric characters, underscores, and hyphens")
     
     return value
 
