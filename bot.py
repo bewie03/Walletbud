@@ -1,6 +1,7 @@
 import os
 import re
 import ssl
+import sys
 import time
 import json
 import uuid
@@ -10,6 +11,7 @@ import logging
 import discord
 import aiohttp
 import asyncpg
+import requests
 import traceback
 import hmac
 import hashlib
@@ -20,11 +22,7 @@ from aiohttp import web
 from discord.ext import commands, tasks
 from typing import Dict, List, Any, Optional, Union, Callable
 from collections import defaultdict
-
-import discord
-from discord import app_commands
-from blockfrost import BlockFrostApi, ApiUrls
-from blockfrost.api.cardano.network import network
+from urllib3.exceptions import InsecureRequestWarning
 from database import (
     get_pool,
     add_wallet_for_user,
@@ -38,8 +36,15 @@ from database import (
     init_db,
     get_all_monitored_addresses,
     get_addresses_for_stake,
-    update_pool_for_stake
+    update_pool_for_stake,
+    get_database_url,
+    DatabaseError
 )
+
+import discord
+from discord import app_commands
+from blockfrost import BlockFrostApi, ApiUrls
+from blockfrost.api.cardano.network import network
 from database_maintenance import DatabaseMaintenance
 from webhook_queue import WebhookQueue
 from decorators import dm_only, has_blockfrost, command_cooldown
@@ -296,8 +301,21 @@ class WalletBudBot(commands.Bot):
     async def setup_hook(self):
         """Set up the bot's background tasks"""
         try:
+            # Validate required environment variables
+            required_vars = ['DISCORD_TOKEN', 'DATABASE_URL', 'BLOCKFROST_PROJECT_ID', 'BLOCKFROST_BASE_URL']
+            missing_vars = [var for var in required_vars if not os.getenv(var)]
+            if missing_vars:
+                error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            
             # Initialize critical components with proper error handling
-            await self.init_database()
+            try:
+                await self.init_database()
+            except Exception as e:
+                logger.error(f"Failed to initialize database: {e}")
+                raise  # Re-raise to prevent bot from starting with broken database
+                
             await self.setup_admin_channel()
             
             try:
@@ -369,44 +387,93 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error during cleanup: {str(e)}")
 
     async def init_database(self):
-        """Initialize database connection pool"""
-        try:
-            # Create connection pool
-            self.db_pool = await asyncpg.create_pool(
-                os.getenv('DATABASE_URL'),
-                min_size=5,
-                max_size=20,
-                command_timeout=60
-            )
-            
-            # Test connection
-            async with self.db_pool.acquire() as conn:
-                await conn.execute('SELECT 1')
+        """Initialize database connection pool and schema"""
+        MAX_RETRIES = 3
+        RETRY_DELAY = 5
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Get validated database URL
+                database_url = get_database_url()
                 
-            logger.info("Database connection test successful")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize database: {e}")
-            await self.send_admin_alert(f"Failed to initialize database: {e}")
-            return False
+                # Create SSL context for database
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                # Create connection pool
+                self.pool = await asyncpg.create_pool(
+                    database_url,
+                    min_size=5,
+                    max_size=20,
+                    command_timeout=60,
+                    ssl=ssl_context
+                )
+                
+                # Test connection and initialize schema
+                async with self.pool.acquire() as conn:
+                    # Test basic connectivity
+                    await conn.execute('SELECT 1')
+                    
+                    # Initialize database schema
+                    try:
+                        await init_db(conn)
+                        logger.info("Database schema initialized successfully")
+                    except DatabaseError as e:
+                        logger.error(f"Failed to initialize database schema: {e}")
+                        await self.send_admin_alert(f"🚨 Database schema initialization failed: {e}")
+                        raise
+                    
+                    logger.info("Database connection and schema initialization successful")
+                    return True
+                    
+            except Exception as e:
+                logger.error(f"Database initialization attempt {attempt + 1} failed: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    logger.info(f"Retrying in {RETRY_DELAY} seconds...")
+                    await asyncio.sleep(RETRY_DELAY)
+                else:
+                    logger.error("All database initialization attempts failed")
+                    await self.send_admin_alert(
+                        f"🚨 Critical: Database initialization failed after {MAX_RETRIES} attempts: {e}"
+                    )
+                    raise
+        
+        return False
             
     async def check_database(self):
         """Check database connection and reconnect if needed"""
         try:
-            if not hasattr(self, 'pool') or not self.pool:
+            if not self.pool:
+                logger.warning("Database pool not initialized, attempting to initialize...")
                 await self.init_database()
                 
             # Test the connection with a simple query
             async with self.pool.acquire() as conn:
-                await conn.fetchval('SELECT 1')
+                await conn.execute('SELECT 1')
+                logger.debug("Database connection check successful")
+                return True
                 
-            self.update_health_metrics('last_db_query')
-            return None
-            
         except Exception as e:
-            logger.error(f"Database connection error: {str(e)}")
-            raise  # Re-raise the exception for health check to handle
+            logger.error(f"Database connection check failed: {e}")
+            await self.send_admin_alert(f"⚠️ Database connection lost: {e}")
+            
+            # Try to clean up old pool
+            if self.pool:
+                try:
+                    await self.pool.close()
+                except Exception as close_error:
+                    logger.error(f"Error closing pool: {close_error}")
+                self.pool = None
+            
+            # Try to reconnect
+            try:
+                await self.init_database()
+                logger.info("Database reconnection successful")
+                return True
+            except Exception as reconnect_error:
+                logger.error(f"Database reconnection failed: {reconnect_error}")
+                return False
 
     async def rate_limited_request(self, func, *args, **kwargs):
         """Execute a rate-limited request to Blockfrost API with improved error handling"""

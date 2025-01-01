@@ -41,46 +41,126 @@ _pool_creation_time = None
 _pool_max_age = timedelta(hours=1)  # Recreate pool every hour
 _pool_lock = asyncio.Lock()
 _pool = None
+_last_error_time = None
+_error_threshold = timedelta(minutes=5)  # Time window for error counting
+_error_count = 0
+_max_errors = 3  # Max errors before forcing pool recreation
 
 async def get_pool():
     """Get database connection pool with Heroku PostgreSQL SSL configuration"""
-    global _pool
+    global _pool, _pool_creation_time, _error_count, _last_error_time
+    
     try:
-        if not _pool:
-            # Parse DATABASE_URL
-            db_url = os.getenv('DATABASE_URL')
-            if not db_url:
-                raise ValueError("DATABASE_URL environment variable not set")
+        async with _pool_lock:
+            current_time = datetime.now()
             
-            # For Heroku PostgreSQL, we use their SSL configuration
-            _pool = await asyncpg.create_pool(
-                db_url,
-                min_size=1,
-                max_size=10,
-                ssl='require',  # This tells PostgreSQL to use SSL without verification
-                command_timeout=60,
-                server_settings={'application_name': 'WalletBud'}
+            # Check if we need to recreate the pool
+            should_recreate = (
+                not _pool or
+                not _pool_creation_time or
+                current_time - _pool_creation_time > _pool_max_age or
+                (_error_count >= _max_errors and 
+                 _last_error_time and 
+                 current_time - _last_error_time < _error_threshold)
             )
-            logger.info("Database pool created successfully with SSL")
-        return _pool
+            
+            if should_recreate:
+                logger.info("Creating new database connection pool")
+                
+                # Clean up old pool if it exists
+                if _pool:
+                    try:
+                        await _pool.close()
+                    except Exception as e:
+                        logger.warning(f"Error closing old pool: {e}")
+                
+                try:
+                    # Parse DATABASE_URL
+                    db_url = os.getenv('DATABASE_URL')
+                    if not db_url:
+                        raise ValueError("DATABASE_URL environment variable not set")
+                    
+                    # Convert postgres:// to postgresql:// if needed
+                    if db_url.startswith('postgres://'):
+                        db_url = 'postgresql://' + db_url[len('postgres://'):]
+                    
+                    # Set up SSL context
+                    ssl_context = ssl.create_default_context(cafile=certifi.where())
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+                    
+                    # Create new pool with proper configuration
+                    _pool = await asyncpg.create_pool(
+                        db_url,
+                        min_size=DB_CONFIG['MIN_POOL_SIZE'],
+                        max_size=DB_CONFIG['MAX_POOL_SIZE'],
+                        max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
+                        command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
+                        ssl=ssl_context,
+                        server_settings={
+                            'application_name': 'walletbud',
+                            'statement_timeout': str(DB_CONFIG['TRANSACTION_TIMEOUT'] * 1000),
+                            'idle_in_transaction_session_timeout': '300000'  # 5 minutes
+                        }
+                    )
+                    
+                    if not _pool:
+                        raise ConnectionError("Failed to create connection pool")
+                    
+                    # Reset error tracking on successful pool creation
+                    _pool_creation_time = current_time
+                    _error_count = 0
+                    _last_error_time = None
+                    
+                    logger.info("Successfully created new database connection pool")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to create connection pool: {str(e)}")
+                    if hasattr(e, '__dict__'):
+                        logger.error(f"Error details: {e.__dict__}")
+                    raise ConnectionError(f"Database connection failed: {str(e)}")
+            
+            # Test pool with a simple query
+            try:
+                async with _pool.acquire() as conn:
+                    await conn.fetchval('SELECT 1')
+            except Exception as e:
+                # Track error
+                _error_count += 1
+                _last_error_time = current_time
+                logger.error(f"Pool test query failed: {str(e)}")
+                raise
+            
+            return _pool
+            
     except Exception as e:
-        logger.error(f"Failed to create database pool: {str(e)}")
+        logger.error(f"Error in get_pool: {str(e)}")
         if hasattr(e, '__dict__'):
             logger.error(f"Error details: {e.__dict__}")
-        raise ConnectionError(f"Database connection failed: {str(e)}")
+        raise
 
 async def reset_pool():
     """Reset the connection pool with proper cleanup"""
-    global _pool, _pool_creation_time
+    global _pool, _pool_creation_time, _error_count, _last_error_time
     
-    async with _pool_lock:
-        if _pool:
-            try:
-                await _pool.close()
-            except Exception as e:
-                logger.error(f"Error closing pool: {e}")
-        _pool = None
-        _pool_creation_time = None
+    try:
+        async with _pool_lock:
+            if _pool:
+                try:
+                    await _pool.close()
+                except Exception as e:
+                    logger.warning(f"Error closing pool during reset: {e}")
+                
+            _pool = None
+            _pool_creation_time = None
+            _error_count = 0
+            _last_error_time = None
+            
+            logger.info("Database connection pool reset successfully")
+            
+    except Exception as e:
+        logger.error(f"Error resetting pool: {str(e)}")
+        raise
 
 # Enhanced retry logic with exponential backoff
 RETRY_DELAYS = [1, 2, 5, 10, 30]  # Exponential backoff delays
@@ -176,13 +256,38 @@ class QueryError(DatabaseError):
     """Database query error"""
     pass
 
-async def init_db():
-    """Initialize database connection pool with proper error handling"""
+async def init_db(conn):
+    """Initialize database and run migrations
+    
+    Args:
+        conn: Database connection to use
+        
+    Raises:
+        DatabaseError: If initialization fails
+    """
     try:
-        await get_pool()
+        # Create version tracking tables first
+        await conn.execute(INIT_SQL)
+        
+        # Get current version
+        version = await get_db_version(conn)
+        if version is None:
+            # Fresh install - set initial version
+            await conn.execute(MIGRATIONS[1], 1)
+            version = 1
+        
+        # Run any pending migrations
+        await run_migrations(conn)
+        
+        # Verify schema
+        await check_database_schema(conn)
+        
+        logger.info(f"Database initialized at version {version}")
+        return True
+        
     except Exception as e:
-        logger.error(f"Failed to initialize database pool: {str(e)}")
-        raise ConnectionError(f"Database initialization failed: {str(e)}")
+        logger.error(f"Failed to initialize database: {e}")
+        raise DatabaseError(f"Database initialization failed: {e}")
 
 async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
     """Add a wallet with proper validation and error handling"""
@@ -275,6 +380,27 @@ async def update_notification_setting(user_id: str, setting: str, enabled: bool)
 
 # Database initialization SQL
 INIT_SQL = """
+-- Create version tracking tables first
+CREATE TABLE IF NOT EXISTS db_version (
+    version INTEGER NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (version)
+);
+
+CREATE TABLE IF NOT EXISTS migration_history (
+    version INTEGER NOT NULL,
+    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    success BOOLEAN,
+    error TEXT,
+    PRIMARY KEY (version)
+);
+
+-- Initialize version
+INSERT INTO db_version (version) VALUES (0)
+ON CONFLICT (version) DO NOTHING;
+
+-- Main tables
 DROP TABLE IF EXISTS wallets CASCADE;
 DROP TABLE IF EXISTS notification_settings CASCADE;
 
@@ -426,221 +552,216 @@ MIGRATIONS = {
     ]
 }
 
-async def get_db_version() -> int:
+async def get_db_version(conn) -> int:
     """Get current database version"""
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Check if version table exists
-            exists = await conn.fetchval("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
-                    AND table_name = 'db_version'
-                )
-            """)
+        # Check if version table exists
+        exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = 'db_version'
+            )
+        """)
+        
+        if not exists:
+            return 0
             
-            if not exists:
-                return 0
-                
-            version = await conn.fetchval("SELECT version FROM db_version")
-            return version or 0
+        version = await conn.fetchval("SELECT version FROM db_version")
+        return version or 0
             
     except Exception as e:
         logger.error(f"Failed to get database version: {str(e)}")
         return 0
 
-async def check_database_schema(pool) -> None:
+async def check_database_schema(conn) -> None:
     """Verify database schema including tables, columns, constraints and indices
     
     Raises:
         DatabaseError: If schema verification fails
     """
     try:
-        async with pool.acquire() as conn:
-            # Check tables
-            tables = await conn.fetch("""
-                SELECT table_name, column_name, data_type, 
-                       is_nullable, column_default,
-                       character_maximum_length
-                FROM information_schema.columns 
-                WHERE table_schema = 'public'
-                ORDER BY table_name, ordinal_position
-            """)
-            
-            # Check constraints
-            constraints = await conn.fetch("""
-                SELECT tc.table_name, tc.constraint_name, tc.constraint_type,
-                       kcu.column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu 
-                    ON tc.constraint_name = kcu.constraint_name
-                WHERE tc.table_schema = 'public'
-            """)
-            
-            # Check indices
-            indices = await conn.fetch("""
-                SELECT schemaname, tablename, indexname, indexdef
-                FROM pg_indexes
-                WHERE schemaname = 'public'
-            """)
-            
-            # Validate expected schema
-            expected_tables = {
-                'wallets': {
-                    'columns': {'id', 'user_id', 'address', 'stake_address', 'created_at'},
-                    'constraints': {'wallets_pkey', 'wallets_address_key'},
-                    'indices': {'idx_wallets_user_id', 'idx_wallets_address'}
-                },
-                'notification_settings': {
-                    'columns': {'user_id', 'ada_transactions', 'token_transfers', 
-                              'nft_updates', 'delegation_status', 'policy_updates'},
-                    'constraints': {'notification_settings_pkey'},
-                    'indices': {'idx_notification_settings_user_id'}
-                },
-                # Add other tables here
-            }
-            
-            # Verify tables and columns
-            found_tables = {t['table_name'] for t in tables}
-            for table, expected in expected_tables.items():
-                if table not in found_tables:
-                    raise DatabaseError(f"Missing required table: {table}")
-                    
-                found_columns = {t['column_name'] for t in tables if t['table_name'] == table}
-                missing_columns = expected['columns'] - found_columns
-                if missing_columns:
-                    raise DatabaseError(f"Missing columns in {table}: {missing_columns}")
-                    
-            # Verify constraints
-            for table, expected in expected_tables.items():
-                found_constraints = {c['constraint_name'] for c in constraints 
-                                  if c['table_name'] == table}
-                missing_constraints = expected['constraints'] - found_constraints
-                if missing_constraints:
-                    raise DatabaseError(f"Missing constraints in {table}: {missing_constraints}")
-                    
-            # Verify indices
-            for table, expected in expected_tables.items():
-                found_indices = {i['indexname'] for i in indices if i['tablename'] == table}
-                missing_indices = expected['indices'] - found_indices
-                if missing_indices:
-                    raise DatabaseError(f"Missing indices in {table}: {missing_indices}")
-                    
-            logger.info("Database schema verification completed successfully")
-            
+        # Check tables
+        tables = await conn.fetch("""
+            SELECT table_name, column_name, data_type, 
+                   is_nullable, column_default,
+                   character_maximum_length
+            FROM information_schema.columns 
+            WHERE table_schema = 'public'
+            ORDER BY table_name, ordinal_position
+        """)
+        
+        # Check constraints
+        constraints = await conn.fetch("""
+            SELECT tc.table_name, tc.constraint_name, tc.constraint_type,
+                   kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu 
+                ON tc.constraint_name = kcu.constraint_name
+            WHERE tc.table_schema = 'public'
+        """)
+        
+        # Check indices
+        indices = await conn.fetch("""
+            SELECT schemaname, tablename, indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+        """)
+        
+        # Validate expected schema
+        expected_tables = {
+            'wallets': {
+                'columns': {'id', 'user_id', 'address', 'stake_address', 'created_at'},
+                'constraints': {'wallets_pkey', 'wallets_address_key'},
+                'indices': {'idx_wallets_user_id', 'idx_wallets_address'}
+            },
+            'notification_settings': {
+                'columns': {'user_id', 'ada_transactions', 'token_transfers', 
+                          'nft_updates', 'delegation_status', 'policy_updates'},
+                'constraints': {'notification_settings_pkey'},
+                'indices': {'idx_notification_settings_user_id'}
+            },
+            # Add other tables here
+        }
+        
+        # Verify tables and columns
+        found_tables = {t['table_name'] for t in tables}
+        for table, expected in expected_tables.items():
+            if table not in found_tables:
+                raise DatabaseError(f"Missing required table: {table}")
+                
+            found_columns = {t['column_name'] for t in tables if t['table_name'] == table}
+            missing_columns = expected['columns'] - found_columns
+            if missing_columns:
+                raise DatabaseError(f"Missing columns in {table}: {missing_columns}")
+                
+        # Verify constraints
+        for table, expected in expected_tables.items():
+            found_constraints = {c['constraint_name'] for c in constraints 
+                              if c['table_name'] == table}
+            missing_constraints = expected['constraints'] - found_constraints
+            if missing_constraints:
+                raise DatabaseError(f"Missing constraints in {table}: {missing_constraints}")
+                
+        # Verify indices
+        for table, expected in expected_tables.items():
+            found_indices = {i['indexname'] for i in indices if i['tablename'] == table}
+            missing_indices = expected['indices'] - found_indices
+            if missing_indices:
+                raise DatabaseError(f"Missing indices in {table}: {missing_indices}")
+                
+        logger.info("Database schema verification completed successfully")
+        
     except asyncpg.PostgresError as e:
         raise DatabaseError(f"Schema verification failed: {str(e)}")
         
     except Exception as e:
         raise DatabaseError(f"Unexpected error during schema verification: {str(e)}")
 
-async def run_migrations(pool) -> None:
+async def run_migrations(conn) -> None:
     """Run database migrations with proper error handling and validation
     
     Raises:
         DatabaseError: If migrations fail
     """
     try:
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                # Get current version
+        async with conn.transaction():
+            # Ensure version tables exist
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS db_version (
+                    version INTEGER NOT NULL,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (version)
+                );
+
+                CREATE TABLE IF NOT EXISTS migration_history (
+                    version INTEGER NOT NULL,
+                    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    completed_at TIMESTAMP WITH TIME ZONE,
+                    success BOOLEAN,
+                    error TEXT,
+                    PRIMARY KEY (version)
+                );
+            """)
+            
+            # Get current version
+            try:
                 current_version = await conn.fetchval("""
                     SELECT version FROM db_version 
                     ORDER BY updated_at DESC LIMIT 1
                 """)
+            except asyncpg.UndefinedTableError:
+                # If table doesn't exist, start from version 0
+                current_version = 0
+                await conn.execute("""
+                    INSERT INTO db_version (version) VALUES (0)
+                """)
+            
+            if current_version is None:
+                current_version = 0
+                await conn.execute("""
+                    INSERT INTO db_version (version) VALUES (0)
+                """)
                 
-                if current_version is None:
-                    current_version = 0
-                    
-                # Get all migrations after current version
-                pending_migrations = {v: sql for v, sql in MIGRATIONS.items() 
-                                   if v > current_version}
+            # Get all migrations after current version
+            pending_migrations = {v: sql for v, sql in MIGRATIONS.items() 
+                               if v > current_version}
+            
+            if not pending_migrations:
+                logger.info(f"Database is up to date at version {current_version}")
+                return
                 
-                if not pending_migrations:
-                    logger.info(f"Database is up to date at version {current_version}")
-                    return
+            # Run migrations in version order
+            for version in sorted(pending_migrations.keys()):
+                logger.info(f"Running migration to version {version}")
+                
+                # Start migration
+                await conn.execute("""
+                    INSERT INTO migration_history (version, started_at)
+                    VALUES ($1, CURRENT_TIMESTAMP)
+                """, version)
+                
+                try:
+                    # Run migration SQL
+                    await conn.execute(pending_migrations[version], version)
                     
-                # Run migrations in version order
-                for version in sorted(pending_migrations.keys()):
-                    logger.info(f"Running migration to version {version}")
-                    
-                    # Start migration
+                    # Update version
                     await conn.execute("""
-                        INSERT INTO migration_history (version, started_at)
-                        VALUES ($1, CURRENT_TIMESTAMP)
+                        UPDATE db_version SET version = $1, 
+                        updated_at = CURRENT_TIMESTAMP
+                        WHERE version = $2
+                    """, version, current_version)
+                    
+                    # Mark migration as completed
+                    await conn.execute("""
+                        UPDATE migration_history 
+                        SET completed_at = CURRENT_TIMESTAMP,
+                            success = true
+                        WHERE version = $1
                     """, version)
                     
-                    try:
-                        # Run migration SQL
-                        await conn.execute(pending_migrations[version], version)
-                        
-                        # Update version
-                        await conn.execute("""
-                            UPDATE db_version SET version = $1, 
-                            updated_at = CURRENT_TIMESTAMP
-                        """, version)
-                        
-                        # Mark migration as completed
-                        await conn.execute("""
-                            UPDATE migration_history 
-                            SET completed_at = CURRENT_TIMESTAMP,
-                                success = true
-                            WHERE version = $1
-                        """, version)
-                        
-                        logger.info(f"Successfully migrated to version {version}")
-                        
-                    except Exception as e:
-                        # Log migration failure
-                        await conn.execute("""
-                            UPDATE migration_history 
-                            SET completed_at = CURRENT_TIMESTAMP,
-                                success = false,
-                                error = $2
-                            WHERE version = $1
-                        """, version, str(e))
-                        
-                        raise DatabaseError(
-                            f"Migration to version {version} failed: {str(e)}"
-                        )
-                        
+                    logger.info(f"Successfully migrated to version {version}")
+                    current_version = version
+                    
+                except Exception as e:
+                    # Log migration failure
+                    await conn.execute("""
+                        UPDATE migration_history 
+                        SET completed_at = CURRENT_TIMESTAMP,
+                            success = false,
+                            error = $2
+                        WHERE version = $1
+                    """, version, str(e))
+                    
+                    raise DatabaseError(
+                        f"Migration to version {version} failed: {str(e)}"
+                    )
+                    
     except asyncpg.PostgresError as e:
         raise DatabaseError(f"Database migration failed: {str(e)}")
         
     except Exception as e:
         raise DatabaseError(f"Unexpected error during migration: {str(e)}")
-
-async def init_db():
-    """Initialize database and run migrations"""
-    try:
-        # Initialize database pool
-        await get_pool()
-        
-        # Execute initialization SQL to create tables
-        async with _pool.acquire() as conn:
-            try:
-                await conn.execute(INIT_SQL)
-                logger.info("Database tables created successfully")
-            except Exception as e:
-                logger.error(f"Failed to create database tables: {str(e)}")
-                raise
-        
-        # Run migrations
-        try:
-            await run_migrations(_pool)
-            logger.info("Database migrations completed successfully")
-        except Exception as e:
-            logger.error(f"Failed to run migrations: {str(e)}")
-            raise
-            
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to initialize database: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        raise
 
 async def add_transaction(wallet_id: int, tx_hash: str, metadata: dict = None) -> bool:
     """Add a transaction to the database with metadata
@@ -2264,19 +2385,39 @@ async def main():
 def init_db_sync():
     """Synchronous version of init_db for Heroku release phase"""
     import asyncio
+    from asyncio import TimeoutError
+    import time
     
-    # Create new event loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    max_retries = 3
+    retry_delay = 5  # seconds
     
-    try:
-        loop.run_until_complete(init_db())
-        logger.info("Database initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
-        raise
-    finally:
-        loop.close()
+    for attempt in range(max_retries):
+        # Create new event loop for each attempt
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            loop.run_until_complete(init_db())
+            logger.info("Database initialized successfully")
+            return
+        except Exception as e:
+            if "already exists" in str(e):
+                logger.info("Database tables already exist, continuing...")
+                return
+            logger.error(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                logger.error("All initialization attempts failed")
+                raise
+        finally:
+            try:
+                loop.close()
+            except Exception as e:
+                logger.error(f"Error closing event loop: {e}")
 
 if __name__ == "__main__":
     # For direct script execution (e.g., in Heroku release phase)
