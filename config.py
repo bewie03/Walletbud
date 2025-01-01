@@ -100,7 +100,7 @@ BLOCKFROST_NETWORKS = {
 
 # Blockfrost configuration
 BLOCKFROST_PROJECT_ID = os.getenv('BLOCKFROST_PROJECT_ID')
-BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0/')
+BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0')
 
 def validate_positive_int(value: str, name: str) -> int:
     """Validate and convert to positive integer"""
@@ -152,16 +152,33 @@ def validate_blockfrost_project_id(value: str, name: str) -> str:
     """Validate Blockfrost project ID format and network"""
     networks = ['mainnet', 'testnet', 'preview', 'preprod']
     if not any(value.startswith(network) for network in networks):
-        raise ValueError(f"Project ID must start with one of: {', '.join(networks)}")
-    if not re.match(r'^[a-z]+[A-Za-z0-9]{32}$', value):
-        raise ValueError("Invalid project ID format")
+        raise ValueError(f"{name}: Project ID must start with one of: {', '.join(networks)}")
+    
+    # Ensure URL matches project ID network
+    network = next(n for n in networks if value.startswith(n))
+    expected_url = f'https://cardano-{network}.blockfrost.io/api/v0'
+    current_url = os.getenv('BLOCKFROST_BASE_URL')
+    if current_url and current_url != expected_url:
+        raise ValueError(f"{name}: Project ID network ({network}) does not match base URL network")
+    
+    # Validate format
+    if not re.match(f'^({"|".join(networks)})[a-zA-Z0-9]{{32}}$', value):
+        raise ValueError(f"{name}: Invalid project ID format. Expected format: network + 32 alphanumeric characters")
+    
     return value
 
 def validate_blockfrost_url(value: str, name: str) -> str:
     """Validate Blockfrost API URL"""
-    valid_urls = list(BLOCKFROST_NETWORKS.values())
-    if value not in valid_urls:
-        raise ValueError(f"Must be one of: {', '.join(valid_urls)}")
+    # Validate against known valid endpoints
+    valid_urls = {
+        'mainnet': 'https://cardano-mainnet.blockfrost.io/api/v0',
+        'preprod': 'https://cardano-preprod.blockfrost.io/api/v0',
+        'preview': 'https://cardano-preview.blockfrost.io/api/v0',
+        'testnet': 'https://cardano-testnet.blockfrost.io/api/v0'
+    }
+    
+    if value not in valid_urls.values():
+        raise ValueError(f"{name}: URL must be one of: {', '.join(valid_urls.values())}")
     return value
 
 def validate_blockfrost_webhook_id(value: str, name: str) -> str:
@@ -214,23 +231,25 @@ def validate_ip_ranges(value: str, name: str) -> list:
         raise ValueError(f"Failed to parse IP ranges JSON: {str(e)}")
 
 def validate_base_url(value: str, name: str) -> str:
-    """Validate Blockfrost base URL"""
-    if not value:
-        raise ValueError(f"{name} cannot be empty")
-        
-    # Known valid endpoints (from official docs)
-    valid_endpoints = {
-        "https://cardano-mainnet.blockfrost.io/api/v0": "mainnet",
-        "https://cardano-testnet.blockfrost.io/api/v0": "testnet", 
-        "https://cardano-preview.blockfrost.io/api/v0": "preview",
-        "https://cardano-preprod.blockfrost.io/api/v0": "preprod"
-    }
+    """Validate Blockfrost base URL and ensure it matches project ID network"""
+    project_id = os.getenv('BLOCKFROST_PROJECT_ID', '')
+    if not project_id:
+        raise ValueError("BLOCKFROST_PROJECT_ID must be set before validating base URL")
     
-    # Normalize URL
-    value = value.rstrip('/')
+    # Extract network from project ID
+    network = next((n for n in ['mainnet', 'testnet', 'preview', 'preprod'] if project_id.startswith(n)), None)
+    if not network:
+        raise ValueError("Invalid BLOCKFROST_PROJECT_ID format")
     
-    if value not in valid_endpoints:
-        raise ValueError(f"Must be one of: {', '.join(valid_endpoints)}")
+    # Validate URL format
+    if not value.startswith('https://'):
+        raise ValueError(f"{name}: URL must start with https://")
+    
+    # Ensure URL matches network
+    expected_url = f'https://cardano-{network}.blockfrost.io/api/v0'
+    if value != expected_url:
+        raise ValueError(f"{name}: URL must be {expected_url} for {network} network")
+    
     return value
 
 def validate_minute(value: str, name: str) -> int:
@@ -345,7 +364,9 @@ ENV_VARS = {
     'BLOCKFROST_BASE_URL': EnvVar(
         name='BLOCKFROST_BASE_URL',
         description="Blockfrost API base URL",
-        validator=validate_base_url
+        validator=validate_blockfrost_url,
+        required=True,
+        default="https://cardano-mainnet.blockfrost.io/api/v0"
     ),
     'WEBHOOK_SECRET': EnvVar(
         name='WEBHOOK_SECRET',
@@ -637,6 +658,7 @@ DISCORD_TOKEN = ENV_VARS['DISCORD_TOKEN'].get_value()
 APPLICATION_ID = ENV_VARS['APPLICATION_ID'].get_value()
 ADMIN_CHANNEL_ID = ENV_VARS['ADMIN_CHANNEL_ID'].get_value()
 BLOCKFROST_PROJECT_ID = ENV_VARS['BLOCKFROST_PROJECT_ID'].get_value()
+BLOCKFROST_BASE_URL = ENV_VARS['BLOCKFROST_BASE_URL'].get_value()
 DATABASE_URL = ENV_VARS['DATABASE_URL'].get_value()
 WEBHOOK_SECRET = ENV_VARS['WEBHOOK_SECRET'].get_value()
 

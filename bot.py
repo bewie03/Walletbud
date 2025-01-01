@@ -20,7 +20,7 @@ from cachetools import TTLCache
 # Import configuration
 from config import (
     DISCORD_TOKEN, APPLICATION_ID, ADMIN_CHANNEL_ID,
-    BLOCKFROST_PROJECT_ID, DATABASE_URL, WEBHOOK_SECRET,
+    BLOCKFROST_PROJECT_ID, BLOCKFROST_BASE_URL, DATABASE_URL, WEBHOOK_SECRET,
     MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_COOLDOWN,
     validate_config
 )
@@ -483,35 +483,35 @@ class WalletBudBot(commands.Bot):
             await self.check_environment()
             logger.info("Environment variables validated")
             if self.admin_channel:
-                await self.admin_channel.send("✅ Environment variables validated")
+                await self.admin_channel.send(" Environment variables validated")
             
             # Initialize database
             await self.init_database()
             logger.info("Database initialized")
             if self.admin_channel:
-                await self.admin_channel.send("✅ Database initialized")
+                await self.admin_channel.send(" Database initialized")
             
             # Initialize Blockfrost client
             await self.init_blockfrost()
             logger.info("Blockfrost client initialized")
             if self.admin_channel:
-                await self.admin_channel.send("✅ Blockfrost API connection established")
+                await self.admin_channel.send(" Blockfrost API connection established")
             
             # Initialize HTTP session
             self.session = aiohttp.ClientSession(connector=self.connector)
             logger.info("HTTP session initialized")
             if self.admin_channel:
-                await self.admin_channel.send("✅ HTTP session initialized")
+                await self.admin_channel.send(" HTTP session initialized")
             
             # Log successful initialization
             logger.info("All dependencies initialized successfully")
             if self.admin_channel:
-                await self.admin_channel.send("✅ All dependencies initialized successfully")
+                await self.admin_channel.send(" All dependencies initialized successfully")
             
         except Exception as e:
             logger.error(f"Failed to initialize dependencies: {e}")
             if self.admin_channel:
-                await self.admin_channel.send(f"🚨 ERROR: Failed to initialize dependencies: {e}")
+                await self.admin_channel.send(f" ERROR: Failed to initialize dependencies: {e}")
             raise
             
     async def on_error(self, event_method: str, *args, **kwargs):
@@ -530,7 +530,7 @@ class WalletBudBot(commands.Bot):
             if self.admin_channel:
                 tb_str = "".join(traceback.format_tb(error_traceback))
                 await self.admin_channel.send(
-                    f"🚨 ERROR in {event_method}:\n"
+                    f" ERROR in {event_method}:\n"
                     f"```\n{error_type.__name__}: {str(error_value)}\n\n{tb_str}```"
                 )
                 
@@ -881,7 +881,7 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error in health command: {e}")
             await interaction.response.send_message(
-                "❌ Error running health check. Check logs for details.",
+                " Error running health check. Check logs for details.",
                 ephemeral=True
             )
 
@@ -889,11 +889,6 @@ class WalletBudBot(commands.Bot):
         """Called when the bot is ready and connected to Discord"""
         try:
             logger.info(f"Logged in as {self.user.name} ({self.user.id})")
-            
-            # Set up admin channel first
-            await self.setup_admin_channel()
-            if self.admin_channel:
-                await self.admin_channel.send("🚀 Bot is starting up...")
             
             # Update status with custom activity
             activity = discord.Activity(
@@ -903,15 +898,8 @@ class WalletBudBot(commands.Bot):
             await self.change_presence(status=discord.Status.online, activity=activity)
             logger.info("Bot status updated")
             
-            # Initialize Blockfrost
-            await self.init_blockfrost()
-            
-            # Start connection check task
-            self.check_connection_task = self.loop.create_task(self._check_connection_loop())
-            logger.info("Connection check task started")
-            
             # Update health metrics
-            await self.update_health_metrics('start_time', datetime.now().isoformat())
+            self.update_health_metrics('start_time', datetime.now().isoformat())
             logger.info("Bot initialization complete")
             
         except Exception as e:
@@ -930,11 +918,6 @@ class WalletBudBot(commands.Bot):
             )
             await self.change_presence(status=discord.Status.online, activity=activity)
             
-            # Initialize session
-            if not self.session:
-                self.session = aiohttp.ClientSession()
-                logger.info("aiohttp session initialized")
-                
         except Exception as e:
             logger.error(f"Error in on_connect: {str(e)}", exc_info=True)
 
@@ -970,43 +953,52 @@ class WalletBudBot(commands.Bot):
         """Check all connections and log their status"""
         try:
             # Check Discord connection
-            if self.is_ready():
-                logger.info("✅ Discord connection is active")
-            else:
-                logger.error("❌ Discord connection is not ready")
-                return False
-
-            # Check Blockfrost connection if available
-            if hasattr(self, 'blockfrost') and self.blockfrost:
-                try:
-                    health = await self.blockfrost.health()
-                    logger.info(f"✅ Blockfrost connection is active. Health: {health}")
-                except Exception as e:
-                    logger.error(f"❌ Blockfrost connection failed: {e}")
-                    if hasattr(e, 'status_code'):
-                        logger.error(f"Status code: {e.status_code}")
-                    return False
-            else:
-                logger.warning("⚠️ Blockfrost client not initialized")
+            discord_status = "connected" if self.is_ready() else "disconnected"
+            logger.debug(f"Discord status: {discord_status}")
             
-            # Check database connection if available
-            if hasattr(self, 'pool') and self.pool:
-                try:
-                    async with self.pool.acquire() as conn:
-                        await conn.execute('SELECT 1')
-                    logger.info("✅ Database connection is active")
-                except Exception as e:
-                    logger.error(f"❌ Database connection failed: {e}")
-                    return False
-            else:
-                logger.warning("⚠️ Database pool not initialized")
-
-            return True
+            # Check database connection
+            try:
+                async with self.pool.acquire() as conn:
+                    await conn.execute("SELECT 1")
+                db_status = "connected"
+            except Exception as e:
+                logger.error(f"Database connection error: {e}")
+                db_status = "disconnected"
+            
+            # Check Blockfrost connection
+            try:
+                await self.blockfrost_request(self.blockfrost.health)
+                blockfrost_status = "connected"
+            except Exception as e:
+                logger.error(f"Blockfrost connection error: {e}")
+                blockfrost_status = "disconnected"
+            
+            # Check webhook server
+            webhook_status = "running" if self.site and not self.site._closed else "stopped"
+            
+            # Update health metrics
+            self.update_health_metrics('connections', {
+                'discord': discord_status,
+                'database': db_status,
+                'blockfrost': blockfrost_status,
+                'webhook': webhook_status
+            })
+            
+            # Log overall status
+            logger.info(f"Connection status - Discord: {discord_status}, DB: {db_status}, "
+                       f"Blockfrost: {blockfrost_status}, Webhook: {webhook_status}")
+            
+            return {
+                'discord': discord_status,
+                'database': db_status,
+                'blockfrost': blockfrost_status,
+                'webhook': webhook_status
+            }
             
         except Exception as e:
             logger.error(f"Error checking connections: {e}")
-            return False
-    
+            raise
+
     async def setup_admin_channel(self):
         """Set up admin channel for bot notifications"""
         try:
@@ -1021,7 +1013,7 @@ class WalletBudBot(commands.Bot):
                 return
                 
             logger.info("Admin channel setup successful")
-            await self.admin_channel.send("🤖 Bot is starting up...")
+            await self.admin_channel.send(" Bot is starting up...")
             
         except Exception as e:
             logger.error(f"Failed to set up admin channel: {e}")
@@ -1041,77 +1033,74 @@ class WalletBudBot(commands.Bot):
                 
             logger.info("Database initialized successfully")
             if self.admin_channel:
-                await self.admin_channel.send("✅ Database initialized successfully")
+                await self.admin_channel.send(" Database initialized successfully")
             
         except Exception as e:
             logger.error(f"Database initialization failed: {e}")
             if self.admin_channel:
-                await self.admin_channel.send(f"🚨 ERROR: Database initialization failed: {e}")
+                await self.admin_channel.send(f" ERROR: Database initialization failed: {e}")
             raise
 
     async def _check_connection_loop(self):
         """Background task to periodically check connection status"""
-        while True:
-            try:
-                await asyncio.sleep(30)  # Check every 30 seconds
-                
-                # Check database
+        try:
+            while not self.is_closed():
                 try:
-                    async with self._pool.acquire() as conn:
-                        await conn.execute('SELECT 1')
+                    # Check all connections
+                    status = await self.check_connections()
+                    
+                    # Log any degraded services
+                    degraded = [name for name, state in status.items() if state != 'connected']
+                    if degraded:
+                        logger.warning(f"Degraded services: {', '.join(degraded)}")
+                        if self.admin_channel:
+                            await self.admin_channel.send(f"Warning: Degraded services: {', '.join(degraded)}")
+                    
                 except Exception as e:
-                    logger.error(f"Database connection check failed: {e}")
-                    await self.send_admin_alert(" Database connection lost, attempting to reconnect...")
-                    await self.init_database()
+                    logger.error(f"Error in connection check: {e}")
                 
-                # Check Blockfrost
-                if not self.blockfrost:
-                    logger.warning("Blockfrost client not initialized, attempting to initialize...")
-                    await self.init_blockfrost()
-                else:
-                    try:
-                        await self.blockfrost_request(self.blockfrost.health)
-                    except Exception as e:
-                        logger.error(f"Blockfrost connection check failed: {e}")
-                        await self.send_admin_alert(" Blockfrost connection lost, attempting to reconnect...")
-                        await self.init_blockfrost()
+                # Wait before next check
+                await asyncio.sleep(300)  # Check every 5 minutes
                 
-                # Check webhook server
-                if not self.site or self.site.closed:
-                    logger.warning("Webhook server not running, attempting to restart...")
-                    await self.setup_webhook_handler()
-                
-            except Exception as e:
-                logger.error(f"Error in connection check loop: {e}")
-                await self.send_admin_alert(f" Connection check failed: {e}")
-                await asyncio.sleep(60)  # Wait longer on error
+        except asyncio.CancelledError:
+            logger.info("Connection check task cancelled")
+            
+        except Exception as e:
+            logger.error(f"Fatal error in connection check loop: {e}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"Error: Connection check loop failed: {e}")
                 
     async def init_blockfrost(self):
         """Initialize Blockfrost API client with proper error handling"""
         if not BLOCKFROST_PROJECT_ID:
             logger.error("BLOCKFROST_PROJECT_ID environment variable is not set")
             if self.admin_channel:
-                await self.admin_channel.send("🚨 ERROR: BLOCKFROST_PROJECT_ID not set")
+                await self.admin_channel.send("Error: BLOCKFROST_PROJECT_ID not set")
             raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
             
         try:
-            # Initialize Blockfrost client with mainnet URL by default
-            base_url = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0/')
+            # Initialize Blockfrost client with configured base URL
             self.blockfrost = BlockFrostApi(
                 project_id=BLOCKFROST_PROJECT_ID,
-                base_url=base_url
+                base_url='https://cardano-mainnet.blockfrost.io/api/v0'
             )
             
-            # Test connection with a simple endpoint
-            await self.blockfrost.health()
-            logger.info("Blockfrost client initialized successfully")
-            if self.admin_channel:
-                await self.admin_channel.send("✅ Blockfrost API connection established")
+            # Test connection by checking network health
+            health = await self.blockfrost.health()
+            if health.get('is_healthy'):
+                logger.info("Blockfrost client initialized successfully")
+                if self.admin_channel:
+                    await self.admin_channel.send("Blockfrost API connection established")
+                
+                # Update health metrics
+                self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
+            else:
+                raise Exception(f"Blockfrost API is not healthy: {health}")
             
         except Exception as e:
             logger.error(f"Failed to initialize Blockfrost client: {e}")
             if self.admin_channel:
-                await self.admin_channel.send(f"🚨 ERROR: Failed to initialize Blockfrost client: {e}")
+                await self.admin_channel.send(f"Error: Failed to initialize Blockfrost client: {e}")
             self.blockfrost = None
             raise
 
@@ -1149,13 +1138,13 @@ class WalletBudBot(commands.Bot):
         except asyncio.TimeoutError as e:
             logger.error(f"Blockfrost request timed out: {endpoint or method.__name__}")
             if self.admin_channel:
-                await self.admin_channel.send(f"⚠️ WARNING: Blockfrost request timed out: {endpoint or method.__name__}")
+                await self.admin_channel.send(f" WARNING: Blockfrost request timed out: {endpoint or method.__name__}")
             raise BlockfrostError(f"Request timed out: {str(e)}")
             
         except Exception as e:
             logger.error(f"Blockfrost request failed: {endpoint or method.__name__} - {str(e)}")
             if self.admin_channel:
-                await self.admin_channel.send(f"🚨 ERROR: Blockfrost request failed: {endpoint or method.__name__}")
+                await self.admin_channel.send(f" ERROR: Blockfrost request failed: {endpoint or method.__name__}")
             raise BlockfrostError(f"Request failed: {str(e)}")
             
     async def on_resumed(self):
@@ -1287,7 +1276,7 @@ class WalletBudBot(commands.Bot):
                     await self._process_single_webhook(webhook_data, request_id)
                     self.health_metrics['webhook_success'] += 1
                     if self.admin_channel:
-                        await self.admin_channel.send(f"✅ SUCCESS: Processed webhook {request_id}")
+                        await self.admin_channel.send(f" SUCCESS: Processed webhook {request_id}")
                     
                 except Exception as e:
                     # Handle webhook processing failure
@@ -1304,7 +1293,7 @@ class WalletBudBot(commands.Bot):
             except Exception as e:
                 logger.error(f"Error in webhook processor: {e}")
                 if self.admin_channel:
-                    await self.admin_channel.send(f"🚨 ERROR: Webhook processor error: {e}")
+                    await self.admin_channel.send(f" ERROR: Webhook processor error: {e}")
                 await asyncio.sleep(1)  # Prevent tight loop on persistent errors
                 
     async def _handle_webhook_failure(self, webhook_data: dict, request_id: str, error: str):
@@ -1332,7 +1321,7 @@ class WalletBudBot(commands.Bot):
                 # Send admin notification
                 if self.admin_channel:
                     await self.admin_channel.send(
-                        f"⚠️ WARNING: Webhook processing failed for request {request_id}. "
+                        f" WARNING: Webhook processing failed for request {request_id}. "
                         f"Retrying in {delay} seconds (attempt {retry_count + 1}/{MAX_RETRIES})"
                     )
                 
@@ -1351,7 +1340,7 @@ class WalletBudBot(commands.Bot):
                 # Send admin notification
                 if self.admin_channel:
                     await self.admin_channel.send(
-                        f"🚨 ERROR: Webhook {request_id} failed permanently after {MAX_RETRIES} retries.\n"
+                        f" ERROR: Webhook {request_id} failed permanently after {MAX_RETRIES} retries.\n"
                         f"Error: {error}"
                     )
                 
@@ -1361,7 +1350,7 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error handling webhook failure: {e}")
             if self.admin_channel:
-                await self.admin_channel.send(f"🚨 ERROR: Failed to handle webhook failure: {e}")
+                await self.admin_channel.send(f" ERROR: Failed to handle webhook failure: {e}")
                 
     async def _process_single_webhook(self, webhook_data: dict, request_id: str):
         """Process a single webhook with proper error handling"""
@@ -1370,7 +1359,7 @@ class WalletBudBot(commands.Bot):
             if not self._validate_webhook_structure(webhook_data):
                 logger.error(f"Invalid webhook structure for request {request_id}")
                 if self.admin_channel:
-                    await self.admin_channel.send(f"🚨 ERROR: Invalid webhook structure for request {request_id}")
+                    await self.admin_channel.send(f" ERROR: Invalid webhook structure for request {request_id}")
                 return
                 
             # Get webhook type and handler
@@ -1380,7 +1369,7 @@ class WalletBudBot(commands.Bot):
             if not handler:
                 logger.error(f"No handler found for webhook type: {webhook_type}")
                 if self.admin_channel:
-                    await self.admin_channel.send(f"🚨 ERROR: No handler found for webhook type: {webhook_type}")
+                    await self.admin_channel.send(f" ERROR: No handler found for webhook type: {webhook_type}")
                 return
                 
             # Process webhook
@@ -1390,7 +1379,7 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error processing webhook {request_id}: {e}")
             if self.admin_channel:
-                await self.admin_channel.send(f"🚨 ERROR: Failed to process webhook {request_id}: {e}")
+                await self.admin_channel.send(f" ERROR: Failed to process webhook {request_id}: {e}")
             raise
             
     def _validate_webhook_structure(self, webhook_data: dict) -> bool:
@@ -1487,13 +1476,13 @@ class WalletBudBot(commands.Bot):
         except asyncio.TimeoutError as e:
             logger.error(f"Blockfrost request timed out: {endpoint or method.__name__}")
             if self.admin_channel:
-                await self.admin_channel.send(f"⚠️ WARNING: Blockfrost request timed out: {endpoint or method.__name__}")
+                await self.admin_channel.send(f" WARNING: Blockfrost request timed out: {endpoint or method.__name__}")
             raise BlockfrostError(f"Request timed out: {str(e)}")
             
         except Exception as e:
             logger.error(f"Blockfrost request failed: {endpoint or method.__name__} - {str(e)}")
             if self.admin_channel:
-                await self.admin_channel.send(f"🚨 ERROR: Blockfrost request failed: {endpoint or method.__name__}")
+                await self.admin_channel.send(f" ERROR: Blockfrost request failed: {endpoint or method.__name__}")
             raise BlockfrostError(f"Request failed: {str(e)}")
             
     async def should_notify(self, user_id: int, notification_type: str) -> bool:
@@ -1625,33 +1614,6 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error checking balance for {address}: {e}")
             raise
-
-    async def monitor_health(self):
-        """Monitor bot health and update metrics"""
-        try:
-            async with self.health_lock:
-                # Update start time if not set
-                if not self.health_metrics['start_time']:
-                    self.health_metrics['start_time'] = datetime.now()
-                
-                # Check connections
-                await self.check_connections()
-                
-                # Clean up any expired cooldowns
-                await self._cleanup_cooldowns()
-                
-                # Update metrics
-                self.update_health_metrics('last_health_check', datetime.now())
-                
-                logger.debug("Health check completed successfully")
-                
-        except Exception as e:
-            logger.error(f"Error in health monitor: {e}")
-            self.health_metrics['errors'].append({
-                'time': datetime.now(),
-                'error': str(e),
-                'type': 'health_monitor'
-            })
 
 if __name__ == "__main__":
     try:
