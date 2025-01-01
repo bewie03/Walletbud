@@ -338,6 +338,12 @@ class WalletBudBot(commands.Bot):
             self._cleanup_tasks
         )
         
+        # Blockfrost cleanup
+        self.shutdown_manager.register_handler(
+            'blockfrost',
+            self._cleanup_blockfrost
+        )
+        
     async def _cleanup_database(self):
         """Cleanup database connections"""
         try:
@@ -396,6 +402,17 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error cancelling background tasks: {e}")
             
+    async def _cleanup_blockfrost(self):
+        """Cleanup Blockfrost client"""
+        if self.blockfrost:
+            try:
+                if hasattr(self.blockfrost, 'session') and self.blockfrost.session:
+                    await self.blockfrost.session.close()
+                self.blockfrost = None
+                logger.info("Blockfrost client cleaned up")
+            except Exception as e:
+                logger.error(f"Error cleaning up Blockfrost client: {e}")
+
     async def close(self):
         """Clean up resources and perform graceful shutdown"""
         try:
@@ -1079,30 +1096,32 @@ class WalletBudBot(commands.Bot):
             raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
             
         try:
-            # Initialize Blockfrost client with predefined mainnet URL
-            self.blockfrost = BlockFrostApi(
-                project_id=BLOCKFROST_PROJECT_ID,
-                base_url=ApiUrls.mainnet.value  # Use predefined URL constant
-            )
-            
-            # Test connection by checking root endpoint first
-            root = await self.blockfrost.root()
-            if root:
-                logger.info("Blockfrost root endpoint accessible")
+            # Initialize Blockfrost client with proper session management
+            async with aiohttp.ClientSession() as session:
+                self.blockfrost = BlockFrostApi(
+                    project_id=BLOCKFROST_PROJECT_ID,
+                    base_url=ApiUrls.mainnet.value,
+                    session=session  # Use the managed session
+                )
                 
-                # Now check health endpoint
-                health = await self.blockfrost.health()
-                if health.get('is_healthy'):
-                    logger.info("Blockfrost client initialized successfully")
-                    if self.admin_channel:
-                        await self.admin_channel.send("Blockfrost API connection established")
+                # Test connection by checking root endpoint first
+                root = await self.blockfrost.root()
+                if root:
+                    logger.info("Blockfrost root endpoint accessible")
                     
-                    # Update health metrics
-                    self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
+                    # Now check health endpoint
+                    health = await self.blockfrost.health()
+                    if health.get('is_healthy'):
+                        logger.info("Blockfrost client initialized successfully")
+                        if self.admin_channel:
+                            await self.admin_channel.send("Blockfrost API connection established")
+                        
+                        # Update health metrics
+                        self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
+                    else:
+                        raise Exception(f"Blockfrost API is not healthy: {health}")
                 else:
-                    raise Exception(f"Blockfrost API is not healthy: {health}")
-            else:
-                raise Exception("Could not access Blockfrost root endpoint")
+                    raise Exception("Could not access Blockfrost root endpoint")
             
         except Exception as e:
             logger.error(f"Failed to initialize Blockfrost client: {e}")
