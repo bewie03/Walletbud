@@ -4,6 +4,8 @@ import ssl
 import sys
 import json
 import time
+import signal
+import psutil
 import asyncio
 import logging
 import certifi
