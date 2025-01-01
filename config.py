@@ -151,6 +151,16 @@ def validate_token_name(value: str, name: str) -> str:
     except (ValueError, AttributeError):
         raise ValueError(f"{name} must be a valid hex-encoded token name, got: {value}")
 
+def validate_policy_id(value: str, name: str) -> str:
+    """Validate Cardano policy ID format"""
+    try:
+        value = value.strip()
+        if not re.match(r'^[0-9a-fA-F]{56}$', value):
+            raise ValueError
+        return value.lower()
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} must be a valid Cardano policy ID (56-character hex), got: {value}")
+
 # Define required environment variables
 ENV_VARS = {
     # Discord Configuration
@@ -335,9 +345,9 @@ ENV_VARS = {
         description="Cardano asset ID to monitor"
     ),
     'YUMMI_POLICY_ID': EnvVar(
-        name='YUMMI_POLICY_ID',
-        validator=validate_asset_id,
-        description="YUMMI token policy ID"
+        name="YUMMI Policy ID",
+        validator=validate_policy_id,
+        description="Cardano policy ID for YUMMI token"
     ),
     'YUMMI_TOKEN_NAME': EnvVar(
         name='YUMMI_TOKEN_NAME',
