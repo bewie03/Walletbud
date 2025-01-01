@@ -2,7 +2,7 @@ import logging
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from typing import Optional
+from typing import Optional, List
 from database import (
     get_user_wallets,
     add_wallet,
@@ -78,6 +78,21 @@ class WalletCommands(commands.Cog):
             logging.error(f"Error fetching balance for {address}: {e}")
             raise
 
+    async def get_user_wallets(self, user_id: int) -> List[str]:
+        """Get list of wallets for a user"""
+        try:
+            async with self.bot.pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT address FROM wallets WHERE user_id = %s",
+                        (user_id,)
+                    )
+                    rows = await cur.fetchall()
+                    return [row[0] for row in rows]
+        except Exception as e:
+            logging.error(f"Error getting user wallets: {e}")
+            return []
+
     @app_commands.command(name="add", description="Add a wallet to monitor")
     @commands.dm_only()
     @check_yummi_balance()
@@ -137,7 +152,7 @@ class WalletCommands(commands.Cog):
             
             # Check if wallet exists
             try:
-                wallets = await get_user_wallets(str(interaction.user.id))
+                wallets = await self.get_user_wallets(interaction.user.id)
                 if address not in wallets:
                     await interaction.followup.send(
                         "❌ Wallet not found in your registered wallets.",
@@ -185,7 +200,7 @@ class WalletCommands(commands.Cog):
             
             # Get user's wallets
             try:
-                addresses = await get_user_wallets(str(interaction.user.id))
+                addresses = await self.get_user_wallets(interaction.user.id)
                 
                 # Check if user has any wallets
                 if not addresses:
@@ -258,7 +273,7 @@ class WalletCommands(commands.Cog):
             await interaction.response.defer(ephemeral=True)
             
             # Get user's wallets
-            addresses = await get_user_wallets(str(interaction.user.id))
+            addresses = await self.get_user_wallets(interaction.user.id)
             
             if not addresses:
                 await interaction.followup.send(

@@ -1,7 +1,11 @@
+import os
+import json
 import logging
+import asyncio
 import discord
-from discord import app_commands
+import traceback
 from discord.ext import commands, tasks
+from discord import app_commands
 from datetime import datetime
 import psutil
 from typing import Optional, Dict, Any
@@ -20,7 +24,6 @@ from config import (
     HEALTH_CHECK_INTERVAL,
     HEALTH_METRICS_TTL
 )
-import asyncio
 import aiofiles
 
 # Initialize logger with proper levels
