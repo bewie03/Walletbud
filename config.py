@@ -200,7 +200,8 @@ ENV_VARS = {
     'WEBHOOK_SECRET': EnvVar(
         'WEBHOOK_SECRET',
         'Webhook verification secret',
-        required=True,
+        required=False,
+        default="default_webhook_secret",
         sensitive=True
     ),
     'ADMIN_CHANNEL_ID': EnvVar(
@@ -959,8 +960,8 @@ try:
     BLOCKFROST_TX_WEBHOOK_ID = env['BLOCKFROST_TX_WEBHOOK_ID']
     BLOCKFROST_DEL_WEBHOOK_ID = env['BLOCKFROST_DEL_WEBHOOK_ID']
     BLOCKFROST_WEBHOOK_SECRET = env['BLOCKFROST_WEBHOOK_SECRET']
-    WEBHOOK_SECRET = env['WEBHOOK_SECRET']  # Export for webhook_queue.py
-
+    WEBHOOK_SECRET = env.get('WEBHOOK_SECRET', 'default_webhook_secret')  # Use get() with default value
+    
     # Database Configuration
     DATABASE_URL = env['DATABASE_URL']
 
