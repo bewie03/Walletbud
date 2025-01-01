@@ -248,7 +248,7 @@ class WalletBudBot(commands.Bot):
         # Initialize components
         self.rate_limiter = RateLimiter(MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_COOLDOWN)
         self.db_maintenance = DatabaseMaintenance()
-        self.blockfrost = None  # Initialize Blockfrost client as None
+        self.blockfrost_session = None
         self.session = None
         self.connector = None
         
@@ -403,14 +403,14 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error cancelling background tasks: {e}")
             
     async def _cleanup_blockfrost(self):
-        """Cleanup Blockfrost client"""
-        if self.blockfrost:
+        """Cleanup Blockfrost session"""
+        if hasattr(self, 'blockfrost_session') and self.blockfrost_session:
             try:
-                # BlockFrostApi manages its own session cleanup
-                self.blockfrost = None
-                logger.info("Blockfrost client cleaned up")
+                await self.blockfrost_session.close()
+                self.blockfrost_session = None
+                logger.info("Blockfrost session cleaned up")
             except Exception as e:
-                logger.error(f"Error cleaning up Blockfrost client: {e}")
+                logger.error(f"Error cleaning up Blockfrost session: {e}")
 
     async def close(self):
         """Clean up resources and perform graceful shutdown"""
@@ -797,12 +797,19 @@ class WalletBudBot(commands.Bot):
 
             # Check Blockfrost API
             try:
-                if self.blockfrost:
-                    await self.blockfrost.health()
-                    health_data['components']['blockfrost'] = {
-                        'status': 'connected',
-                        'last_call': self.health_metrics['last_api_call'].isoformat() if self.health_metrics['last_api_call'] else None
-                    }
+                if self.blockfrost_session:
+                    async with self.blockfrost_session.get('/health') as response:
+                        if response.status == 200:
+                            health = await response.json()
+                            if health.get('is_healthy'):
+                                health_data['components']['blockfrost'] = {
+                                    'status': 'connected',
+                                    'last_call': self.health_metrics['last_api_call'].isoformat() if self.health_metrics['last_api_call'] else None
+                                }
+                            else:
+                                raise Exception(f"Blockfrost API is not healthy: {health}")
+                        else:
+                            raise Exception(f"Health check failed with status {response.status}")
                 else:
                     health_data['components']['blockfrost'] = {'status': 'not_initialized'}
                     health_data['status'] = 'degraded'
@@ -983,8 +990,15 @@ class WalletBudBot(commands.Bot):
             
             # Check Blockfrost connection
             try:
-                await self.blockfrost_request(self.blockfrost.health)
-                blockfrost_status = "connected"
+                async with self.blockfrost_session.get('/health') as response:
+                    if response.status == 200:
+                        health = await response.json()
+                        if health.get('is_healthy'):
+                            blockfrost_status = "connected"
+                        else:
+                            raise Exception(f"Blockfrost API is not healthy: {health}")
+                    else:
+                        raise Exception(f"Health check failed with status {response.status}")
             except Exception as e:
                 logger.error(f"Blockfrost connection error: {e}")
                 blockfrost_status = "disconnected"
@@ -1057,35 +1071,6 @@ class WalletBudBot(commands.Bot):
                 await self.admin_channel.send(f" ERROR: Database initialization failed: {e}")
             raise
 
-    async def _check_connection_loop(self):
-        """Background task to periodically check connection status"""
-        try:
-            while not self.is_closed():
-                try:
-                    # Check all connections
-                    status = await self.check_connections()
-                    
-                    # Log any degraded services
-                    degraded = [name for name, state in status.items() if state != 'connected']
-                    if degraded:
-                        logger.warning(f"Degraded services: {', '.join(degraded)}")
-                        if self.admin_channel:
-                            await self.admin_channel.send(f"Warning: Degraded services: {', '.join(degraded)}")
-                    
-                except Exception as e:
-                    logger.error(f"Error in connection check: {e}")
-                
-                # Wait before next check
-                await asyncio.sleep(300)  # Check every 5 minutes
-                
-        except asyncio.CancelledError:
-            logger.info("Connection check task cancelled")
-            
-        except Exception as e:
-            logger.error(f"Fatal error in connection check loop: {e}")
-            if self.admin_channel:
-                await self.admin_channel.send(f"Error: Connection check loop failed: {e}")
-                
     async def init_blockfrost(self):
         """Initialize Blockfrost API client with proper error handling"""
         if not BLOCKFROST_PROJECT_ID:
@@ -1095,80 +1080,87 @@ class WalletBudBot(commands.Bot):
             raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
             
         try:
-            # Initialize Blockfrost client with exact project ID from dashboard
-            self.blockfrost = BlockFrostApi(
-                project_id='mainnet0vqb8DAEyXDyGuUR1pA7W8VkgPbnhWAc',  # Use exact ID
-                base_url=ApiUrls.mainnet.value
+            # Create aiohttp session with proper headers
+            self.blockfrost_session = aiohttp.ClientSession(
+                base_url='https://cardano-mainnet.blockfrost.io/api/v0',
+                headers={
+                    'project_id': 'mainnet0vqb8DAEyXDyGuUR1pA7W8VkgPbnhWAc'
+                }
             )
             
             # Test connection by checking root endpoint first
-            root = await self.blockfrost.root()
-            if root:
-                logger.info("Blockfrost root endpoint accessible")
-                
-                # Now check health endpoint
-                health = await self.blockfrost.health()
-                if health.get('is_healthy'):
-                    logger.info("Blockfrost client initialized successfully")
-                    if self.admin_channel:
-                        await self.admin_channel.send("Blockfrost API connection established")
+            async with self.blockfrost_session.get('/') as response:
+                if response.status == 200:
+                    root = await response.json()
+                    logger.info("Blockfrost root endpoint accessible")
                     
-                    # Update health metrics
-                    self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
+                    # Now check health endpoint
+                    async with self.blockfrost_session.get('/health') as health_response:
+                        if health_response.status == 200:
+                            health = await health_response.json()
+                            if health.get('is_healthy'):
+                                logger.info("Blockfrost client initialized successfully")
+                                if self.admin_channel:
+                                    await self.admin_channel.send("Blockfrost API connection established")
+                                
+                                # Update health metrics
+                                self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
+                            else:
+                                raise Exception(f"Blockfrost API is not healthy: {health}")
+                        else:
+                            raise Exception(f"Health check failed with status {health_response.status}")
                 else:
-                    raise Exception(f"Blockfrost API is not healthy: {health}")
-            else:
-                raise Exception("Could not access Blockfrost root endpoint")
+                    raise Exception(f"Root endpoint check failed with status {response.status}")
             
         except Exception as e:
             logger.error(f"Failed to initialize Blockfrost client: {e}")
             if self.admin_channel:
                 await self.admin_channel.send(f"Error: Failed to initialize Blockfrost client: {e}")
-            self.blockfrost = None
+            if hasattr(self, 'blockfrost_session'):
+                await self.blockfrost_session.close()
+                self.blockfrost_session = None
             raise
 
     async def blockfrost_request(
-        self, 
-        method: Callable, 
-        endpoint: Optional[str] = None,
-        *args, 
-        **kwargs
-    ) -> Any:
+            self, 
+            endpoint: str,
+            method: str = 'GET',
+            **kwargs
+        ):
         """Make a request to Blockfrost API with rate limiting and error handling
         
         Args:
-            method: Blockfrost API method to call
-            endpoint: Optional API endpoint (for logging)
-            *args: Positional arguments for the method
-            **kwargs: Keyword arguments for the method
+            endpoint: API endpoint to call (e.g. '/health')
+            method: HTTP method (GET, POST, etc.)
+            **kwargs: Additional arguments to pass to aiohttp request
             
         Returns:
-            API response
+            API response as JSON
             
         Raises:
-            BlockfrostError: If API request fails
+            Exception: If API request fails
         """
-        if not self.blockfrost:
-            raise BlockfrostError("Blockfrost client not initialized")
+        if not hasattr(self, 'blockfrost_session') or not self.blockfrost_session:
+            raise Exception("Blockfrost session not initialized")
             
         try:
-            async with self.rate_limiter.acquire("blockfrost"):
-                async with asyncio.timeout(30):  # 30 second timeout
-                    response = await method(*args, **kwargs)
-                    self.health_metrics['last_api_call'] = datetime.utcnow()
-                    return response
+            async with self.blockfrost_session.request(method, endpoint, **kwargs) as response:
+                if response.status == 200:
+                    result = await response.json()
                     
-        except asyncio.TimeoutError as e:
-            logger.error(f"Blockfrost request timed out: {endpoint or method.__name__}")
-            if self.admin_channel:
-                await self.admin_channel.send(f" WARNING: Blockfrost request timed out: {endpoint or method.__name__}")
-            raise BlockfrostError(f"Request timed out: {str(e)}")
+                    # Update health metrics
+                    self.update_health_metrics('last_api_call', datetime.now().isoformat())
+                    
+                    return result
+                else:
+                    error = await response.json()
+                    raise Exception(f"Blockfrost API request failed: {error}")
             
         except Exception as e:
-            logger.error(f"Blockfrost request failed: {endpoint or method.__name__} - {str(e)}")
+            logger.error(f"Blockfrost API request failed: {e}")
             if self.admin_channel:
-                await self.admin_channel.send(f" ERROR: Blockfrost request failed: {endpoint or method.__name__}")
-            raise BlockfrostError(f"Request failed: {str(e)}")
+                await self.admin_channel.send(f"Error: Blockfrost API request failed: {e}")
+            raise
             
     async def on_resumed(self):
         """Called when the bot resumes a session"""
@@ -1465,49 +1457,6 @@ class WalletBudBot(commands.Bot):
         log_method = getattr(logger, level.lower(), logger.info)
         log_method(message, **safe_kwargs)
 
-    async def blockfrost_request(
-        self, 
-        method: Callable, 
-        endpoint: Optional[str] = None,
-        *args, 
-        **kwargs
-    ) -> Any:
-        """Make a request to Blockfrost API with rate limiting and error handling
-        
-        Args:
-            method: Blockfrost API method to call
-            endpoint: Optional API endpoint (for logging)
-            *args: Positional arguments for the method
-            **kwargs: Keyword arguments for the method
-            
-        Returns:
-            API response
-            
-        Raises:
-            BlockfrostError: If API request fails
-        """
-        if not self.blockfrost:
-            raise BlockfrostError("Blockfrost client not initialized")
-            
-        try:
-            async with self.rate_limiter.acquire("blockfrost"):
-                async with asyncio.timeout(30):  # 30 second timeout
-                    response = await method(*args, **kwargs)
-                    self.health_metrics['last_api_call'] = datetime.utcnow()
-                    return response
-                    
-        except asyncio.TimeoutError as e:
-            logger.error(f"Blockfrost request timed out: {endpoint or method.__name__}")
-            if self.admin_channel:
-                await self.admin_channel.send(f" WARNING: Blockfrost request timed out: {endpoint or method.__name__}")
-            raise BlockfrostError(f"Request timed out: {str(e)}")
-            
-        except Exception as e:
-            logger.error(f"Blockfrost request failed: {endpoint or method.__name__} - {str(e)}")
-            if self.admin_channel:
-                await self.admin_channel.send(f" ERROR: Blockfrost request failed: {endpoint or method.__name__}")
-            raise BlockfrostError(f"Request failed: {str(e)}")
-            
     async def should_notify(self, user_id: int, notification_type: str) -> bool:
         """Check if we should send a notification to the user"""
         try:
@@ -1594,10 +1543,11 @@ class WalletBudBot(commands.Bot):
         """Check balance for a single wallet with retries"""
         try:
             # Get current balance
-            current_balance = await self.blockfrost_request(
-                self.blockfrost.address_assets,
-                address
-            )
+            async with self.blockfrost_session.get(f'/addresses/{address}/assets') as response:
+                if response.status == 200:
+                    current_balance = await response.json()
+                else:
+                    raise Exception(f"Failed to get balance for {address}: {response.status}")
             
             # Get previous balance from database
             async with self.pool.acquire() as conn:
@@ -1651,6 +1601,114 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error in health monitoring: {e}")
             if self.admin_channel:
                 await self.admin_channel.send(f"Error: Health monitoring failed: {e}")
+
+    async def fetch_wallet_assets(self, address: str) -> List[Dict]:
+        """Fetch assets for a single wallet address"""
+        async with self.blockfrost_session.get(f'/addresses/{address}/assets') as response:
+            if response.status == 200:
+                return await response.json()
+            else:
+                raise Exception(f"Failed to get balance for {address}: {response.status}")
+
+    async def fetch_multiple_wallet_details(self, wallets: List[str]) -> List[Dict]:
+        """Fetch details for multiple wallets concurrently
+        
+        Args:
+            wallets: List of wallet addresses to fetch
+            
+        Returns:
+            List of wallet details from Blockfrost API
+        """
+        # Create tasks for each wallet request
+        tasks = [self.fetch_wallet_assets(wallet) for wallet in wallets]
+        
+        # Execute all requests concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results and handle any errors
+        wallet_details = []
+        for wallet, result in zip(wallets, results):
+            if isinstance(result, Exception):
+                logger.error(f"Failed to fetch details for wallet {wallet}: {result}")
+                if self.admin_channel:
+                    await self.admin_channel.send(f"Error: Failed to fetch details for wallet {wallet}: {result}")
+                wallet_details.append({"address": wallet, "error": str(result)})
+            else:
+                wallet_details.append({"address": wallet, "assets": result})
+                
+        return wallet_details
+
+    async def check_wallets_balance(self, wallets: List[str]) -> Dict[str, Any]:
+        """Check balance changes for multiple wallets
+        
+        Args:
+            wallets: List of wallet addresses to check
+            
+        Returns:
+            Dict containing balance changes and notifications
+        """
+        try:
+            # Fetch all wallet details concurrently
+            current_balances = await self.fetch_multiple_wallet_details(wallets)
+            
+            changes = []
+            notifications = []
+            
+            # Get previous balances from database
+            async with self.pool.acquire() as conn:
+                for wallet_data in current_balances:
+                    address = wallet_data["address"]
+                    
+                    # Skip wallets that had errors
+                    if "error" in wallet_data:
+                        continue
+                        
+                    current_assets = wallet_data["assets"]
+                    
+                    # Get previous balance
+                    previous = await conn.fetchrow(
+                        'SELECT balance FROM wallet_balances WHERE address = $1 ORDER BY timestamp DESC LIMIT 1',
+                        address
+                    )
+                    
+                    if not previous:
+                        # New wallet, store initial balance
+                        await conn.execute(
+                            'INSERT INTO wallet_balances (address, balance, timestamp) VALUES ($1, $2, $3)',
+                            address, json.dumps(current_assets), datetime.now()
+                        )
+                        continue
+                        
+                    # Compare balances and detect changes
+                    previous_assets = json.loads(previous['balance'])
+                    balance_changes = self.compare_balances(previous_assets, current_assets)
+                    
+                    if balance_changes:
+                        changes.append({
+                            'address': address,
+                            'changes': balance_changes
+                        })
+                        
+                        # Store new balance
+                        await conn.execute(
+                            'INSERT INTO wallet_balances (address, balance, timestamp) VALUES ($1, $2, $3)',
+                            address, json.dumps(current_assets), datetime.now()
+                        )
+                        
+                        # Create notification
+                        notification = self.create_balance_notification(address, balance_changes)
+                        notifications.append(notification)
+            
+            return {
+                'changes': changes,
+                'notifications': notifications
+            }
+            
+        except Exception as e:
+            logger.error(f"Error checking wallet balances: {e}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"Error checking wallet balances: {e}")
+            raise
 
 if __name__ == "__main__":
     try:
