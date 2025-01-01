@@ -1095,9 +1095,9 @@ class WalletBudBot(commands.Bot):
             raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
             
         try:
-            # Initialize Blockfrost client with predefined mainnet URL
+            # Initialize Blockfrost client with exact project ID from dashboard
             self.blockfrost = BlockFrostApi(
-                project_id=BLOCKFROST_PROJECT_ID,
+                project_id='mainnet0vqb8DAEyXDyGuUR1pA7W8VkgPbnhWAc',  # Use exact ID
                 base_url=ApiUrls.mainnet.value
             )
             
