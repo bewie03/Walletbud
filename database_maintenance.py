@@ -5,7 +5,6 @@ Handles database cleanup, archiving, and optimization tasks.
 
 import logging
 import asyncio
-import os
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -299,3 +298,87 @@ class DatabaseMaintenance:
         if self._pool:
             await self._pool.close()
             self._pool = None
+
+class DatabaseMaintenanceWorker:
+    def __init__(self):
+        self.pool = None
+        self.running = False
+        self.last_maintenance = None
+        self.maintenance = DatabaseMaintenance()
+
+    async def init_pool(self):
+        """Initialize database pool"""
+        if not self.pool:
+            self.pool = await get_pool()
+            logger.info("Database pool initialized")
+
+    async def run_maintenance(self):
+        """Run maintenance tasks"""
+        try:
+            logger.info("Starting database maintenance")
+            await self.maintenance.run_maintenance()
+            self.last_maintenance = datetime.utcnow()
+            logger.info("Database maintenance completed successfully")
+        except Exception as e:
+            logger.error(f"Error during maintenance: {e}")
+
+    async def should_run_maintenance(self):
+        """Check if maintenance should run"""
+        now = datetime.utcnow()
+        
+        # If never run, run immediately
+        if not self.last_maintenance:
+            return True
+
+        # Calculate next scheduled time
+        next_run = datetime.utcnow().replace(
+            hour=int(MAINTENANCE_HOUR),
+            minute=int(MAINTENANCE_MINUTE),
+            second=0,
+            microsecond=0
+        )
+        
+        # If next run time is in the past, add a day
+        if next_run <= now:
+            next_run += timedelta(days=1)
+
+        # Run if it's time
+        return now >= next_run
+
+    async def start(self):
+        """Start the maintenance worker"""
+        self.running = True
+        await self.init_pool()
+        
+        logger.info("Database maintenance worker started")
+        
+        while self.running:
+            try:
+                if await self.should_run_maintenance():
+                    await self.run_maintenance()
+                
+                # Sleep for 5 minutes before next check
+                await asyncio.sleep(300)
+            except Exception as e:
+                logger.error(f"Error in maintenance loop: {e}")
+                # Sleep for 1 minute on error
+                await asyncio.sleep(60)
+
+    def stop(self):
+        """Stop the maintenance worker"""
+        self.running = False
+        logger.info("Database maintenance worker stopped")
+
+async def main():
+    """Main entry point"""
+    worker = DatabaseMaintenanceWorker()
+    try:
+        await worker.start()
+    except KeyboardInterrupt:
+        worker.stop()
+    except Exception as e:
+        logger.error(f"Fatal error in maintenance worker: {e}")
+        raise
+
+if __name__ == "__main__":
+    asyncio.run(main())

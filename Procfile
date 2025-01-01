@@ -1,3 +1,3 @@
-release: python -c "from database import init_db; init_db()"
+release: python -c "from database import init_db_sync; init_db_sync()"
 web: python bot.py
-worker: python -m database_maintenance
+maintenance: python -m database_maintenance

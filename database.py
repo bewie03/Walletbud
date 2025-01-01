@@ -2288,6 +2288,18 @@ async def main():
         if hasattr(e, '__dict__'):
             logger.error(f"Error details: {e.__dict__}")
 
-if __name__ == "__main__":
+def init_db_sync():
+    """Synchronous version of init_db for Heroku release phase"""
     import asyncio
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(init_db())
+    except Exception as e:
+        logging.error(f"Failed to initialize database: {e}")
+        raise
+    finally:
+        loop.close()
+
+if __name__ == "__main__":
+    # For direct script execution (e.g., in Heroku release phase)
+    init_db_sync()
