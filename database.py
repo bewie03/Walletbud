@@ -257,44 +257,37 @@ class QueryError(DatabaseError):
     """Database query error"""
     pass
 
-async def init_db(conn):
+async def init_db(conn) -> bool:
     """Initialize database and run migrations
     
     Args:
         conn: Database connection to use
         
+    Returns:
+        bool: True if successful
+        
     Raises:
         DatabaseError: If initialization fails
     """
     try:
-        # Create version tracking tables first
-        try:
-            await conn.execute(INIT_SQL)
-            logger.info("Database tables created successfully")
-        except asyncpg.exceptions.DuplicateTableError:
-            logger.info("Database tables already exist, continuing with migrations...")
+        # Create tables
+        await conn.execute(INIT_SQL)
         
-        # Get current version
-        version = await get_db_version(conn)
-        if version is None:
-            # Fresh install - set initial version
-            await conn.execute(MIGRATIONS[1], 1)
-            version = 1
+        # Run migrations
+        await migrate_database(conn)
         
-        # Run any pending migrations
-        await run_migrations(conn)
-        
-        # Verify schema
-        await check_database_schema(conn)
-        
-        logger.info(f"Database initialized at version {version}")
+        # Initialize notification settings for existing users
+        users = await conn.fetch(
+            "SELECT DISTINCT user_id FROM wallets WHERE user_id IS NOT NULL"
+        )
+        for user in users:
+            await initialize_notification_settings(user['user_id'])
+            
         return True
         
     except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        raise DatabaseError(f"Database initialization failed: {e}")
+        logger.error(f"Database initialization failed: {e}")
+        raise DatabaseError(f"Failed to initialize database: {e}")
 
 async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
     """Add a wallet with proper validation and error handling"""
@@ -2263,15 +2256,13 @@ async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
     """
     try:
         async def _get_user_id_for_stake_address(conn, stake_address):
-            row = await conn.fetchrow(
-                '''
+            query = """
                 SELECT DISTINCT user_id 
                 FROM wallets 
                 WHERE stake_address = $1
-                ''',
-                stake_address
-            )
-            return str(row['user_id']) if row else None
+            """
+            result = await conn.fetchval(query, stake_address)
+            return result
         
         return await execute_with_retry(_get_user_id_for_stake_address, stake_address)
     except Exception as e:
