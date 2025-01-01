@@ -141,10 +141,10 @@ CREATE TABLE IF NOT EXISTS wallets (
     user_id TEXT NOT NULL,
     address TEXT NOT NULL,
     stake_address TEXT,
-    ada_balance BIGINT DEFAULT 0,
-    monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    last_policy_check TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    ada_balance NUMERIC DEFAULT 0,
+    monitoring_since TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+    last_policy_check TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
     UNIQUE(user_id, address)
 );
 
@@ -197,9 +197,9 @@ CREATE TABLE IF NOT EXISTS failed_transactions (
     id SERIAL PRIMARY KEY,
     wallet_id INTEGER REFERENCES wallets(id),
     tx_hash TEXT NOT NULL,
-    error_message TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(wallet_id, tx_hash)
+    error_type TEXT,
+    error_details JSONB,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
 );
 
 -- Create asset_history table
@@ -208,8 +208,29 @@ CREATE TABLE IF NOT EXISTS asset_history (
     wallet_id INTEGER REFERENCES wallets(id),
     asset_id TEXT NOT NULL,
     policy_id TEXT NOT NULL,
-    amount BIGINT NOT NULL,
+    asset_name TEXT,
+    quantity NUMERIC,
+    action TEXT,
+    tx_hash TEXT,
+    metadata JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create token_balances table
+CREATE TABLE IF NOT EXISTS token_balances (
+    id SERIAL PRIMARY KEY,
+    address TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    balance NUMERIC DEFAULT 0,
+    last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+);
+
+-- Create delegation_status table
+CREATE TABLE IF NOT EXISTS delegation_status (
+    id SERIAL PRIMARY KEY,
+    address TEXT NOT NULL,
+    pool_id TEXT NOT NULL,
+    last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
 );
 
 -- Create processed_rewards table
@@ -217,27 +238,16 @@ CREATE TABLE IF NOT EXISTS processed_rewards (
     id SERIAL PRIMARY KEY,
     stake_address TEXT NOT NULL,
     epoch INTEGER NOT NULL,
-    amount BIGINT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(stake_address, epoch)
-);
-
--- Create delegation_status table
-CREATE TABLE IF NOT EXISTS delegation_status (
-    id SERIAL PRIMARY KEY,
-    stake_address TEXT NOT NULL,
-    pool_id TEXT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(stake_address)
+    amount NUMERIC NOT NULL,
+    processed_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
 );
 
 -- Create policy_expiry table
 CREATE TABLE IF NOT EXISTS policy_expiry (
     id SERIAL PRIMARY KEY,
     policy_id TEXT NOT NULL,
-    expiry_slot INTEGER NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(policy_id)
+    expiry_slot BIGINT NOT NULL,
+    last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
 );
 
 -- Create dapp_interactions table
@@ -245,28 +255,14 @@ CREATE TABLE IF NOT EXISTS dapp_interactions (
     id SERIAL PRIMARY KEY,
     address TEXT NOT NULL,
     tx_hash TEXT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(address)
-);
-
--- Create yummi_warnings table
-CREATE TABLE IF NOT EXISTS yummi_warnings (
-    id SERIAL PRIMARY KEY,
-    wallet_id INTEGER NOT NULL,
-    warning_count INTEGER NOT NULL DEFAULT 0,
-    last_warning_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(wallet_id)
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
 );
 
 -- Create stake_addresses table
 CREATE TABLE IF NOT EXISTS stake_addresses (
-    id SERIAL PRIMARY KEY,
-    stake_address TEXT NOT NULL,
+    stake_address TEXT PRIMARY KEY,
     last_pool_id TEXT,
-    last_checked TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(stake_address)
+    last_checked TIMESTAMP WITHOUT TIME ZONE
 );
 """
 
@@ -389,21 +385,22 @@ async def create_indices(conn):
         "CREATE INDEX IF NOT EXISTS idx_asset_history_policy ON asset_history(policy_id)",
         "CREATE INDEX IF NOT EXISTS idx_asset_history_created ON asset_history(created_at DESC)",
         
+        # Token balances indices
+        "CREATE INDEX IF NOT EXISTS idx_token_balances_address ON token_balances(address)",
+        "CREATE INDEX IF NOT EXISTS idx_token_balances_token ON token_balances(token_id)",
+        
+        # Delegation status indices
+        "CREATE INDEX IF NOT EXISTS idx_delegation_status_address ON delegation_status(address)",
+        
         # Processed rewards indices
         "CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewards(stake_address)",
         "CREATE INDEX IF NOT EXISTS idx_processed_rewards_epoch ON processed_rewards(epoch)",
-        
-        # Delegation status indices
-        "CREATE INDEX IF NOT EXISTS idx_delegation_status_stake_address ON delegation_status(stake_address)",
         
         # Policy expiry indices
         "CREATE INDEX IF NOT EXISTS idx_policy_expiry_policy_id ON policy_expiry(policy_id)",
         
         # DApp interactions indices
         "CREATE INDEX IF NOT EXISTS idx_dapp_interactions_address ON dapp_interactions(address)",
-        
-        # YUMMI warnings indices
-        "CREATE INDEX IF NOT EXISTS idx_yummi_warnings_wallet_id ON yummi_warnings(wallet_id)",
         
         # Stake addresses indices
         "CREATE INDEX IF NOT EXISTS idx_stake_addresses_stake_address ON stake_addresses(stake_address)",
@@ -845,7 +842,7 @@ async def get_wallet_info(address: str) -> Dict[str, Any]:
                 ) t
             ) as recent_transactions
         FROM wallets w
-        LEFT JOIN delegation_status d ON d.stake_address = w.stake_address
+        LEFT JOIN delegation_status d ON d.address = w.address
         WHERE w.address = $1
     """
     try:
@@ -897,9 +894,9 @@ async def update_wallet_state(address: str, updates: Dict[str, Any]) -> bool:
     if 'delegation_pool' in updates:
         queries.append((
             """
-            INSERT INTO delegation_status (stake_address, pool_id)
-            SELECT stake_address, $1 FROM wallets WHERE address = $2
-            ON CONFLICT (stake_address) DO UPDATE SET pool_id = $1
+            INSERT INTO delegation_status (address, pool_id)
+            SELECT address, $1 FROM wallets WHERE address = $2
+            ON CONFLICT (address) DO UPDATE SET pool_id = $1
             """,
             (updates['delegation_pool'], address)
         ))
@@ -952,7 +949,7 @@ async def get_user_wallets(user_id: str) -> List[Dict[str, Any]]:
                 ) t
             ) as recent_transactions
         FROM wallets w
-        LEFT JOIN delegation_status d ON d.stake_address = w.stake_address
+        LEFT JOIN delegation_status d ON d.address = w.address
         WHERE w.user_id = $1
         ORDER BY w.monitoring_since DESC
     """
@@ -2414,10 +2411,10 @@ MIGRATIONS = {
             user_id TEXT NOT NULL,
             address TEXT NOT NULL,
             stake_address TEXT,
-            ada_balance BIGINT DEFAULT 0,
-            monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            last_policy_check TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            ada_balance NUMERIC DEFAULT 0,
+            monitoring_since TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+            last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
+            last_policy_check TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW(),
             UNIQUE(user_id, address)
         );
         """,
@@ -2478,9 +2475,9 @@ MIGRATIONS = {
             id SERIAL PRIMARY KEY,
             wallet_id INTEGER REFERENCES wallets(id),
             tx_hash TEXT NOT NULL,
-            error_message TEXT,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            UNIQUE(wallet_id, tx_hash)
+            error_type TEXT,
+            error_details JSONB,
+            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
         );
         """,
         
@@ -2491,8 +2488,73 @@ MIGRATIONS = {
             wallet_id INTEGER REFERENCES wallets(id),
             asset_id TEXT NOT NULL,
             policy_id TEXT NOT NULL,
-            amount BIGINT NOT NULL,
+            asset_name TEXT,
+            quantity NUMERIC,
+            action TEXT,
+            tx_hash TEXT,
+            metadata JSONB,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+        """,
+        
+        """
+        -- Create token_balances table
+        CREATE TABLE IF NOT EXISTS token_balances (
+            id SERIAL PRIMARY KEY,
+            address TEXT NOT NULL,
+            token_id TEXT NOT NULL,
+            balance NUMERIC DEFAULT 0,
+            last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+        );
+        """,
+        
+        """
+        -- Create delegation_status table
+        CREATE TABLE IF NOT EXISTS delegation_status (
+            id SERIAL PRIMARY KEY,
+            address TEXT NOT NULL,
+            pool_id TEXT NOT NULL,
+            last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+        );
+        """,
+        
+        """
+        -- Create processed_rewards table
+        CREATE TABLE IF NOT EXISTS processed_rewards (
+            id SERIAL PRIMARY KEY,
+            stake_address TEXT NOT NULL,
+            epoch INTEGER NOT NULL,
+            amount NUMERIC NOT NULL,
+            processed_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+        );
+        """,
+        
+        """
+        -- Create policy_expiry table
+        CREATE TABLE IF NOT EXISTS policy_expiry (
+            id SERIAL PRIMARY KEY,
+            policy_id TEXT NOT NULL,
+            expiry_slot BIGINT NOT NULL,
+            last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+        );
+        """,
+        
+        """
+        -- Create dapp_interactions table
+        CREATE TABLE IF NOT EXISTS dapp_interactions (
+            id SERIAL PRIMARY KEY,
+            address TEXT NOT NULL,
+            tx_hash TEXT NOT NULL,
+            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
+        );
+        """,
+        
+        """
+        -- Create stake_addresses table
+        CREATE TABLE IF NOT EXISTS stake_addresses (
+            stake_address TEXT PRIMARY KEY,
+            last_pool_id TEXT,
+            last_checked TIMESTAMP WITHOUT TIME ZONE
         );
         """,
         
@@ -2527,6 +2589,38 @@ MIGRATIONS = {
         CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id);
         CREATE INDEX IF NOT EXISTS idx_asset_history_policy ON asset_history(policy_id);
         CREATE INDEX IF NOT EXISTS idx_asset_history_created ON asset_history(created_at DESC);
+        """,
+        
+        # Step 7: Create indices for token_balances
+        """
+        CREATE INDEX IF NOT EXISTS idx_token_balances_address ON token_balances(address);
+        CREATE INDEX IF NOT EXISTS idx_token_balances_token ON token_balances(token_id);
+        """,
+        
+        # Step 8: Create indices for delegation_status
+        """
+        CREATE INDEX IF NOT EXISTS idx_delegation_status_address ON delegation_status(address);
+        """,
+        
+        # Step 9: Create indices for processed_rewards
+        """
+        CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewards(stake_address);
+        CREATE INDEX IF NOT EXISTS idx_processed_rewards_epoch ON processed_rewards(epoch);
+        """,
+        
+        # Step 10: Create indices for policy_expiry
+        """
+        CREATE INDEX IF NOT EXISTS idx_policy_expiry_policy_id ON policy_expiry(policy_id);
+        """,
+        
+        # Step 11: Create indices for dapp_interactions
+        """
+        CREATE INDEX IF NOT EXISTS idx_dapp_interactions_address ON dapp_interactions(address);
+        """,
+        
+        # Step 12: Create indices for stake_addresses
+        """
+        CREATE INDEX IF NOT EXISTS idx_stake_addresses_stake_address ON stake_addresses(stake_address);
         """
     ]
 }
