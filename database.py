@@ -382,7 +382,6 @@ async def create_indices(conn):
         # Asset history indices
         "CREATE INDEX IF NOT EXISTS idx_asset_history_wallet ON asset_history(wallet_id)",
         "CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id)",
-        "CREATE INDEX IF NOT EXISTS idx_asset_history_policy ON asset_history(policy_id)",
         "CREATE INDEX IF NOT EXISTS idx_asset_history_created ON asset_history(created_at DESC)",
         
         # Token balances indices
@@ -2587,41 +2586,45 @@ MIGRATIONS = {
         """
         CREATE INDEX IF NOT EXISTS idx_asset_history_wallet ON asset_history(wallet_id);
         CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id);
-        CREATE INDEX IF NOT EXISTS idx_asset_history_policy ON asset_history(policy_id);
         CREATE INDEX IF NOT EXISTS idx_asset_history_created ON asset_history(created_at DESC);
         """,
         
-        # Step 7: Create indices for token_balances
+        # Token balances indices
         """
         CREATE INDEX IF NOT EXISTS idx_token_balances_address ON token_balances(address);
         CREATE INDEX IF NOT EXISTS idx_token_balances_token ON token_balances(token_id);
         """,
         
-        # Step 8: Create indices for delegation_status
+        # Delegation status indices
         """
         CREATE INDEX IF NOT EXISTS idx_delegation_status_address ON delegation_status(address);
         """,
         
-        # Step 9: Create indices for processed_rewards
+        # Processed rewards indices
         """
         CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewards(stake_address);
         CREATE INDEX IF NOT EXISTS idx_processed_rewards_epoch ON processed_rewards(epoch);
         """,
         
-        # Step 10: Create indices for policy_expiry
+        # Policy expiry indices
         """
         CREATE INDEX IF NOT EXISTS idx_policy_expiry_policy_id ON policy_expiry(policy_id);
         """,
         
-        # Step 11: Create indices for dapp_interactions
+        # DApp interactions indices
         """
         CREATE INDEX IF NOT EXISTS idx_dapp_interactions_address ON dapp_interactions(address);
         """,
         
-        # Step 12: Create indices for stake_addresses
+        # Stake addresses indices
         """
         CREATE INDEX IF NOT EXISTS idx_stake_addresses_stake_address ON stake_addresses(stake_address);
+        """,
+        
+        # Step 7: Create indices for asset_history
         """
+        CREATE INDEX IF NOT EXISTS idx_asset_history_policy ON asset_history(policy_id);
+        """,
     ]
 }
 
