@@ -3,6 +3,7 @@ Database maintenance module for WalletBud.
 Handles database cleanup, archiving, and optimization tasks.
 """
 
+import os
 import logging
 import asyncio
 from datetime import datetime, timedelta
