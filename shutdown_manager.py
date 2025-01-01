@@ -24,11 +24,10 @@ class ShutdownManager:
         """Execute all shutdown handlers with timeout"""
         async with self._shutdown_lock:
             if self.is_shutting_down:
-                logger.warning("Shutdown already in progress")
                 return
                 
             self.is_shutting_down = True
-            self.shutdown_start = datetime.utcnow()
+            self.shutdown_start = datetime.now()
             
             logger.info("Starting graceful shutdown...")
             
@@ -42,17 +41,22 @@ class ShutdownManager:
                 # Wait for all handlers with timeout
                 await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
                 logger.info("Graceful shutdown completed successfully")
-                
             except asyncio.TimeoutError:
                 logger.error(f"Shutdown timed out after {timeout} seconds")
+            except Exception as e:
+                logger.error(f"Error during shutdown: {e}")
+            finally:
                 # Cancel any remaining tasks
                 for task in tasks:
                     if not task.done():
                         task.cancel()
-                        
-            except Exception as e:
-                logger.error(f"Error during shutdown: {e}")
-                
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as e:
+                            logger.error(f"Error cancelling task during shutdown: {e}")
+
     async def _execute_handler(self, name: str, handler: Callable[[], Coroutine[Any, Any, None]]):
         """Execute a single shutdown handler with error handling"""
         try:
@@ -69,14 +73,15 @@ class ShutdownManager:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(
                     sig,
-                    lambda s=sig: asyncio.create_task(self._signal_handler(s))
+                    lambda s=sig: asyncio.create_task(
+                        self.handle_shutdown_signal(s)
+                    )
                 )
             logger.info("Signal handlers registered successfully")
-            
-        except NotImplementedError:
-            logger.warning("Signal handlers not supported on this platform")
-            
-    async def _signal_handler(self, sig: signal.Signals):
+        except Exception as e:
+            logger.error(f"Failed to set up signal handlers: {e}")
+
+    async def handle_shutdown_signal(self, sig: signal.Signals):
         """Handle shutdown signals"""
-        logger.info(f"Received signal {sig.name}")
+        logger.info(f"Received signal {sig.name}, initiating shutdown...")
         await self.cleanup()

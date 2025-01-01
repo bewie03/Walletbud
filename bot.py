@@ -298,10 +298,8 @@ class WalletBudBot(commands.Bot):
         self.ssl_context = init_ssl_context()
         
         # Initialize aiohttp connector with default settings
-        self.connector = aiohttp.TCPConnector(ssl=self.ssl_context, limit=100)
-        
-        # Initialize session with the connector
-        self.session = aiohttp.ClientSession(connector=self.connector)
+        self.connector = None
+        self.session = None
         
         # Add command locks
         self.command_locks = {}
@@ -466,77 +464,27 @@ class WalletBudBot(commands.Bot):
     async def setup_hook(self):
         """Set up the bot's background tasks and signal handlers"""
         try:
-            logger.info("Starting bot setup...")
+            # Initialize connector and session
+            self.connector = aiohttp.TCPConnector(ssl=self.ssl_context, limit=100)
+            self.session = aiohttp.ClientSession(connector=self.connector)
             
-            # Validate environment and initialize dependencies
+            # Initialize dependencies
             await self.validate_and_init_dependencies()
             
             # Set up admin channel
             await self.setup_admin_channel()
             
-            # Initialize database
-            await self.init_database()
-            
-            # Initialize Blockfrost client
-            await self.init_blockfrost()
-            
-            # Start webhook server
-            await self.start_webhook()
-            
-            # Start webhook processor
-            self._webhook_processor = asyncio.create_task(self._process_webhook_queue())
-            
-            # Start health check task
+            # Start background tasks
             self.health_check_task.start()
-            
-            # Start YUMMI balance check task
             self.check_yummi_balances.start()
             
-            # Log successful setup
+            # Set up signal handlers
+            loop = asyncio.get_running_loop()
+            self.shutdown_manager.setup_signal_handlers(loop)
+            
             logger.info("Bot setup completed successfully")
-            
         except Exception as e:
-            logger.error(f"Error during bot initialization: {e}")
-            if self.admin_channel:
-                await self.admin_channel.send(f" Error during bot initialization: {e}")
-            raise
-            
-    async def validate_and_init_dependencies(self):
-        """Validate and initialize all critical dependencies"""
-        try:
-            # Check environment variables
-            await self.check_environment()
-            logger.info("Environment variables validated")
-            if self.admin_channel:
-                await self.admin_channel.send(" Environment variables validated")
-            
-            # Initialize database
-            await self.init_database()
-            logger.info("Database initialized")
-            if self.admin_channel:
-                await self.admin_channel.send(" Database initialized")
-            
-            # Initialize Blockfrost client
-            await self.init_blockfrost()
-            logger.info("Blockfrost client initialized")
-            if self.admin_channel:
-                await self.admin_channel.send(" Blockfrost API connection established")
-            
-            # Initialize HTTP session
-            self.session = aiohttp.ClientSession(connector=self.connector)
-            logger.info("HTTP session initialized")
-            if self.admin_channel:
-                await self.admin_channel.send(" HTTP session initialized")
-            
-            # Log successful initialization
-            logger.info("All dependencies initialized successfully")
-            if self.admin_channel:
-                await self.admin_channel.send(" All dependencies initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize dependencies: {e}")
-            if self.admin_channel:
-                await self.admin_channel.send(f" ERROR: Failed to initialize dependencies: {e}")
+            logger.error(f"Error in setup_hook: {e}")
             raise
             
     async def on_error(self, event_method: str, *args, **kwargs):
@@ -665,45 +613,6 @@ class WalletBudBot(commands.Bot):
             'health': self.health
         }
         return handlers.get(command_name)
-
-    async def _handle_discord_error(self, interaction: discord.Interaction, error: Exception):
-        """Handle Discord-specific errors"""
-        try:
-            if isinstance(error, discord.errors.Forbidden):
-                await interaction.followup.send(
-                    "I don't have permission to do that.",
-                    ephemeral=True
-                )
-            elif isinstance(error, discord.errors.NotFound):
-                await interaction.followup.send(
-                    "The requested resource was not found.",
-                    ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    "An error occurred while processing your command.",
-                    ephemeral=True
-                )
-        except Exception as e:
-            logger.error(f"Error handling Discord error: {e}")
-            
-    async def _handle_command_error(self, interaction: discord.Interaction, error: Exception):
-        """Handle general command errors"""
-        try:
-            # Log error details
-            logger.error(f"Command error: {error}", exc_info=True)
-            
-            # Send user-friendly error message
-            await interaction.followup.send(
-                "An error occurred while processing your command. Please try again later.",
-                ephemeral=True
-            )
-            
-            # Send detailed error to admin channel
-            await self._handle_command_error(interaction, error)
-            
-        except Exception as e:
-            logger.error(f"Error handling command error: {e}")
 
     async def safe_send(self, interaction: discord.Interaction, content: str, *, ephemeral: bool = True) -> bool:
         """Safely send a message through interaction, handling rate limits and errors"""
@@ -1750,11 +1659,29 @@ if __name__ == "__main__":
                 # Get port from environment for Heroku
                 port = int(os.getenv('PORT', 8080))
                 
-                # Start webhook server
-                await bot.start_webhook()
+                # Create event loop
+                loop = asyncio.get_running_loop()
                 
-                # Run the bot
-                await bot.start(DISCORD_TOKEN)
+                # Set up signal handlers for graceful shutdown
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(
+                        bot.close()
+                    ))
+                
+                try:
+                    # Start webhook server
+                    await bot.start_webhook()
+                    
+                    # Run the bot
+                    await bot.start(DISCORD_TOKEN)
+                except Exception as e:
+                    logger.error(f"Error during bot operation: {e}")
+                    raise
+                finally:
+                    # Ensure cleanup happens
+                    if not loop.is_closed():
+                        await bot.close()
+                        
             except Exception as e:
                 logger.error(f"Error during bot initialization: {e}")
                 raise
