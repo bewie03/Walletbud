@@ -60,7 +60,6 @@ from database import (
     # Stake address management
     get_stake_address,
     update_stake_address,
-    get_user_stake_addresses,
     get_user_id_for_stake_address,
     get_addresses_for_stake,
     
