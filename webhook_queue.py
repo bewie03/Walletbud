@@ -8,7 +8,9 @@ import asyncio
 import json
 import time
 import os
-from typing import Dict, Any, Optional, List
+import hmac
+import hashlib
+from typing import Dict, Any, Optional, List, Callable
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from collections import deque
@@ -20,7 +22,8 @@ from config import (
     MAX_RETRIES,
     MAX_EVENT_AGE,
     BATCH_SIZE,
-    MAX_WEBHOOK_SIZE
+    MAX_WEBHOOK_SIZE,
+    WEBHOOK_SECRET
 )
 
 # Get port from Heroku environment, default to 8080 for local development
@@ -50,69 +53,98 @@ class WebhookEvent:
         """Check if event should be retried based on age and retry count"""
         if self.retries >= MAX_RETRIES:
             return False
-        
+            
         if self.age_seconds > MAX_EVENT_AGE:
             return False
             
+        # Implement exponential backoff
         if self.last_retry:
-            # Exponential backoff: wait 2^retries seconds
-            wait_time = 2 ** self.retries
-            time_since_retry = (datetime.now() - self.last_retry).total_seconds()
-            return time_since_retry >= wait_time
-            
+            backoff = min(300, 2 ** self.retries)  # Cap at 5 minutes
+            next_retry = self.last_retry + timedelta(seconds=backoff)
+            if datetime.now() < next_retry:
+                return False
+                
         return True
+        
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert event to dictionary for storage"""
+        return {
+            'id': self.id,
+            'event_type': self.event_type,
+            'payload': self.payload,
+            'headers': self.headers,
+            'created_at': self.created_at.isoformat(),
+            'retries': self.retries,
+            'last_retry': self.last_retry.isoformat() if self.last_retry else None,
+            'error': self.error
+        }
+        
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'WebhookEvent':
+        """Create event from dictionary"""
+        return cls(
+            id=data['id'],
+            event_type=data['event_type'],
+            payload=data['payload'],
+            headers=data['headers'],
+            created_at=datetime.fromisoformat(data['created_at']),
+            retries=data['retries'],
+            last_retry=datetime.fromisoformat(data['last_retry']) if data['last_retry'] else None,
+            error=data['error']
+        )
 
 class RateLimiter:
-    """Rate limiter for webhook requests"""
+    """Rate limiter for webhook requests with burst support"""
     def __init__(self, window: int = RATE_LIMIT_WINDOW, max_requests: int = RATE_LIMIT_MAX_REQUESTS):
         self.window = window
         self.max_requests = max_requests
         self.requests: Dict[str, List[datetime]] = {}
         self.lock = asyncio.Lock()
+        self.last_cleanup = datetime.now()
         
     async def is_allowed(self, ip: str) -> bool:
-        """Check if request is allowed for IP
-        
-        Args:
-            ip (str): IP address
-            
-        Returns:
-            bool: True if allowed, False if rate limited
-        """
+        """Check if request is allowed for IP with burst handling"""
         async with self.lock:
             now = datetime.now()
             
-            # Clean up old IPs periodically
-            if len(self.requests) > 1000:  # Arbitrary limit
-                cutoff = now - timedelta(seconds=self.window * 2)
-                self.requests = {
-                    ip: times for ip, times in self.requests.items()
-                    if any(t > cutoff for t in times)
-                }
-            
+            # Cleanup old entries periodically
+            if (now - self.last_cleanup).total_seconds() > 60:
+                await self.cleanup()
+                self.last_cleanup = now
+                
+            # Initialize if IP not seen before
             if ip not in self.requests:
                 self.requests[ip] = []
                 
-            # Remove old requests
-            cutoff = now - timedelta(seconds=self.window)
-            self.requests[ip] = [t for t in self.requests[ip] if t > cutoff]
+            # Remove old requests outside window
+            window_start = now - timedelta(seconds=self.window)
+            self.requests[ip] = [ts for ts in self.requests[ip] if ts > window_start]
             
-            # Check rate limit
-            if len(self.requests[ip]) >= self.max_requests:
+            # Check rate limit with burst allowance
+            current_requests = len(self.requests[ip])
+            if current_requests >= self.max_requests:
+                # Allow burst if no requests in last second
+                if current_requests < self.max_requests * 2:
+                    last_request = self.requests[ip][-1]
+                    if (now - last_request).total_seconds() > 1:
+                        self.requests[ip].append(now)
+                        return True
                 return False
                 
-            # Add new request
             self.requests[ip].append(now)
             return True
-        
-    def cleanup(self):
+            
+    async def cleanup(self):
         """Remove old rate limit data"""
-        now = datetime.now()
-        cutoff = now - timedelta(seconds=self.window)
-        for ip in list(self.requests.keys()):
-            self.requests[ip] = [t for t in self.requests[ip] if t > cutoff]
-            if not self.requests[ip]:
-                del self.requests[ip]
+        async with self.lock:
+            now = datetime.now()
+            window_start = now - timedelta(seconds=self.window)
+            
+            # Clean up old requests and remove empty IPs
+            for ip in list(self.requests.keys()):
+                self.requests[ip] = [ts for ts in self.requests[ip] if ts > window_start]
+                if not self.requests[ip]:
+                    del self.requests[ip]
 
 class WebhookQueue:
     """Queue for processing webhooks with rate limiting and retries"""
@@ -121,9 +153,9 @@ class WebhookQueue:
         self.queue = deque(maxlen=MAX_QUEUE_SIZE)
         self.processing = False
         self.process_lock = asyncio.Lock()
-        self.queue_lock = asyncio.Lock()  # Separate lock for queue operations
+        self.queue_lock = asyncio.Lock()
         self.rate_limiter = RateLimiter()
-        self.errors: deque[QueueError] = deque(maxlen=1000)
+        self.errors = deque(maxlen=1000)
         self.stats = {
             'total_received': 0,
             'total_processed': 0,
@@ -133,75 +165,84 @@ class WebhookQueue:
             'total_invalid': 0,
             'total_rate_limited': 0,
             'current_queue_size': 0,
-            'last_process_time': None
+            'last_process_time': None,
+            'processing_time_avg': 0.0,
+            'retry_success_rate': 0.0
         }
+        self.event_handlers: Dict[str, Callable] = {}
         
-    def _validate_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
-        """Validate event payload
+    def register_handler(self, event_type: str, handler: Callable):
+        """Register handler for event type"""
+        self.event_handlers[event_type] = handler
         
-        Args:
-            event_type (str): Type of event
-            payload (Dict[str, Any]): Event payload
+    def _validate_signature(self, payload: bytes, signature: str) -> bool:
+        """Validate webhook signature"""
+        if not WEBHOOK_SECRET or not signature:
+            return False
             
-        Returns:
-            bool: True if valid, False otherwise
-        """
+        try:
+            # Calculate expected signature
+            expected = hmac.new(
+                WEBHOOK_SECRET.encode(),
+                payload,
+                hashlib.sha256
+            ).hexdigest()
+            
+            # Constant-time comparison
+            return hmac.compare_digest(signature, expected)
+        except Exception as e:
+            logger.error(f"Error validating signature: {e}")
+            return False
+            
+    async def _validate_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
+        """Validate event payload with comprehensive checks"""
         try:
             # Check payload size
-            payload_size = len(json.dumps(payload).encode('utf-8'))
-            if payload_size > MAX_WEBHOOK_SIZE:  # 1MB
-                logger.error(f"Event payload too large: {payload_size} bytes")
-                self.stats['total_oversized'] += 1
+            payload_size = len(json.dumps(payload))
+            if payload_size > MAX_WEBHOOK_SIZE:
+                self._add_error('oversized_payload', f'Payload size {payload_size} exceeds limit')
                 return False
-            
-            # Validate required fields
+                
+            # Basic structure validation
+            required_fields = {'address', 'timestamp', 'data'}
+            if not all(field in payload for field in required_fields):
+                self._add_error('missing_fields', 'Missing required fields')
+                return False
+                
+            # Validate timestamp
+            try:
+                event_time = datetime.fromisoformat(payload['timestamp'])
+                if abs((datetime.now() - event_time).total_seconds()) > MAX_EVENT_AGE:
+                    self._add_error('invalid_timestamp', 'Event timestamp too old or future')
+                    return False
+            except ValueError:
+                self._add_error('invalid_timestamp', 'Invalid timestamp format')
+                return False
+                
+            # Validate address format
+            if not payload['address'].startswith(('addr1', 'stake1')):
+                self._add_error('invalid_address', 'Invalid address format')
+                return False
+                
+            # Event-specific validation
             if event_type == 'transaction':
-                required = ['addresses', 'tx_hash', 'block_height']
+                if 'tx_hash' not in payload['data']:
+                    self._add_error('missing_tx_hash', 'Transaction missing tx_hash')
+                    return False
             elif event_type == 'delegation':
-                required = ['stake_address', 'pool_id', 'block_height']
-            else:
-                logger.error(f"Invalid event type: {event_type}")
-                self.stats['total_invalid'] += 1
-                return False
-            
-            # Check all required fields exist
-            if not all(field in payload for field in required):
-                logger.error(f"Missing required fields in {event_type} event")
-                self.stats['total_invalid'] += 1
-                return False
-            
-            # Validate field types
-            if event_type == 'transaction':
-                if not isinstance(payload['addresses'], list):
-                    logger.error("addresses must be a list")
-                    self.stats['total_invalid'] += 1
+                if 'pool_id' not in payload['data']:
+                    self._add_error('missing_pool_id', 'Delegation missing pool_id')
                     return False
-                if not isinstance(payload['tx_hash'], str):
-                    logger.error("tx_hash must be a string")
-                    self.stats['total_invalid'] += 1
-                    return False
-                if not isinstance(payload['block_height'], int):
-                    logger.error("block_height must be an integer")
-                    self.stats['total_invalid'] += 1
-                    return False
-            
+                    
             return True
             
         except Exception as e:
-            logger.error(f"Error validating event: {str(e)}")
-            self.stats['total_invalid'] += 1
+            self._add_error('validation_error', str(e))
             return False
-        
-    def _add_error(self, error_type: str, message: str, event_id: Optional[str] = None, 
-                  details: Optional[Dict[str, Any]] = None):
-        """Add error to history
-        
-        Args:
-            error_type (str): Type of error
-            message (str): Error message
-            event_id (Optional[str]): Associated event ID
-            details (Optional[Dict[str, Any]]): Additional error details
-        """
+            
+    def _add_error(self, error_type: str, message: str, event_id: Optional[str] = None,
+                   details: Optional[Dict[str, Any]] = None):
+        """Add error to history with metadata"""
         error = QueueError(
             timestamp=datetime.now(),
             error_type=error_type,
@@ -210,91 +251,91 @@ class WebhookQueue:
             details=details
         )
         self.errors.append(error)
-        logger.error(f"{error_type}: {message}")
+        logger.error(f"Queue error: {error_type} - {message}")
         
-    async def add_event(self, event_id: str, event_type: str, 
+    async def add_event(self, event_id: str, event_type: str,
                        payload: Dict[str, Any], headers: Dict[str, str]) -> bool:
-        """Add new event to queue
-        
-        Args:
-            event_id (str): Unique event ID
-            event_type (str): Type of event (transaction/delegation)
-            payload (Dict[str, Any]): Event payload
-            headers (Dict[str, str]): Request headers
-            
-        Returns:
-            bool: True if added successfully, False if queue full
-        """
-        async with self.queue_lock:
-            if len(self.queue) >= MAX_QUEUE_SIZE:
-                self._add_error(
-                    'QUEUE_FULL',
-                    "Queue is full, event rejected",
-                    event_id
+        """Add new event to queue with validation"""
+        try:
+            async with self.queue_lock:
+                if len(self.queue) >= MAX_QUEUE_SIZE:
+                    self._add_error('queue_full', f'Queue full ({MAX_QUEUE_SIZE} events)')
+                    self.stats['total_failed'] += 1
+                    return False
+                    
+                # Validate event
+                if not await self._validate_event(event_type, payload):
+                    self.stats['total_invalid'] += 1
+                    return False
+                    
+                # Create and add event
+                event = WebhookEvent(
+                    id=event_id,
+                    event_type=event_type,
+                    payload=payload,
+                    headers=headers,
+                    created_at=datetime.now()
                 )
-                return False
-
-            # Validate event
-            if not self._validate_event(event_type, payload):
-                self.stats['total_invalid'] += 1
-                return False
-
-            # Create event
-            event = WebhookEvent(
-                id=event_id,
-                event_type=event_type,
-                payload=payload,
-                headers=headers,
-                created_at=datetime.now()
-            )
-
-            # Add to queue
-            self.queue.append(event)
-            self.stats['total_received'] += 1
-            self.stats['current_queue_size'] = len(self.queue)
-            return True
-
-    async def process_queue(self, handler):
-        """Process events in queue
-        
-        Args:
-            handler: Async function to handle events
-        """
+                
+                self.queue.append(event)
+                self.stats['total_received'] += 1
+                self.stats['current_queue_size'] = len(self.queue)
+                
+                logger.info(f"Added event {event_id} to queue (size: {len(self.queue)})")
+                return True
+                
+        except Exception as e:
+            self._add_error('add_event_error', str(e), event_id)
+            return False
+            
+    async def process_queue(self, handler: Optional[Callable] = None):
+        """Process events in queue with batching and error handling"""
         if self.processing:
             return
-
-        async with self.process_lock:
-            if self.processing:
-                return
-                
-            try:
+            
+        try:
+            async with self.process_lock:
                 self.processing = True
-                self.stats['last_process_time'] = datetime.now()
+                start_time = time.time()
                 
-                while True:
+                while self.queue:
+                    # Process events in batches
                     batch = []
                     async with self.queue_lock:
-                        # Get batch of events
                         while len(batch) < BATCH_SIZE and self.queue:
-                            event = self.queue[0]
-                            if not event.should_retry:
-                                self.queue.popleft()
-                                continue
-                            batch.append(self.queue.popleft())
-                    
+                            event = self.queue.popleft()
+                            if event.should_retry or event.retries == 0:
+                                batch.append(event)
+                            else:
+                                self._add_error('max_retries', 
+                                              f'Event {event.id} exceeded max retries',
+                                              event.id)
+                                self.stats['total_failed'] += 1
+                                
                     if not batch:
-                        break
+                        continue
                         
                     # Process batch
                     for event in batch:
                         try:
-                            await handler(
+                            # Use registered handler or fallback
+                            event_handler = self.event_handlers.get(
                                 event.event_type,
-                                event.payload,
-                                event.headers
+                                handler
                             )
-                            self.stats['total_processed'] += 1
                             
+                            if not event_handler:
+                                raise ValueError(f"No handler for event type: {event.event_type}")
+                                
+                            await event_handler(event.payload)
+                            
+                            self.stats['total_processed'] += 1
+                            if event.retries > 0:
+                                self.stats['retry_success_rate'] = (
+                                    self.stats['total_processed'] /
+                                    (self.stats['total_processed'] + self.stats['total_failed'])
+                                )
+                                
                         except Exception as e:
                             event.retries += 1
                             event.last_retry = datetime.now()
@@ -305,79 +346,67 @@ class WebhookQueue:
                                     self.queue.append(event)
                                 self.stats['total_retried'] += 1
                             else:
+                                self._add_error('processing_failed',
+                                              f'Failed to process event: {str(e)}',
+                                              event.id)
                                 self.stats['total_failed'] += 1
-                                self._add_error(
-                                    'PROCESSING',
-                                    f"Failed to process event after {event.retries} retries",
-                                    event.id,
-                                    {'error': str(e)}
-                                )
-                    
+                                
+                    # Update stats
                     self.stats['current_queue_size'] = len(self.queue)
+                    self.stats['last_process_time'] = datetime.now().isoformat()
                     
-            finally:
-                self.processing = False
-                
+                    # Calculate average processing time
+                    process_time = time.time() - start_time
+                    self.stats['processing_time_avg'] = (
+                        self.stats['processing_time_avg'] * 0.9 +
+                        process_time * 0.1
+                    )
+                    
+                    # Avoid blocking event loop
+                    await asyncio.sleep(0)
+                    
+        except Exception as e:
+            self._add_error('queue_processing_error', str(e))
+        finally:
+            self.processing = False
+            
     async def clear_old_events(self) -> int:
-        """Clear events older than MAX_EVENT_AGE
-        
-        Returns:
-            int: Number of events cleared
-        """
+        """Clear events older than MAX_EVENT_AGE"""
+        cleared = 0
         async with self.queue_lock:
-            now = datetime.now()
-            original_size = len(self.queue)
+            current_time = datetime.now()
+            remaining_events = deque()
             
-            # Use list comprehension for efficiency
-            self.queue = deque(
-                [event for event in self.queue 
-                 if event.age_seconds <= MAX_EVENT_AGE],
-                maxlen=MAX_QUEUE_SIZE
-            )
+            while self.queue:
+                event = self.queue.popleft()
+                if event.age_seconds <= MAX_EVENT_AGE:
+                    remaining_events.append(event)
+                else:
+                    cleared += 1
+                    self._add_error('event_expired',
+                                  f'Event {event.id} expired',
+                                  event.id)
+                    
+            self.queue = remaining_events
+            self.stats['current_queue_size'] = len(self.queue)
             
-            cleared = original_size - len(self.queue)
-            if cleared > 0:
-                logger.info(f"Cleared {cleared} old events from queue")
-                self.stats['current_queue_size'] = len(self.queue)
-            
-            return cleared
-
+        return cleared
+        
     def get_stats(self) -> Dict[str, Any]:
-        """Get queue statistics
-        
-        Returns:
-            Dict[str, Any]: Queue statistics
-        """
-        recent_errors = [
-            {
-                'type': e.error_type,
-                'message': e.message,
-                'timestamp': e.timestamp.isoformat(),
-                'event_id': e.event_id,
-                'details': e.details
-            }
-            for e in list(self.errors)[-10:]  # Get last 10 errors
-        ]
-        
-        # Get oldest and newest events efficiently
-        oldest_event = None
-        newest_event = None
-        if self.queue:
-            try:
-                oldest_event = self.queue[0].created_at
-                newest_event = self.queue[-1].created_at
-            except IndexError:
-                # Queue was modified while we were reading it
-                pass
-        
-        return {
-            'queue_size': len(self.queue),
-            'is_processing': self.processing,
-            'stats': self.stats,
-            'oldest_event': oldest_event,
-            'newest_event': newest_event,
-            'recent_errors': recent_errors
-        }
+        """Get comprehensive queue statistics"""
+        stats = self.stats.copy()
+        stats.update({
+            'error_count': len(self.errors),
+            'recent_errors': [
+                {
+                    'type': e.error_type,
+                    'message': e.message,
+                    'timestamp': e.timestamp.isoformat()
+                }
+                for e in list(self.errors)[-5:]  # Last 5 errors
+            ]
+        })
+        return stats
 
 @dataclass
 class QueueError:

@@ -74,7 +74,8 @@ from config import (
     WEBHOOK_AUTH_TOKEN,
     WEBHOOK_CONFIRMATIONS,
     ERROR_MESSAGES,
-    WEBHOOK_RETRY_ATTEMPTS
+    WEBHOOK_RETRY_ATTEMPTS,
+    SSL_CERT_FILE
 )
 
 import uuid
@@ -288,37 +289,51 @@ class WalletBudBot(commands.Bot):
         # Add command locks
         self.command_locks = {}
         self.health_lock = asyncio.Lock()  # Specific lock for health command
-
+        
+        # Initialize webhook rate limiting
+        self.webhook_rate_limits = {}
+        
     async def setup_hook(self):
         """Set up the bot's background tasks"""
         try:
-            logger.info("Setting up bot...")
-            
-            # Initialize database
+            # Initialize critical components with proper error handling
             await self.init_database()
-            logger.info("Database initialized")
+            await self.setup_admin_channel()
             
-            # Initialize Blockfrost client
-            await self.init_blockfrost()
-            logger.info("Blockfrost client initialized")
+            try:
+                await self.init_blockfrost()
+            except Exception as e:
+                logger.error(f"Failed to initialize Blockfrost: {e}")
+                await self.send_admin_alert("⚠️ Blockfrost initialization failed. Bot will continue with limited functionality.")
             
-            # Set up admin channel
-            if self.admin_channel_id:
-                await self.setup_admin_channel()
-                logger.info("Admin channel setup complete")
+            # Initialize aiohttp session with SSL context
+            if not self.session:
+                self.session = aiohttp.ClientSession(connector=self.connector)
+            
+            # Set up webhook handling
+            self.app.router.add_post('/webhook', self.handle_webhook)
+            await self.runner.setup()
+            
+            try:
+                port = int(os.getenv("PORT", 8080))
+                self.site = web.TCPSite(self.runner, "0.0.0.0", port)
+                await self.site.start()
+                logger.info(f"Webhook server started on port {port}")
+            except Exception as e:
+                logger.error(f"Failed to start webhook server: {e}")
+                await self.send_admin_alert("⚠️ Webhook server failed to start. Notifications may be delayed.")
             
             # Start background tasks
-            self._check_connection_loop.start()
             self.check_yummi_balances.start()
-            logger.info("Background tasks started")
+            self._webhook_processor = asyncio.create_task(self._process_webhook_queue())
             
             # Update health metrics
-            self.health_metrics['start_time'] = datetime.now().isoformat()
-            logger.info("Bot setup complete")
+            self.health_metrics['start_time'] = datetime.utcnow()
             
         except Exception as e:
-            logger.error(f"Error in setup_hook: {str(e)}", exc_info=True)
-            raise
+            logger.error(f"Critical error during bot setup: {e}")
+            await self.send_admin_alert(f"🚨 Critical error during bot setup: {str(e)}")
+            raise  # Re-raise to prevent bot from starting in an invalid state
 
     async def close(self):
         """Clean up resources when the bot is shutting down."""
@@ -572,87 +587,137 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error sending DM: {str(e)}")
 
-    @app_commands.command(name="health", description="Check system health and status")
-    async def health(self, interaction: discord.Interaction):
-        """Check system health and status"""
+    async def health_check(self) -> Dict[str, Any]:
+        """Comprehensive health check of all system components"""
+        health = {
+            'status': 'healthy',
+            'components': {},
+            'metrics': {},
+            'errors': []
+        }
+        
         try:
-            # Acquire lock to prevent concurrent health checks
-            async with self.health_lock:
-                # Create embed for health status
-                embed = discord.Embed(
-                    title="🏥 System Health Report",
-                    description="Current status of bot systems",
-                    color=discord.Color.blue()
-                )
+            # Check Discord connection
+            health['components']['discord'] = {
+                'status': 'connected' if self.is_ready() else 'disconnected',
+                'latency': round(self.latency * 1000, 2),  # ms
+                'guilds': len(self.guilds)
+            }
+            
+            # Check Blockfrost
+            try:
+                if self.blockfrost:
+                    await self.blockfrost.health()
+                    health['components']['blockfrost'] = {
+                        'status': 'healthy',
+                        'last_call': self.health_metrics.get('last_api_call')
+                    }
+                else:
+                    health['components']['blockfrost'] = {
+                        'status': 'not_initialized'
+                    }
+            except Exception as e:
+                health['components']['blockfrost'] = {
+                    'status': 'error',
+                    'error': str(e)
+                }
+                health['errors'].append(f"Blockfrost error: {str(e)}")
                 
-                # Add bot uptime
-                if self.health_metrics['start_time']:
-                    start_time = datetime.fromisoformat(self.health_metrics['start_time'])
-                    uptime = datetime.now() - start_time
-                    hours = int(uptime.total_seconds() / 3600)
-                    minutes = int((uptime.total_seconds() % 3600) / 60)
-                    embed.add_field(
-                        name="⏱️ Uptime",
-                        value=f"{hours} hours, {minutes} minutes",
-                        inline=True
-                    )
+            # Check database
+            try:
+                async with self.pool.acquire() as conn:
+                    await conn.execute('SELECT 1')
+                    health['components']['database'] = {
+                        'status': 'connected',
+                        'pool_size': self.pool.get_size(),
+                        'free_size': self.pool.get_free_size()
+                    }
+            except Exception as e:
+                health['components']['database'] = {
+                    'status': 'error',
+                    'error': str(e)
+                }
+                health['errors'].append(f"Database error: {str(e)}")
                 
-                # Add API status
-                api_status = "🟢 Online" if self.blockfrost else "🔴 Offline"
-                embed.add_field(
-                    name="🌐 Blockfrost API",
-                    value=api_status,
-                    inline=True
-                )
-                
-                # Add database status
-                db_status = "🟢 Connected" if hasattr(self, 'pool') and self.pool else "🔴 Disconnected"
-                embed.add_field(
-                    name="🗄️ Database",
-                    value=db_status,
-                    inline=True
-                )
-                
-                # Add webhook metrics
-                embed.add_field(
-                    name="📊 Webhook Metrics",
-                    value=f"Success: {self.health_metrics.get('webhook_success', 0)}\nFailures: {self.health_metrics.get('webhook_failure', 0)}",
-                    inline=True
-                )
-                
-                # Add last activity timestamps
-                timestamps = []
-                if self.health_metrics.get('last_api_call'):
-                    timestamps.append(f"API Call: {self.health_metrics['last_api_call']}")
-                if self.health_metrics.get('last_db_query'):
-                    timestamps.append(f"DB Query: {self.health_metrics['last_db_query']}")
-                if self.health_metrics.get('last_webhook'):
-                    timestamps.append(f"Webhook: {self.health_metrics['last_webhook']}")
-                
-                if timestamps:
-                    embed.add_field(
-                        name="⏰ Last Activity",
-                        value="\n".join(timestamps),
-                        inline=False
-                    )
-                
-                # Add recent errors if any
-                recent_errors = self.health_metrics.get('errors', [])[-5:]  # Show last 5 errors
-                if recent_errors:
-                    error_text = "\n".join(f"• {error}" for error in recent_errors)
-                    embed.add_field(
-                        name="❌ Recent Errors",
-                        value=error_text[:1024],  # Discord field value limit
-                        inline=False
-                    )
-                
-                # Send response
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+            # Check webhook server
+            health['components']['webhook'] = {
+                'status': 'running' if self.site else 'stopped',
+                'queue_size': self._webhook_queue.qsize(),
+                'success_count': self.health_metrics.get('webhook_success', 0),
+                'failure_count': self.health_metrics.get('webhook_failure', 0)
+            }
+            
+            # System metrics
+            health['metrics'] = {
+                'uptime': str(datetime.utcnow() - self.health_metrics['start_time']),
+                'memory_usage': psutil.Process().memory_info().rss / 1024 / 1024,  # MB
+                'cpu_percent': psutil.Process().cpu_percent(),
+                'thread_count': psutil.Process().num_threads()
+            }
+            
+            # Overall status
+            if health['errors']:
+                health['status'] = 'degraded' if len(health['errors']) < 2 else 'unhealthy'
                 
         except Exception as e:
-            logger.error(f"Error in health command: {str(e)}", exc_info=True)
+            health['status'] = 'error'
+            health['errors'].append(f"Health check error: {str(e)}")
+            
+        return health
+        
+    @app_commands.command(name="health")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def health(self, interaction: discord.Interaction):
+        """Check bot health status"""
+        try:
+            # Run health check
+            health = await self.health_check()
+            
+            # Create embed
+            embed = discord.Embed(
+                title="🏥 Bot Health Status",
+                color=discord.Color.green() if health['status'] == 'healthy'
+                else discord.Color.orange() if health['status'] == 'degraded'
+                else discord.Color.red()
+            )
+            
+            # Components
+            components = []
+            for name, info in health['components'].items():
+                status_emoji = "✅" if info['status'] in ['healthy', 'connected', 'running'] else "⚠️" if info['status'] == 'degraded' else "❌"
+                components.append(f"{status_emoji} **{name.title()}**: {info['status']}")
+            embed.add_field(
+                name="Components",
+                value="\n".join(components),
+                inline=False
+            )
+            
+            # Metrics
+            metrics = []
+            for name, value in health['metrics'].items():
+                if isinstance(value, float):
+                    value = f"{value:.2f}"
+                metrics.append(f"**{name.replace('_', ' ').title()}**: {value}")
+            embed.add_field(
+                name="Metrics",
+                value="\n".join(metrics),
+                inline=False
+            )
+            
+            # Errors
+            if health['errors']:
+                embed.add_field(
+                    name="⚠️ Errors",
+                    value="\n".join(f"- {error}" for error in health['errors'][-5:]),  # Show last 5 errors
+                    inline=False
+                )
+                
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"Error in health command: {e}")
             await interaction.response.send_message(
-                "❌ An error occurred while checking system health. Please try again later.",
+                "❌ Error running health check. Check logs for details.",
                 ephemeral=True
             )
 
@@ -680,14 +745,6 @@ class WalletBudBot(commands.Bot):
             # Start connection check task
             self.check_connection_task = self.loop.create_task(self._check_connection_loop())
             logger.info("Connection check task started")
-            
-            # Start background tasks if database is available
-            if hasattr(self, 'pool') and self.pool:
-                try:
-                    self.check_yummi_balances.start()
-                    logger.info("YUMMI balance check task started")
-                except Exception as e:
-                    logger.error(f"Could not start YUMMI balance check: {e}")
             
             # Update health metrics
             await self.update_health_metrics('start_time', datetime.now().isoformat())
@@ -875,195 +932,112 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error in on_resumed: {str(e)}", exc_info=True)
 
     async def check_webhook_rate_limit(self, ip: str) -> bool:
-        """Check if webhook request exceeds rate limit
+        """Check if webhook request exceeds rate limit"""
+        # Use a more granular rate limit per IP
+        rate_key = f"webhook:{ip}"
+        now = datetime.utcnow()
         
-        Args:
-            ip (str): IP address of the request
+        async with self.rate_limiter.acquire("webhook"):
+            # Get current state
+            state = self.webhook_rate_limits.get(rate_key, {
+                'count': 0,
+                'reset_at': now
+            })
             
-        Returns:
-            bool: True if allowed, False if rate limited
-        """
-        async with self.webhook_lock:
-            now = time.time()
-            minute_ago = now - 60
+            # Reset if window has passed
+            if now > state['reset_at']:
+                state = {
+                    'count': 0,
+                    'reset_at': now + timedelta(minutes=1)
+                }
+                
+            # Check limit
+            if state['count'] >= WEBHOOK_RATE_LIMIT:
+                return False
+                
+            # Update state
+            state['count'] += 1
+            self.webhook_rate_limits[rate_key] = state
             
-            # Clean old entries
-            self.webhook_counts = {
-                k: (count, ts) for k, (count, ts) in self.webhook_counts.items()
-                if ts > minute_ago
-            }
-            
-            # Check current IP
-            if ip in self.webhook_counts:
-                count, _ = self.webhook_counts[ip]
-                if count >= WEBHOOK_RATE_LIMIT:
-                    logger.warning(f"Rate limit exceeded for IP {ip}")
-                    return False
-                self.webhook_counts[ip] = (count + 1, now)
-            else:
-                self.webhook_counts[ip] = (1, now)
-            
+            # Clean up old entries every 100 requests
+            if random.random() < 0.01:  # 1% chance
+                self._cleanup_rate_limits()
+                
             return True
-
-    async def handle_webhook_with_retry(self, request: web.Request):
-        """Handle webhook with exponential backoff retry"""
-        max_retries = 5
-        base_delay = 1  # Start with 1 second delay
-        
-        for attempt in range(max_retries):
-            try:
-                return await self.handle_webhook(request)
-            except discord.errors.HTTPException as e:
-                if e.status == 429:  # Rate limit error
-                    retry_after = e.retry_after if hasattr(e, 'retry_after') else base_delay * (2 ** attempt)
-                    logger.warning(f"Rate limited, waiting {retry_after}s before retry (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(retry_after)
-                else:
-                    raise
-            except Exception as e:
-                logger.error(f"Error processing webhook (attempt {attempt + 1}/{max_retries}): {str(e)}")
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(base_delay * (2 ** attempt))
-        
-        raise Exception("Max retries exceeded")
-
+            
+    def _cleanup_rate_limits(self):
+        """Clean up expired rate limit entries"""
+        now = datetime.utcnow()
+        expired = [
+            k for k, v in self.webhook_rate_limits.items()
+            if now > v['reset_at']
+        ]
+        for k in expired:
+            del self.webhook_rate_limits[k]
+            
     async def handle_webhook(self, request: web.Request) -> web.Response:
-        """Handle incoming webhooks from Blockfrost with comprehensive validation"""
-        request_id = get_request_id()
-        client_ip = request.remote
-        
+        """Handle incoming webhooks with comprehensive validation and rate limiting"""
         try:
-            # 1. IP Whitelist Check
-            if BLOCKFROST_IP_RANGES and not any(
-                ip_network(range).supernet_of(ip_network(client_ip))
-                for range in BLOCKFROST_IP_RANGES
-            ):
-                logger.warning(f"[{request_id}] Rejected webhook from unauthorized IP: {client_ip}")
-                return web.Response(status=403, text="Unauthorized IP")
-            
-            # 2. Rate Limit Check
-            if not self.check_webhook_rate_limit(client_ip):
-                logger.warning(f"[{request_id}] Rate limit exceeded for IP: {client_ip}")
-                return web.Response(status=429, text="Rate limit exceeded")
-            
-            # 3. Size Check
-            if request.content_length and request.content_length > MAX_WEBHOOK_SIZE:
-                logger.warning(f"[{request_id}] Webhook payload too large: {request.content_length} bytes")
-                return web.Response(status=413, text="Payload too large")
-            
-            # 4. Required Headers Check
-            webhook_id = request.headers.get('Webhook-Id')
-            signature = request.headers.get('Signature')
-            if not all([webhook_id, signature]):
-                logger.warning(f"[{request_id}] Missing required headers")
-                return web.Response(status=400, text="Missing required headers")
-            
-            # 5. Payload Validation
-            try:
-                payload = await request.json()
-            except Exception as e:
-                logger.warning(f"[{request_id}] Invalid JSON payload: {str(e)}")
-                return web.Response(status=400, text="Invalid JSON payload")
-            
-            # 6. Signature Verification
-            if not self.verify_webhook_signature(payload, signature):
-                logger.warning(f"[{request_id}] Invalid webhook signature")
-                return web.Response(status=401, text="Invalid signature")
-            
-            # 7. Queue the webhook for processing
-            try:
-                await self._webhook_queue.put({
-                    'id': request_id,
-                    'payload': payload,
-                    'headers': dict(request.headers),
-                    'timestamp': datetime.now().isoformat()
-                })
-                logger.info(f"[{request_id}] Webhook queued successfully")
-                return web.Response(status=202, text="Accepted")
-                
-            except asyncio.QueueFull:
-                logger.error(f"[{request_id}] Webhook queue is full")
-                return web.Response(status=503, text="Queue is full")
-                
+            # Verify webhook auth token
+            auth_token = request.headers.get('Authorization')
+            if not auth_token or auth_token != WEBHOOK_AUTH_TOKEN:
+                raise web.HTTPUnauthorized(text="Invalid authorization token")
+
+            # Get client IP and check rate limit
+            ip = request.remote
+            if not self.check_webhook_rate_limit(ip):
+                raise web.HTTPTooManyRequests(text="Rate limit exceeded")
+
+            # Verify webhook signature
+            signature = request.headers.get('Webhook-Signature')
+            if not signature:
+                raise web.HTTPBadRequest(text="Missing webhook signature")
+
+            # Read and validate request body
+            body = await request.read()
+            if len(body) > int(os.getenv('MAX_WEBHOOK_SIZE', 1048576)):
+                raise web.HTTPRequestEntityTooLarge(text="Webhook payload too large")
+
+            # Verify webhook identifier
+            data = json.loads(body)
+            if data.get('identifier') != WEBHOOK_IDENTIFIER:
+                raise web.HTTPBadRequest(text="Invalid webhook identifier")
+
+            # Check confirmation count
+            if data.get('confirmations', 0) < int(WEBHOOK_CONFIRMATIONS):
+                return web.Response(text="Waiting for more confirmations")
+
+            # Process the webhook
+            await self._webhook_queue.put(data)
+            return web.Response(text="Webhook received")
+
+        except json.JSONDecodeError:
+            raise web.HTTPBadRequest(text="Invalid JSON payload")
         except Exception as e:
-            logger.error(f"[{request_id}] Error processing webhook: {str(e)}")
-            return web.Response(status=500, text="Internal server error")
+            self.log_sanitized('error', f"Webhook error: {str(e)}")
+            raise web.HTTPInternalServerError(text="Internal server error")
 
     async def _process_webhook_queue(self):
-        """Process webhooks from queue"""
+        """Process webhooks from queue with error handling"""
         while True:
             try:
-                event_type, payload, headers = await self._webhook_queue.get()
+                webhook_data = await self._webhook_queue.get()
                 
                 try:
-                    await self._process_webhook_event(event_type, payload, headers)
-                except discord.errors.HTTPException as e:
-                    if e.status == 429:  # Rate limit error
-                        # Put the item back in queue with exponential backoff
-                        retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
-                        logger.warning(f"Rate limited in webhook queue, retrying in {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        await self._webhook_queue.put((event_type, payload, headers))
-                    else:
-                        logger.error(f"Discord API error processing webhook: {str(e)}")
+                    await self._process_webhook_event(
+                        webhook_data['type'],
+                        webhook_data,
+                        webhook_data['headers']
+                    )
                 except Exception as e:
-                    logger.error(f"Error processing webhook from queue: {str(e)}")
-                finally:
-                    self._webhook_queue.task_done()
+                    logger.error(f"Failed to process webhook event: {e}")
+                    self.health_metrics['webhook_failure'] += 1
                     
-            except asyncio.CancelledError:
-                break
+                self._webhook_queue.task_done()
+                
             except Exception as e:
-                logger.error(f"Unexpected error in webhook queue processor: {str(e)}")
-                await asyncio.sleep(5)  # Brief pause before continuing
-
-    async def _process_webhook_event(self, event_type: str, payload: Dict[str, Any], headers: Dict[str, str]):
-        """Process a single webhook event with sanitized logging"""
-        try:
-            # Sanitize headers for logging
-            safe_headers = {
-                k: "[REDACTED]" if k.lower() in ['authorization', 'signature', 'auth-token'] 
-                else v for k, v in headers.items()
-            }
-            
-            self.log_sanitized('info', 
-                f"Processing {event_type} webhook",
-                headers=safe_headers,
-                payload_size=len(str(payload))
-            )
-            
-            # Process based on event type
-            if event_type == 'transaction':
-                await self._handle_transaction_webhook(payload)
-            elif event_type == 'delegation':
-                await self._handle_delegation_webhook(payload)
-            else:
-                logger.warning(f"Unknown webhook event type: {event_type}")
-            
-            # Update success metrics
-            self.update_health_metrics('webhook_success', 
-                self.health_metrics.get('webhook_success', 0) + 1
-            )
-            
-        except Exception as e:
-            # Update failure metrics
-            self.update_health_metrics('webhook_failure',
-                self.health_metrics.get('webhook_failure', 0) + 1
-            )
-            
-            # Add error to history (limit to last 100 errors)
-            errors = self.health_metrics.get('errors', [])
-            errors.append({
-                'timestamp': datetime.now().isoformat(),
-                'type': type(e).__name__,
-                'message': str(e)
-            })
-            self.health_metrics['errors'] = errors[-100:]
-            
-            # Log the error
-            logger.error(f"Error processing webhook: {str(e)}")
-            await self.send_admin_alert(f"Webhook processing error: {str(e)}")
+                logger.error(f"Error in webhook queue processor: {e}")
+                await asyncio.sleep(1)  # Prevent tight loop on persistent errors
 
     async def update_health_metrics(self, metric: str, value: Any = None):
         """Update bot health metrics with sanitized logging"""
@@ -1164,66 +1138,50 @@ class WalletBudBot(commands.Bot):
                         logger.error(f"Error details: {e.__dict__}")
                     raise
 
-    async def init_blockfrost(self) -> bool:
+    async def init_blockfrost(self):
         """Initialize Blockfrost API client with proper error handling and retries"""
-        MAX_RETRIES = 3
-        RETRY_DELAY = 5  # seconds
+        if not os.getenv('BLOCKFROST_PROJECT_ID'):
+            raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
+            
+        try:
+            base_url = os.getenv('BLOCKFROST_BASE_URL', ApiUrls.mainnet.value)
+            self.blockfrost = BlockFrostApi(
+                project_id=os.getenv('BLOCKFROST_PROJECT_ID'),
+                base_url=base_url
+            )
+            # Test connection
+            await self.blockfrost.health()
+            logger.info("Blockfrost client initialized successfully")
+            self.health_metrics['blockfrost_init'] = datetime.utcnow()
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Blockfrost client: {e}")
+            self.blockfrost = None
+            raise
 
-        for attempt in range(MAX_RETRIES):
+    async def blockfrost_request(self, method: Callable, *args, **kwargs):
+        """Execute a rate-limited request to Blockfrost API with retries"""
+        if not self.blockfrost:
+            raise RuntimeError("Blockfrost client not initialized")
+            
+        max_retries = 3
+        retry_delay = 1.0
+        
+        for attempt in range(max_retries):
             try:
-                # Get and validate environment variables
-                project_id = os.getenv('BLOCKFROST_PROJECT_ID')
-                base_url = os.getenv('BLOCKFROST_BASE_URL')
-                network = os.getenv('CARDANO_NETWORK', 'mainnet')
-
-                if not project_id or not project_id.startswith(('mainnet', 'preprod', 'preview')):
-                    raise ValueError(f"Invalid BLOCKFROST_PROJECT_ID format: {project_id}")
-
-                # Determine network and base URL
-                if not base_url:
-                    base_url = (
-                        "https://cardano-mainnet.blockfrost.io/api/v0"
-                        if network == "mainnet"
-                        else "https://cardano-testnet.blockfrost.io/api/v0"
-                    )
-
-                # Initialize Blockfrost with proper configuration
-                self.blockfrost = BlockFrostApi(
-                    project_id=project_id,
-                    base_url=base_url,
-                    session_args={
-                        'timeout': aiohttp.ClientTimeout(total=30),
-                        'connector': self.connector
-                    }
-                )
-
-                # Test connection and get network info
-                health = await self.blockfrost.health()
-                if not health.is_healthy:
-                    raise RuntimeError("Blockfrost API reported unhealthy status")
-
-                network_info = await self.blockfrost.network()
-                
-                logger.info(f"✅ Blockfrost API initialized successfully on {network}")
-                logger.info(f"Network info: Supply={network_info.supply}, Stake={network_info.stake}")
-
-                self.update_health_metrics('blockfrost_init', True)
-                self.update_health_metrics('last_api_call', datetime.now())
-                return True
-
+                async with self.rate_limiter.acquire("blockfrost"):
+                    response = await method(*args, **kwargs)
+                    self.health_metrics['last_api_call'] = datetime.utcnow()
+                    return response
+                    
             except Exception as e:
-                logger.error(f"❌ Blockfrost initialization failed (attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}")
-                if hasattr(e, '__dict__'):
-                    logger.error(f"Error details: {e.__dict__}")
-
-                if attempt < MAX_RETRIES - 1:
-                    logger.info(f"Retrying in {RETRY_DELAY} seconds...")
-                    await asyncio.sleep(RETRY_DELAY)
-                else:
-                    self.update_health_metrics('blockfrost_init', False)
-                    await self.send_admin_alert("⚠️ Blockfrost initialization failed after all retries")
-                    return False
-
+                if attempt == max_retries - 1:
+                    logger.error(f"Blockfrost request failed after {max_retries} attempts: {e}")
+                    raise
+                    
+                logger.warning(f"Blockfrost request failed (attempt {attempt + 1}/{max_retries}): {e}")
+                await asyncio.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                
     async def should_notify(self, user_id: int, notification_type: str) -> bool:
         """Check if we should send a notification to the user"""
         try:
@@ -1748,109 +1706,6 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Event handler error: {e}", exc_info=True)
             raise
 
-    async def health_check(self) -> dict:
-        """Comprehensive health check of all system components"""
-        health_data = {
-            'status': 'healthy',
-            'timestamp': datetime.now().isoformat(),
-            'components': {
-                'discord': self._check_discord_health(),
-                'blockfrost': await self._check_blockfrost_health(),
-                'database': await self._check_database_health(),
-                'system': self._check_system_health(),
-                'webhooks': self._check_webhook_health()
-            }
-        }
-        
-        # Determine overall health
-        unhealthy_components = [
-            name for name, data in health_data['components'].items()
-            if not data['healthy']
-        ]
-        
-        if unhealthy_components:
-            health_data['status'] = 'degraded'
-            health_data['unhealthy_components'] = unhealthy_components
-            
-            # Send alert if critical components are down
-            critical_components = {'discord', 'database'}
-            if any(comp in critical_components for comp in unhealthy_components):
-                await self.send_admin_alert(
-                    f"⚠️ Critical components unhealthy: {', '.join(unhealthy_components)}"
-                )
-        
-        return health_data
-
-    def _check_discord_health(self) -> dict:
-        """Check Discord connection health"""
-        return {
-            'healthy': self.is_ready() and not self.is_closed(),
-            'latency': round(self.latency * 1000, 2),
-            'shards': self.shard_count,
-            'guilds': len(self.guilds)
-        }
-
-    async def _check_blockfrost_health(self) -> dict:
-        """Check Blockfrost API health"""
-        try:
-            if not self.blockfrost:
-                return {'healthy': False, 'error': 'Not initialized'}
-                
-            async with self.rate_limiter.acquire('blockfrost'):
-                health = await self.blockfrost.health()
-                network = await self.blockfrost.network()
-                
-            return {
-                'healthy': True,
-                'network': network.network,
-                'sync_progress': network.sync_progress,
-                'rate_limits': self.rate_limiter.get_limits('blockfrost')
-            }
-        except Exception as e:
-            return {'healthy': False, 'error': str(e)}
-
-    async def _check_database_health(self) -> dict:
-        """Check database connection health"""
-        try:
-            async with self.pool.acquire() as conn:
-                await conn.execute('SELECT 1')
-                
-            return {
-                'healthy': True,
-                'pool_size': self.pool.size,
-                'min_size': self.pool.min_size,
-                'max_size': self.pool.max_size,
-                'used_connections': len(self.pool._holders)
-            }
-        except Exception as e:
-            return {'healthy': False, 'error': str(e)}
-
-    def _check_system_health(self) -> dict:
-        """Check system resource usage"""
-        try:
-            process = psutil.Process()
-            memory = process.memory_info()
-            
-            return {
-                'healthy': True,
-                'cpu_percent': process.cpu_percent(),
-                'memory_used_mb': memory.rss / 1024 / 1024,
-                'memory_percent': process.memory_percent(),
-                'threads': len(process.threads()),
-                'open_files': len(process.open_files())
-            }
-        except Exception as e:
-            return {'healthy': False, 'error': str(e)}
-
-    def _check_webhook_health(self) -> dict:
-        """Check webhook processing health"""
-        return {
-            'healthy': True,
-            'queue_size': self.webhook_queue.qsize(),
-            'queue_capacity': WEBHOOK_QUEUE_SIZE,
-            'processing': not self.webhook_queue.empty()
-        }
-
 if __name__ == "__main__":
     try:
         # Configure logging for production
@@ -1877,7 +1732,47 @@ if __name__ == "__main__":
         # Check environment variables
         bot.check_environment()
         
-        # Run the bot
+        # Get port from environment for Heroku
+        port = int(os.getenv('PORT', 8080))
+        
+        # Start webhook server on 0.0.0.0 for Heroku
+        async def start_webhook():
+            """Start the webhook server with proper error handling and Heroku compatibility"""
+            try:
+                # Initialize aiohttp app
+                app = web.Application()
+                app.router.add_post('/webhook', bot.handle_webhook)
+                
+                # Set up runner with proper cleanup
+                runner = web.AppRunner(app, access_log=None)  # Disable access logging for performance
+                await runner.setup()
+                
+                # Get port from environment (Heroku sets PORT)
+                port = int(os.getenv("PORT", 8080))
+                
+                # Bind to 0.0.0.0 for Heroku
+                site = web.TCPSite(runner, "0.0.0.0", port)
+                
+                try:
+                    await site.start()
+                    logger.info(f"Webhook server started on port {port}")
+                except OSError as e:
+                    logger.error(f"Failed to bind to port {port}: {e}")
+                    # Try alternative port if 8080 is taken
+                    if port == 8080:
+                        alt_port = 8081
+                        site = web.TCPSite(runner, "0.0.0.0", alt_port)
+                        await site.start()
+                        logger.info(f"Webhook server started on alternative port {alt_port}")
+                
+                return runner, site
+                
+            except Exception as e:
+                logger.error(f"Failed to start webhook server: {e}")
+                raise
+        
+        # Run the bot and webhook server
+        loop.create_task(start_webhook())
         bot.run(os.getenv('DISCORD_TOKEN'))
         
     except Exception as e:

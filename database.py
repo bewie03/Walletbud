@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Union, Tuple
 from dotenv import load_dotenv
 import re
+import ssl
+import certifi
 
 # Load environment variables
 load_dotenv()
@@ -40,7 +42,116 @@ _pool_max_age = timedelta(hours=1)  # Recreate pool every hour
 _pool_lock = asyncio.Lock()
 _pool = None
 
-def get_database_url() -> str:
+async def get_pool() -> asyncpg.Pool:
+    """Get database connection pool with proper initialization and health check"""
+    global _pool, _pool_creation_time
+    
+    async with _pool_lock:
+        # Check if pool needs recreation
+        if (_pool is None or 
+            _pool_creation_time is None or 
+            datetime.now() - _pool_creation_time > _pool_max_age):
+            
+            # Clean up old pool if it exists
+            if _pool:
+                await _pool.close()
+            
+            try:
+                # Handle Heroku's postgres:// URL format
+                url = os.getenv('DATABASE_URL')
+                if url and url.startswith('postgres://'):
+                    url = url.replace('postgres://', 'postgresql://', 1)
+                
+                # Create SSL context for secure connections
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+                ssl_context.verify_mode = ssl.CERT_REQUIRED
+                
+                # Initialize pool with proper settings
+                _pool = await asyncpg.create_pool(
+                    url,
+                    min_size=DB_CONFIG['MIN_POOL_SIZE'],
+                    max_size=DB_CONFIG['MAX_POOL_SIZE'],
+                    max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
+                    command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
+                    ssl=ssl_context,
+                    server_settings={
+                        'application_name': 'WalletBud',
+                        'statement_timeout': str(DB_CONFIG['COMMAND_TIMEOUT'] * 1000),
+                        'idle_in_transaction_session_timeout': str(DB_CONFIG['TRANSACTION_TIMEOUT'] * 1000)
+                    }
+                )
+                
+                # Test connection
+                async with _pool.acquire() as conn:
+                    await conn.execute('SELECT 1')
+                
+                _pool_creation_time = datetime.now()
+                logger.info("Database pool initialized successfully")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize database pool: {e}")
+                _pool = None
+                _pool_creation_time = None
+                raise ConnectionError(f"Database connection failed: {str(e)}")
+        
+        return _pool
+
+async def reset_pool():
+    """Reset the connection pool with proper cleanup"""
+    global _pool, _pool_creation_time
+    
+    async with _pool_lock:
+        if _pool:
+            try:
+                await _pool.close()
+            except Exception as e:
+                logger.error(f"Error closing pool: {e}")
+        _pool = None
+        _pool_creation_time = None
+
+# Enhanced retry logic with exponential backoff
+RETRY_DELAYS = [1, 2, 5, 10, 30]  # Exponential backoff delays
+
+async def execute_with_retry(func, *args, retries=None):
+    """Execute database operation with retry logic and proper error handling"""
+    if retries is None:
+        retries = DB_CONFIG['RETRY_ATTEMPTS']
+        
+    last_error = None
+    
+    for attempt, delay in enumerate(RETRY_DELAYS[:retries]):
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    return await func(conn, *args)
+                    
+        except (asyncpg.ConnectionDoesNotExistError, 
+                asyncpg.ConnectionFailureError) as e:
+            last_error = e
+            logger.warning(f"Connection error (attempt {attempt + 1}/{retries}): {e}")
+            
+            # Reset pool on connection errors
+            await reset_pool()
+            
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+                
+        except asyncpg.InterfaceError as e:
+            last_error = e
+            logger.error(f"Interface error: {e}")
+            break  # Don't retry on interface errors
+            
+        except Exception as e:
+            last_error = e
+            logger.error(f"Database error (attempt {attempt + 1}/{retries}): {e}")
+            
+            if attempt < retries - 1:
+                await asyncio.sleep(delay)
+            
+    raise QueryError(f"Database operation failed after {retries} attempts: {str(last_error)}")
+
+async def get_database_url() -> str:
     """Get and validate database URL with proper Heroku postgres:// to postgresql:// conversion"""
     url = os.getenv('DATABASE_URL')
     if not url:
@@ -52,129 +163,21 @@ def get_database_url() -> str:
     
     return url
 
-async def get_pool():
-    """Get database connection pool with initialization check and proper locking"""
-    global _pool, _pool_creation_time
-    
-    async with _pool_lock:
-        # Check if pool needs recreation
-        if (_pool is None or 
-            _pool_creation_time is None or 
-            datetime.now() - _pool_creation_time > _pool_max_age):
-            
-            if _pool:
-                logger.info("Closing existing connection pool")
-                try:
-                    await _pool.close()
-                except Exception as e:
-                    logger.warning(f"Error closing pool: {e}")
-            
-            try:
-                db_url = get_database_url()
-                
-                # Configure SSL for Heroku
-                ssl_config = None
-                if 'amazonaws.com' in db_url or 'herokuapp.com' in db_url:
-                    ssl_config = {
-                        'sslmode': 'require',
-                        'ssl': True,
-                        'ssl_min_protocol_version': 'TLSv1.2'
-                    }
-                
-                # Create connection pool with configurable settings
-                _pool = await asyncpg.create_pool(
-                    db_url,
-                    min_size=DB_CONFIG['MIN_POOL_SIZE'],
-                    max_size=DB_CONFIG['MAX_POOL_SIZE'],
-                    command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
-                    ssl=ssl_config,
-                    max_cached_statement_lifetime=600,
-                    max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
-                    server_settings={
-                        'application_name': 'WalletBud',
-                        'statement_timeout': f"{DB_CONFIG['COMMAND_TIMEOUT']}000",
-                        'idle_in_transaction_session_timeout': f"{DB_CONFIG['TRANSACTION_TIMEOUT']}000",
-                        'lock_timeout': '10000',  # 10 second lock timeout
-                        'tcp_keepalives_idle': '60',
-                        'tcp_keepalives_interval': '10',
-                        'tcp_keepalives_count': '3'
-                    }
-                )
-                
-                # Verify connection works
-                async with _pool.acquire() as conn:
-                    await conn.fetchval('SELECT 1')
-                
-                _pool_creation_time = datetime.now()
-                logger.info(f"Database pool initialized (size: {DB_CONFIG['MIN_POOL_SIZE']}-{DB_CONFIG['MAX_POOL_SIZE']})")
-                
-            except Exception as e:
-                logger.error(f"Failed to create connection pool: {e}")
-                _pool = None
-                _pool_creation_time = None
-                raise ConnectionError(f"Could not create database pool: {str(e)}") from e
-    
-    return _pool
-
-async def reset_pool():
-    """Reset the connection pool with proper cleanup"""
-    global _pool, _pool_creation_time
-    async with _pool_lock:
-        if _pool:
-            await _pool.close()
-        _pool = None
-        _pool_creation_time = None
-
-# Enhanced retry logic with exponential backoff
-RETRY_DELAYS = [1, 2, 5, 10, 30]  # Exponential backoff delays
-
-async def execute_with_retry(func, *args, retries=None):
-    """Execute database operation with retry logic and proper error handling"""
-    retries = retries if retries is not None else len(RETRY_DELAYS)
-    last_error = None
-    
-    for attempt, delay in enumerate(RETRY_DELAYS[:retries]):
-        try:
-            return await func(*args)
-        except asyncpg.InterfaceError:
-            # Pool/connection is broken, force recreation
-            await reset_pool()
-            last_error = f"Interface error on attempt {attempt + 1}"
-        except asyncpg.PostgresError as e:
-            if e.sqlstate.startswith(('40', '53', '55', '57P01')):  # Include admin shutdown
-                last_error = f"Recoverable error on attempt {attempt + 1}: {str(e)}"
-                await asyncio.sleep(delay)
-                continue
-            raise QueryError(f"Database error: {str(e)}") from e
-        except asyncio.TimeoutError:
-            last_error = f"Timeout on attempt {attempt + 1}"
-            await asyncio.sleep(delay)
-            continue
-        except Exception as e:
-            raise DatabaseError(f"Unexpected error: {str(e)}") from e
-    
-    raise ConnectionError(f"Max retries exceeded. Last error: {last_error}")
-
-# Update fetch functions to use retry logic
 async def fetch_all(query: str, *args, retries=None) -> List[asyncpg.Record]:
     """Fetch all rows with retry logic and proper error handling"""
-    async def _fetch():
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                return await conn.fetch(query, *args)
+    async def _fetch(conn, *args):
+        async with conn.transaction():
+            return await conn.fetch(query, *args)
     
-    return await execute_with_retry(_fetch, retries=retries)
+    return await execute_with_retry(_fetch, *args, retries=retries)
 
 async def fetch_one(query: str, *args, retries=None) -> Optional[asyncpg.Record]:
     """Fetch single row with retry logic and proper error handling"""
-    async def _fetch():
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                return await conn.fetchrow(query, *args)
+    async def _fetch(conn, *args):
+        async with conn.transaction():
+            return await conn.fetchrow(query, *args)
     
-    return await execute_with_retry(_fetch, retries=retries)
+    return await execute_with_retry(_fetch, *args, retries=retries)
 
 # Add input validation for wallet addresses
 WALLET_ADDRESS_PATTERN = re.compile(r'^addr1[a-zA-Z0-9]{98}$')
@@ -256,20 +259,16 @@ async def execute_transaction(queries: List[tuple[str, tuple]], retries: int = N
     Raises:
         QueryError: If transaction fails after all retries
     """
-    pool = await get_pool()
-    retry_count = retries if retries is not None else DB_CONFIG['RETRY_ATTEMPTS']
-    
-    async with pool.acquire() as conn:
+    async def _execute_transaction(conn, queries):
         async with conn.transaction():
             for query, args in queries:
                 try:
                     await conn.execute(query, *args)
                 except Exception as e:
                     logger.error(f"Error executing query in transaction: {e}")
-                    if retry_count > 0:
-                        await asyncio.sleep(DB_CONFIG['RETRY_DELAY'])
-                        return await execute_transaction(queries, retry_count - 1)
-                    raise QueryError(f"Transaction failed after {DB_CONFIG['RETRY_ATTEMPTS']} retries: {e}")
+                    raise QueryError(f"Transaction failed: {e}")
+                    
+    await execute_with_retry(_execute_transaction, queries, retries=retries)
 
 async def update_notification_setting(user_id: str, setting: str, enabled: bool) -> bool:
     """Update a notification setting with proper validation
@@ -305,141 +304,122 @@ async def update_notification_setting(user_id: str, setting: str, enabled: bool)
 INIT_SQL = """
 DROP TABLE IF EXISTS wallets CASCADE;
 DROP TABLE IF EXISTS notification_settings CASCADE;
-DROP TABLE IF EXISTS transactions CASCADE;
-DROP TABLE IF EXISTS token_balances CASCADE;
-DROP TABLE IF EXISTS delegation_status CASCADE;
-DROP TABLE IF EXISTS processed_rewards CASCADE;
-DROP TABLE IF EXISTS policy_expiry CASCADE;
-DROP TABLE IF EXISTS dapp_interactions CASCADE;
-DROP TABLE IF EXISTS failed_transactions CASCADE;
-DROP TABLE IF EXISTS stake_addresses CASCADE;
-DROP TABLE IF EXISTS db_version CASCADE;
-DROP TABLE IF EXISTS transactions_by_month CASCADE;
 
-CREATE TABLE IF NOT EXISTS db_version (
-    version INTEGER PRIMARY KEY
-);
-
-CREATE TABLE IF NOT EXISTS wallets (
+CREATE TABLE wallets (
     id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
-    address TEXT NOT NULL,
+    address TEXT UNIQUE NOT NULL,
     stake_address TEXT,
-    ada_balance DECIMAL DEFAULT 0,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_policy_check TIMESTAMP,
-    monitoring_since TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, address)
+    ada_balance BIGINT DEFAULT 0,
+    token_balances JSONB DEFAULT '{}',
+    utxo_state JSONB DEFAULT '{}',
+    delegation_pool TEXT,
+    last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS notification_settings (
+-- Add indices for frequently queried fields
+CREATE INDEX idx_wallets_user_id ON wallets(user_id);
+CREATE INDEX idx_wallets_address ON wallets(address);
+CREATE INDEX idx_wallets_stake_address ON wallets(stake_address);
+CREATE INDEX idx_wallets_delegation_pool ON wallets(delegation_pool);
+CREATE INDEX idx_wallets_last_checked ON wallets(last_checked);
+
+-- Add GiST index for JSONB fields for faster querying
+CREATE INDEX idx_wallets_token_balances ON wallets USING gin (token_balances);
+CREATE INDEX idx_wallets_utxo_state ON wallets USING gin (utxo_state);
+
+CREATE TABLE notification_settings (
     user_id TEXT PRIMARY KEY,
-    ada_transactions BOOLEAN DEFAULT TRUE,
-    token_changes BOOLEAN DEFAULT TRUE,
-    nft_updates BOOLEAN DEFAULT TRUE,
-    staking_rewards BOOLEAN DEFAULT TRUE,
-    stake_changes BOOLEAN DEFAULT TRUE,
-    policy_expiry BOOLEAN DEFAULT TRUE,
-    delegation_status BOOLEAN DEFAULT TRUE,
-    dapp_interactions BOOLEAN DEFAULT TRUE,
-    failed_transactions BOOLEAN DEFAULT TRUE
+    ada_transactions BOOLEAN DEFAULT true,
+    token_changes BOOLEAN DEFAULT true,
+    nft_updates BOOLEAN DEFAULT true,
+    delegation_status BOOLEAN DEFAULT true,
+    policy_updates BOOLEAN DEFAULT true,
+    balance_alerts BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS transactions (
-    id SERIAL,
-    wallet_id INTEGER REFERENCES wallets(id),
-    tx_hash TEXT NOT NULL,
-    metadata JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    archived BOOLEAN DEFAULT FALSE,
-    archived_at TIMESTAMP WITH TIME ZONE,
-    PRIMARY KEY(id, created_at),
-    UNIQUE(wallet_id, tx_hash, created_at)
-) PARTITION BY RANGE (created_at);
+-- Add index for notification settings user_id
+CREATE INDEX idx_notification_settings_user_id ON notification_settings(user_id);
 
-DO $$
-BEGIN
-    FOR i IN 0..11 LOOP
-        EXECUTE format(
-            'CREATE TABLE IF NOT EXISTS transactions_%s_%s PARTITION OF transactions 
-            FOR VALUES FROM (%L) TO (%L)',
-            to_char(CURRENT_DATE + (interval '1 month' * i), 'YYYY'),
-            to_char(CURRENT_DATE + (interval '1 month' * i), 'MM'),
-            CURRENT_DATE + (interval '1 month' * i),
-            CURRENT_DATE + (interval '1 month' * (i + 1))
-        );
-    END LOOP;
-END $$;
-
-CREATE TABLE IF NOT EXISTS token_balances (
-    id SERIAL PRIMARY KEY,
-    address TEXT NOT NULL,
-    token_id TEXT NOT NULL,
-    balance DECIMAL DEFAULT 0,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(address, token_id)
-);
-
-CREATE TABLE IF NOT EXISTS delegation_status (
-    id SERIAL PRIMARY KEY,
-    address TEXT NOT NULL,
-    pool_id TEXT NOT NULL,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(address)
-);
-
-CREATE TABLE IF NOT EXISTS processed_rewards (
-    id SERIAL PRIMARY KEY,
+CREATE TABLE processed_rewards (
     stake_address TEXT NOT NULL,
     epoch INTEGER NOT NULL,
-    amount DECIMAL NOT NULL,
-    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(stake_address, epoch)
+    amount BIGINT NOT NULL,
+    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (stake_address, epoch)
 );
 
-CREATE TABLE IF NOT EXISTS policy_expiry (
-    id SERIAL PRIMARY KEY,
-    policy_id TEXT NOT NULL,
-    expiry_slot BIGINT NOT NULL,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(policy_id)
-);
+-- Add index for processed rewards lookup
+CREATE INDEX idx_processed_rewards_stake_address ON processed_rewards(stake_address);
+CREATE INDEX idx_processed_rewards_epoch ON processed_rewards(epoch);
 
-CREATE TABLE IF NOT EXISTS dapp_interactions (
-    id SERIAL PRIMARY KEY,
-    address TEXT NOT NULL,
+CREATE TABLE processed_token_changes (
+    wallet_id INTEGER REFERENCES wallets(id),
     tx_hash TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(address, tx_hash)
+    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (wallet_id, tx_hash)
 );
 
-CREATE TABLE IF NOT EXISTS failed_transactions (
+-- Add index for token changes lookup
+CREATE INDEX idx_processed_token_changes_wallet ON processed_token_changes(wallet_id);
+CREATE INDEX idx_processed_token_changes_tx ON processed_token_changes(tx_hash);
+
+CREATE TABLE failed_transactions (
     id SERIAL PRIMARY KEY,
     wallet_id INTEGER REFERENCES wallets(id),
     tx_hash TEXT NOT NULL,
     error_type TEXT NOT NULL,
     error_details JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(wallet_id, tx_hash)
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS stake_addresses (
-    stake_address TEXT PRIMARY KEY,
-    last_pool_id TEXT,
-    last_checked TIMESTAMP
+-- Add indices for failed transactions
+CREATE INDEX idx_failed_transactions_wallet ON failed_transactions(wallet_id);
+CREATE INDEX idx_failed_transactions_tx ON failed_transactions(tx_hash);
+CREATE INDEX idx_failed_transactions_error ON failed_transactions(error_type);
+
+CREATE TABLE asset_history (
+    id SERIAL PRIMARY KEY,
+    wallet_id INTEGER REFERENCES wallets(id),
+    asset_id TEXT NOT NULL,
+    tx_hash TEXT NOT NULL,
+    action TEXT NOT NULL,
+    quantity NUMERIC NOT NULL,
+    metadata JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
-CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
-CREATE INDEX IF NOT EXISTS idx_transactions_wallet_id ON transactions(wallet_id);
-CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at);
-CREATE INDEX IF NOT EXISTS idx_transactions_archived ON transactions(archived, archived_at);
-CREATE INDEX IF NOT EXISTS idx_token_balances_address ON token_balances(address);
-CREATE INDEX IF NOT EXISTS idx_delegation_status_address ON delegation_status(address);
-CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewards(stake_address);
-CREATE INDEX IF NOT EXISTS idx_policy_expiry_policy_id ON policy_expiry(policy_id);
-CREATE INDEX IF NOT EXISTS idx_dapp_interactions_address ON dapp_interactions(address);
-CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet_id ON failed_transactions(wallet_id);
+-- Add indices for asset history
+CREATE INDEX idx_asset_history_wallet ON asset_history(wallet_id);
+CREATE INDEX idx_asset_history_asset ON asset_history(asset_id);
+CREATE INDEX idx_asset_history_tx ON asset_history(tx_hash);
+CREATE INDEX idx_asset_history_action ON asset_history(action);
+
+CREATE TABLE policy_expiry (
+    policy_id TEXT PRIMARY KEY,
+    expiry_slot BIGINT NOT NULL,
+    last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Add index for policy expiry lookup
+CREATE INDEX idx_policy_expiry_slot ON policy_expiry(expiry_slot);
+
+CREATE TABLE dapp_interactions (
+    wallet_id INTEGER REFERENCES wallets(id),
+    last_tx TEXT,
+    last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (wallet_id)
+);
+
+-- Add index for dapp interactions
+CREATE INDEX idx_dapp_interactions_tx ON dapp_interactions(last_tx);
+
+CREATE TABLE db_version (
+    version INTEGER PRIMARY KEY,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
 """
 
 # Database version tracking
@@ -701,11 +681,8 @@ async def add_transaction(wallet_id: int, tx_hash: str, metadata: dict = None) -
         bool: Success status
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Start transaction
+        async def _add_transaction(conn, wallet_id, tx_hash, metadata):
             async with conn.transaction():
-                # Add or update transaction
                 query = """
                     INSERT INTO transactions (wallet_id, tx_hash, metadata)
                     VALUES ($1, $2, $3)
@@ -715,22 +692,15 @@ async def add_transaction(wallet_id: int, tx_hash: str, metadata: dict = None) -
                         created_at = CURRENT_TIMESTAMP
                     RETURNING id
                 """
-                
-                logger.debug(f"Adding transaction {tx_hash[:20]}... for wallet ID {wallet_id}...")
                 result = await conn.fetchval(
                     query, 
                     wallet_id, 
                     tx_hash, 
                     json.dumps(metadata) if metadata else None
                 )
-                
-                if result:
-                    logger.info(f"Added/updated transaction {tx_hash[:20]}... for wallet ID {wallet_id}")
-                    return True
-                else:
-                    logger.error(f"Failed to add transaction {tx_hash[:20]}... for wallet ID {wallet_id}")
-                    return False
-                    
+                return bool(result)
+        
+        return await execute_with_retry(_add_transaction, wallet_id, tx_hash, metadata)
     except Exception as e:
         logger.error(f"Error adding transaction: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -748,9 +718,7 @@ async def get_transaction_metadata(wallet_id: int, tx_hash: str) -> Optional[dic
         Optional[dict]: Transaction metadata or None if not found
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching transaction metadata for wallet ID {wallet_id} and tx hash {tx_hash[:20]}...")
+        async def _get_metadata(conn, wallet_id, tx_hash):
             query = """
                 SELECT metadata
                 FROM transactions
@@ -758,6 +726,8 @@ async def get_transaction_metadata(wallet_id: int, tx_hash: str) -> Optional[dic
             """
             result = await conn.fetchval(query, wallet_id, tx_hash)
             return json.loads(result) if result else None
+        
+        return await execute_with_retry(_get_metadata, wallet_id, tx_hash)
     except Exception as e:
         logger.error(f"Error getting transaction metadata: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -774,9 +744,7 @@ async def get_notification_settings(user_id: str):
         dict: Dictionary of notification settings
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching notification settings for user {user_id}...")
+        async def _get_settings(conn, user_id):
             row = await conn.fetchrow(
                 "SELECT * FROM notification_settings WHERE user_id = $1",
                 user_id
@@ -795,6 +763,8 @@ async def get_notification_settings(user_id: str):
                 }
             else:
                 return None
+        
+        return await execute_with_retry(_get_settings, user_id)
     except Exception as e:
         logger.error(f"Error getting notification settings: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -831,7 +801,7 @@ async def update_notification_setting(user_id: str, setting: str, enabled: bool)
 async def should_notify(user_id: str, notification_type: str) -> bool:
     """Check if a user should be notified about a specific event type"""
     try:
-        async with pool.acquire() as conn:
+        async def _should_notify(conn, user_id, notification_type):
             result = await conn.fetchval(
                 f"""
                 SELECT {notification_type} 
@@ -841,6 +811,8 @@ async def should_notify(user_id: str, notification_type: str) -> bool:
                 user_id
             )
             return bool(result)
+        
+        return await execute_with_retry(_should_notify, user_id, notification_type)
     except Exception as e:
         logger.error(f"Error checking notification settings: {str(e)}")
         return True  # Default to notifying if there's an error
@@ -1020,9 +992,7 @@ async def check_ada_balance(address: str) -> tuple[bool, int]:
         tuple[bool, int]: (is_below_threshold, current_balance_ada)
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Checking ADA balance for wallet {address[:20]}...")
+        async def _check_balance(conn, address):
             balance = await conn.fetchval(
                 "SELECT ada_balance FROM wallets WHERE address = $1",
                 address
@@ -1033,6 +1003,8 @@ async def check_ada_balance(address: str) -> tuple[bool, int]:
                 
             balance_ada = balance
             return balance_ada < 10, balance_ada
+        
+        return await execute_with_retry(_check_balance, address)
     except Exception as e:
         logger.error(f"Error checking ADA balance: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1050,9 +1022,7 @@ async def update_ada_balance(address: str, balance: float) -> bool:
         bool: Success status
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Updating ADA balance for wallet {address[:20]}...")
+        async def _update_balance(conn, address, balance):
             await conn.execute(
                 """
                 UPDATE wallets 
@@ -1062,6 +1032,8 @@ async def update_ada_balance(address: str, balance: float) -> bool:
                 address, balance
             )
             return True
+        
+        return await execute_with_retry(_update_balance, address, balance)
     except Exception as e:
         logger.error(f"Error updating ADA balance: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1079,9 +1051,7 @@ async def update_token_balances(address: str, token_balances: dict) -> bool:
         bool: Success status
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Updating token balances for wallet {address[:20]}...")
+        async def _update_token_balances(conn, address, token_balances):
             for token_id, balance in token_balances.items():
                 await conn.execute(
                     """
@@ -1093,6 +1063,8 @@ async def update_token_balances(address: str, token_balances: dict) -> bool:
                     address, token_id, balance
                 )
             return True
+        
+        return await execute_with_retry(_update_token_balances, address, token_balances)
     except Exception as e:
         logger.error(f"Error updating token balances: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1109,14 +1081,14 @@ async def get_wallet_balance(address: str) -> int:
         int: Current ADA balance in lovelace
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching wallet balance for {address[:20]}...")
+        async def _get_balance(conn, address):
             balance = await conn.fetchval(
                 "SELECT ada_balance FROM wallets WHERE address = $1",
                 address
             )
             return balance if balance is not None else 0
+        
+        return await execute_with_retry(_get_balance, address)
     except Exception as e:
         logger.error(f"Error getting wallet balance: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1133,10 +1105,8 @@ async def update_utxo_state(address: str, utxo_state: dict):
     Returns:
         bool: Success status
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        try:
-            logger.debug(f"Updating UTxO state for wallet {address[:20]}...")
+    try:
+        async def _update_utxo_state(conn, address, utxo_state):
             await conn.execute(
                 """
                 UPDATE wallets
@@ -1146,11 +1116,13 @@ async def update_utxo_state(address: str, utxo_state: dict):
                 utxo_state, address
             )
             return True
-        except Exception as e:
-            logger.error(f"Error updating UTxO state for {address[:20]}: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            return False
+        
+        return await execute_with_retry(_update_utxo_state, address, utxo_state)
+    except Exception as e:
+        logger.error(f"Error updating UTxO state for {address[:20]}: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        return False
 
 async def get_stake_address(address: str):
     """Get cached stake address for a wallet
@@ -1161,17 +1133,24 @@ async def get_stake_address(address: str):
     Returns:
         Optional[str]: Stake address if cached, None otherwise
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT stake_address
-            FROM wallets
-            WHERE address = $1 AND stake_address IS NOT NULL
-            """,
-            address
-        )
-        return row['stake_address'] if row else None
+    try:
+        async def _get_stake_address(conn, address):
+            row = await conn.fetchrow(
+                """
+                SELECT stake_address
+                FROM wallets
+                WHERE address = $1 AND stake_address IS NOT NULL
+                """,
+                address
+            )
+            return row['stake_address'] if row else None
+        
+        return await execute_with_retry(_get_stake_address, address)
+    except Exception as e:
+        logger.error(f"Error getting stake address for {address[:20]}: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        return None
 
 async def update_stake_address(address: str, stake_address: str):
     """Update stake address for a wallet
@@ -1180,17 +1159,25 @@ async def update_stake_address(address: str, stake_address: str):
         address: Wallet address
         stake_address: Stake address
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE wallets
-            SET stake_address = $2
-            WHERE address = $1
-            """,
-            address,
-            stake_address
-        )
+    try:
+        async def _update_stake_address(conn, address, stake_address):
+            await conn.execute(
+                """
+                UPDATE wallets
+                SET stake_address = $2
+                WHERE address = $1
+                """,
+                address,
+                stake_address
+            )
+            return True
+        
+        return await execute_with_retry(_update_stake_address, address, stake_address)
+    except Exception as e:
+        logger.error(f"Error updating stake address for {address[:20]}: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        return False
 
 async def is_reward_processed(stake_address: str, epoch: int):
     """Check if a staking reward has been processed
@@ -1202,10 +1189,8 @@ async def is_reward_processed(stake_address: str, epoch: int):
     Returns:
         bool: True if reward was processed
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        try:
-            logger.debug(f"Checking if reward is processed for stake address {stake_address[:20]} and epoch {epoch}...")
+    try:
+        async def _is_reward_processed(conn, stake_address, epoch):
             row = await conn.fetchrow(
                 """
                 SELECT id
@@ -1215,11 +1200,13 @@ async def is_reward_processed(stake_address: str, epoch: int):
                 stake_address, epoch
             )
             return bool(row)
-        except Exception as e:
-            logger.error(f"Error checking reward for {stake_address[:20]} epoch {epoch}: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            return False
+        
+        return await execute_with_retry(_is_reward_processed, stake_address, epoch)
+    except Exception as e:
+        logger.error(f"Error checking reward for {stake_address[:20]} epoch {epoch}: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        return False
 
 async def add_processed_reward(stake_address: str, epoch: int, amount: int):
     """Add a processed staking reward
@@ -1232,10 +1219,8 @@ async def add_processed_reward(stake_address: str, epoch: int, amount: int):
     Returns:
         bool: Success status
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        try:
-            logger.debug(f"Adding processed reward for stake address {stake_address[:20]} and epoch {epoch}...")
+    try:
+        async def _add_processed_reward(conn, stake_address, epoch, amount):
             await conn.execute(
                 """
                 INSERT INTO processed_rewards (stake_address, epoch, amount)
@@ -1245,11 +1230,13 @@ async def add_processed_reward(stake_address: str, epoch: int, amount: int):
                 stake_address, epoch, amount
             )
             return True
-        except Exception as e:
-            logger.error(f"Error adding processed reward: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            return False
+        
+        return await execute_with_retry(_add_processed_reward, stake_address, epoch, amount)
+    except Exception as e:
+        logger.error(f"Error adding processed reward: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        return False
 
 async def get_last_transactions(address: str) -> List[str]:
     """Retrieve the last set of processed transactions for a wallet
@@ -1260,10 +1247,8 @@ async def get_last_transactions(address: str) -> List[str]:
     Returns:
         List[str]: List of transaction hashes
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        try:
-            logger.debug(f"Fetching last transactions for wallet {address[:20]}...")
+    try:
+        async def _get_last_transactions(conn, address):
             wallet_id = await conn.fetchval(
                 """
                 SELECT id
@@ -1286,11 +1271,13 @@ async def get_last_transactions(address: str) -> List[str]:
                 wallet_id
             )
             return [row['tx_hash'] for row in rows]
-        except Exception as e:
-            logger.error(f"Error getting last transactions for {address[:20]}: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            return []
+        
+        return await execute_with_retry(_get_last_transactions, address)
+    except Exception as e:
+        logger.error(f"Error getting last transactions for {address[:20]}: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        return []
 
 async def get_utxo_state(address: str) -> Optional[dict]:
     """Get the UTxO state for a wallet address
@@ -1301,10 +1288,8 @@ async def get_utxo_state(address: str) -> Optional[dict]:
     Returns:
         Optional[dict]: Dictionary containing UTxO state or None if not found
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        try:
-            logger.debug(f"Fetching UTxO state for wallet {address[:20]}...")
+    try:
+        async def _get_utxo_state(conn, address):
             row = await conn.fetchrow(
                 """
                 SELECT utxo_state
@@ -1314,11 +1299,13 @@ async def get_utxo_state(address: str) -> Optional[dict]:
                 address
             )
             return row['utxo_state'] if row else None
-        except Exception as e:
-            logger.error(f"Error getting UTxO state for {address[:20]}: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            return None
+        
+        return await execute_with_retry(_get_utxo_state, address)
+    except Exception as e:
+        logger.error(f"Error getting UTxO state for {address[:20]}: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        return None
 
 async def get_wallet_for_user(user_id: str, address: str) -> Optional[dict]:
     """Get wallet details for a specific user and address
@@ -1331,8 +1318,7 @@ async def get_wallet_for_user(user_id: str, address: str) -> Optional[dict]:
         Optional[dict]: Wallet record with all details or None if not found
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _get_wallet_for_user(conn, user_id, address):
             wallet = await conn.fetchrow(
                 """
                 SELECT * FROM wallets 
@@ -1351,6 +1337,8 @@ async def get_wallet_for_user(user_id: str, address: str) -> Optional[dict]:
                     'last_policy_check': wallet['last_policy_check']
                 }
             return None
+        
+        return await execute_with_retry(_get_wallet_for_user, user_id, address)
     except Exception as e:
         logger.error(f"Error getting wallet for user {user_id} address {address}: {str(e)}")
         return None
@@ -1366,9 +1354,7 @@ async def is_token_change_processed(wallet_id: int, tx_hash: str) -> bool:
         bool: True if change was processed
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Checking if token change is processed for wallet ID {wallet_id} and tx hash {tx_hash[:20]}...")
+        async def _is_token_change_processed(conn, wallet_id, tx_hash):
             result = await conn.fetchval(
                 """
                 SELECT EXISTS(
@@ -1379,6 +1365,8 @@ async def is_token_change_processed(wallet_id: int, tx_hash: str) -> bool:
                 wallet_id, tx_hash
             )
             return bool(result)
+        
+        return await execute_with_retry(_is_token_change_processed, wallet_id, tx_hash)
     except Exception as e:
         logger.error(f"Error checking processed token change: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1396,9 +1384,7 @@ async def add_processed_token_change(wallet_id: int, tx_hash: str) -> bool:
         bool: Success status
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Adding processed token change for wallet ID {wallet_id} and tx hash {tx_hash[:20]}...")
+        async def _add_processed_token_change(conn, wallet_id, tx_hash):
             await conn.execute(
                 """
                 INSERT INTO transactions (wallet_id, tx_hash)
@@ -1408,6 +1394,8 @@ async def add_processed_token_change(wallet_id: int, tx_hash: str) -> bool:
                 wallet_id, tx_hash
             )
             return True
+        
+        return await execute_with_retry(_add_processed_token_change, wallet_id, tx_hash)
     except Exception as e:
         logger.error(f"Error adding processed token change: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1424,9 +1412,7 @@ async def get_new_tokens(address: str) -> List[str]:
         List[str]: List of new token IDs
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching new tokens for wallet {address[:20]}...")
+        async def _get_new_tokens(conn, address):
             old_state = await get_utxo_state(address)
             if not old_state:
                 return []
@@ -1438,6 +1424,8 @@ async def get_new_tokens(address: str) -> List[str]:
                 
             current_tokens = set(current_state.get('tokens', {}).keys())
             return list(current_tokens - old_tokens)
+        
+        return await execute_with_retry(_get_new_tokens, address)
     except Exception as e:
         logger.error(f"Error getting new tokens: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1454,9 +1442,7 @@ async def get_removed_nfts(address: str) -> List[str]:
         List[str]: List of removed NFT IDs
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching removed NFTs for wallet {address[:20]}...")
+        async def _get_removed_nfts(conn, address):
             old_state = await get_utxo_state(address)
             if not old_state:
                 return []
@@ -1468,6 +1454,8 @@ async def get_removed_nfts(address: str) -> List[str]:
                 
             current_nfts = set(current_state.get('nfts', []))
             return list(old_nfts - current_nfts)
+        
+        return await execute_with_retry(_get_removed_nfts, address)
     except Exception as e:
         logger.error(f"Error getting removed NFTs: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1484,9 +1472,7 @@ async def get_yummi_warning_count(wallet_id: int) -> int:
         int: Number of warnings (0 if no warnings)
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching YUMMI warning count for wallet ID {wallet_id}...")
+        async def _get_yummi_warning_count(conn, wallet_id):
             result = await conn.fetchval(
                 """
                 SELECT warning_count 
@@ -1496,6 +1482,8 @@ async def get_yummi_warning_count(wallet_id: int) -> int:
                 wallet_id
             )
             return result or 0
+        
+        return await execute_with_retry(_get_yummi_warning_count, wallet_id)
     except Exception as e:
         logger.error(f"Error getting YUMMI warning count: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1512,9 +1500,7 @@ async def increment_yummi_warning(wallet_id: int) -> int:
         int: New warning count
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Incrementing YUMMI warning count for wallet ID {wallet_id}...")
+        async def _increment_yummi_warning(conn, wallet_id):
             result = await conn.fetchval(
                 """
                 INSERT INTO yummi_warnings (wallet_id, warning_count)
@@ -1527,6 +1513,8 @@ async def increment_yummi_warning(wallet_id: int) -> int:
                 wallet_id
             )
             return result
+        
+        return await execute_with_retry(_increment_yummi_warning, wallet_id)
     except Exception as e:
         logger.error(f"Error incrementing YUMMI warning: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1543,9 +1531,7 @@ async def reset_yummi_warning(wallet_id: int) -> bool:
         bool: Success status
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Resetting YUMMI warning count for wallet ID {wallet_id}...")
+        async def _reset_yummi_warning(conn, wallet_id):
             await conn.execute(
                 """
                 DELETE FROM yummi_warnings
@@ -1554,6 +1540,8 @@ async def reset_yummi_warning(wallet_id: int) -> bool:
                 wallet_id
             )
             return True
+        
+        return await execute_with_retry(_reset_yummi_warning, wallet_id)
     except Exception as e:
         logger.error(f"Error resetting YUMMI warning: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1570,9 +1558,7 @@ async def get_delegation_status(address: str):
         str: Pool ID or None if not delegated
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching delegation status for wallet {address[:20]}...")
+        async def _get_delegation_status(conn, address):
             result = await conn.fetchval(
                 """
                 SELECT pool_id
@@ -1582,6 +1568,8 @@ async def get_delegation_status(address: str):
                 address
             )
             return result
+        
+        return await execute_with_retry(_get_delegation_status, address)
     except Exception as e:
         logger.error(f"Error getting delegation status: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1599,9 +1587,7 @@ async def update_delegation_status(address: str, pool_id: str):
         bool: Success status
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Updating delegation status for wallet {address[:20]}...")
+        async def _update_delegation_status(conn, address, pool_id):
             await conn.execute(
                 """
                 INSERT INTO delegation_status (address, pool_id)
@@ -1613,6 +1599,8 @@ async def update_delegation_status(address: str, pool_id: str):
                 pool_id
             )
             return True
+        
+        return await execute_with_retry(_update_delegation_status, address, pool_id)
     except Exception as e:
         logger.error(f"Error updating delegation status: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1629,9 +1617,7 @@ async def get_policy_expiry(policy_id: str):
         int: Slot number when policy expires or None
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching policy expiry for policy ID {policy_id}...")
+        async def _get_policy_expiry(conn, policy_id):
             result = await conn.fetchval(
                 """
                 SELECT expiry_slot
@@ -1641,6 +1627,8 @@ async def get_policy_expiry(policy_id: str):
                 policy_id
             )
             return result
+        
+        return await execute_with_retry(_get_policy_expiry, policy_id)
     except Exception as e:
         logger.error(f"Error getting policy expiry: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1658,9 +1646,7 @@ async def update_policy_expiry(policy_id: str, expiry_slot: int):
         bool: Success status
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Updating policy expiry for policy ID {policy_id}...")
+        async def _update_policy_expiry(conn, policy_id, expiry_slot):
             await conn.execute(
                 """
                 INSERT INTO policy_expiry (policy_id, expiry_slot)
@@ -1672,6 +1658,8 @@ async def update_policy_expiry(policy_id: str, expiry_slot: int):
                 expiry_slot
             )
             return True
+        
+        return await execute_with_retry(_update_policy_expiry, policy_id, expiry_slot)
     except Exception as e:
         logger.error(f"Error updating policy expiry: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1687,10 +1675,8 @@ async def get_dapp_interactions(address: str) -> str:
     Returns:
         str: Last processed tx hash or None
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        try:
-            logger.debug(f"Fetching DApp interactions for wallet {address[:20]}...")
+    try:
+        async def _get_dapp_interactions(conn, address):
             row = await conn.fetchrow(
                 """
                 SELECT tx_hash
@@ -1702,11 +1688,13 @@ async def get_dapp_interactions(address: str) -> str:
                 address
             )
             return row['tx_hash'] if row else None
-        except Exception as e:
-            logger.error(f"Error getting DApp interactions for {address[:20]}: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            return None
+        
+        return await execute_with_retry(_get_dapp_interactions, address)
+    except Exception as e:
+        logger.error(f"Error getting DApp interactions for {address[:20]}: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        return None
 
 async def update_dapp_interaction(address: str, tx_hash: str) -> bool:
     """Update the last processed DApp interaction
@@ -1718,10 +1706,8 @@ async def update_dapp_interaction(address: str, tx_hash: str) -> bool:
     Returns:
         bool: Success status
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        try:
-            logger.debug(f"Updating DApp interaction for wallet {address[:20]}...")
+    try:
+        async def _update_dapp_interaction(conn, address, tx_hash):
             await conn.execute(
                 """
                 INSERT INTO dapp_interactions (address, tx_hash)
@@ -1732,11 +1718,13 @@ async def update_dapp_interaction(address: str, tx_hash: str) -> bool:
                 address, tx_hash
             )
             return True
-        except Exception as e:
-            logger.error(f"Error updating DApp interaction for {address[:20]}: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            return False
+        
+        return await execute_with_retry(_update_dapp_interaction, address, tx_hash)
+    except Exception as e:
+        logger.error(f"Error updating DApp interaction for {address[:20]}: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        return False
 
 async def get_last_dapp_tx(address: str) -> Optional[str]:
     """Get the last processed DApp transaction for a wallet
@@ -1748,9 +1736,7 @@ async def get_last_dapp_tx(address: str) -> Optional[str]:
         Optional[str]: Transaction hash or None if not found
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching last DApp transaction for wallet {address[:20]}...")
+        async def _get_last_dapp_tx(conn, address):
             query = """
                 SELECT tx_hash
                 FROM dapp_interactions
@@ -1760,6 +1746,8 @@ async def get_last_dapp_tx(address: str) -> Optional[str]:
             """
             result = await conn.fetchval(query, address)
             return result
+        
+        return await execute_with_retry(_get_last_dapp_tx, address)
     except Exception as e:
         logger.error(f"Error getting last DApp transaction: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1777,9 +1765,7 @@ async def update_last_dapp_tx(address: str, tx_hash: str) -> bool:
         bool: True if successful, False otherwise
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Updating last DApp transaction for wallet {address[:20]}...")
+        async def _update_last_dapp_tx(conn, address, tx_hash):
             query = """
                 INSERT INTO dapp_interactions (address, tx_hash)
                 VALUES ($1, $2)
@@ -1788,6 +1774,8 @@ async def update_last_dapp_tx(address: str, tx_hash: str) -> bool:
             """
             await conn.execute(query, address, tx_hash)
             return True
+        
+        return await execute_with_retry(_update_last_dapp_tx, address, tx_hash)
     except Exception as e:
         logger.error(f"Error updating last DApp transaction: {str(e)}")
         if hasattr(e, '__dict__'):
@@ -1797,8 +1785,7 @@ async def update_last_dapp_tx(address: str, tx_hash: str) -> bool:
 async def add_failed_transaction(wallet_id: int, tx_hash: str, error_type: str, error_details: dict) -> bool:
     """Add a failed transaction to the database"""
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _add_failed_transaction(conn, wallet_id, tx_hash, error_type, error_details):
             await conn.execute(
                 """
                 INSERT INTO failed_transactions (wallet_id, tx_hash, error_type, error_details)
@@ -1809,6 +1796,8 @@ async def add_failed_transaction(wallet_id: int, tx_hash: str, error_type: str, 
                 wallet_id, tx_hash, error_type, error_details
             )
             return True
+        
+        return await execute_with_retry(_add_failed_transaction, wallet_id, tx_hash, error_type, error_details)
     except Exception as e:
         logger.error(f"Error adding failed transaction: {str(e)}")
         return False
@@ -1823,8 +1812,7 @@ async def add_asset_history(
 ) -> bool:
     """Add an asset history entry to the database"""
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _add_asset_history(conn, wallet_id, asset_id, tx_hash, action, quantity, metadata):
             await conn.execute(
                 """
                 INSERT INTO asset_history 
@@ -1839,6 +1827,8 @@ async def add_asset_history(
                 wallet_id, asset_id, tx_hash, action, quantity, metadata
             )
             return True
+        
+        return await execute_with_retry(_add_asset_history, wallet_id, asset_id, tx_hash, action, quantity, metadata)
     except Exception as e:
         logger.error(f"Error adding asset history: {str(e)}")
         return False
@@ -1850,8 +1840,7 @@ async def initialize_notification_settings(user_id: str):
         user_id: Discord user ID
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _initialize_notification_settings(conn, user_id):
             # Default settings - all notifications enabled
             default_settings = {
                 "ada_transactions": True,
@@ -1895,6 +1884,7 @@ async def initialize_notification_settings(user_id: str):
             
             logger.info(f"Initialized notification settings for user {user_id}")
                 
+        await execute_with_retry(_initialize_notification_settings, user_id)
     except Exception as e:
         logger.error(f"Error initializing notification settings: {e}")
         if hasattr(e, '__dict__'):
@@ -1909,15 +1899,17 @@ async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
     Returns:
         Optional[str]: Discord user ID or None if not found
     """
-    query = """
-        SELECT DISTINCT user_id 
-        FROM wallets 
-        WHERE stake_address = $1
-    """
-    
     try:
-        result = await fetch_one(query, stake_address)
-        return result['user_id'] if result else None
+        async def _get_user_id_for_stake_address(conn, stake_address):
+            query = """
+                SELECT DISTINCT user_id 
+                FROM wallets 
+                WHERE stake_address = $1
+            """
+            result = await conn.fetchval(query, stake_address)
+            return result
+        
+        return await execute_with_retry(_get_user_id_for_stake_address, stake_address)
     except Exception as e:
         logger.error(f"Error getting user ID for stake address: {e}")
         return None
@@ -1931,17 +1923,22 @@ async def get_last_policy_check(address: str):
     Returns:
         Optional[datetime]: Last check time or None if never checked
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT last_policy_check
-            FROM wallets
-            WHERE address = $1
-            """,
-            address
-        )
-        return row['last_policy_check'] if row else None
+    try:
+        async def _get_last_policy_check(conn, address):
+            row = await conn.fetchrow(
+                """
+                SELECT last_policy_check
+                FROM wallets
+                WHERE address = $1
+                """,
+                address
+            )
+            return row['last_policy_check'] if row else None
+        
+        return await execute_with_retry(_get_last_policy_check, address)
+    except Exception as e:
+        logger.error(f"Error getting last policy check: {str(e)}")
+        return None
 
 async def update_last_policy_check(address: str):
     """Update the last policy check time
@@ -1949,16 +1946,20 @@ async def update_last_policy_check(address: str):
     Args:
         address: Wallet address
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE wallets
-            SET last_policy_check = NOW()
-            WHERE address = $1
-            """,
-            address
-        )
+    try:
+        async def _update_last_policy_check(conn, address):
+            await conn.execute(
+                """
+                UPDATE wallets
+                SET last_policy_check = NOW()
+                WHERE address = $1
+                """,
+                address
+            )
+        
+        await execute_with_retry(_update_last_policy_check, address)
+    except Exception as e:
+        logger.error(f"Error updating last policy check: {str(e)}")
 
 async def get_monitoring_since(address: str) -> datetime:
     """Get when monitoring started for a wallet
@@ -1969,16 +1970,21 @@ async def get_monitoring_since(address: str) -> datetime:
     Returns:
         datetime: When monitoring started
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetchval(
-            """
-            SELECT monitoring_since
-            FROM wallets
-            WHERE address = $1
-            """,
-            address
-        )
+    try:
+        async def _get_monitoring_since(conn, address):
+            return await conn.fetchval(
+                """
+                SELECT monitoring_since
+                FROM wallets
+                WHERE address = $1
+                """,
+                address
+            )
+        
+        return await execute_with_retry(_get_monitoring_since, address)
+    except Exception as e:
+        logger.error(f"Error getting monitoring since: {str(e)}")
+        return None
 
 async def get_all_monitored_addresses(pool):
     """Get all monitored addresses and stake addresses
@@ -2005,8 +2011,7 @@ async def get_all_monitored_addresses(pool):
 async def get_addresses_for_stake(stake_address: str) -> list[str]:
     """Get all addresses for a stake address"""
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _get_addresses_for_stake(conn, stake_address):
             async with conn.execute(
                 """
                 SELECT address
@@ -2016,6 +2021,8 @@ async def get_addresses_for_stake(stake_address: str) -> list[str]:
                 stake_address
             ) as cursor:
                 return [row[0] async for row in cursor]
+        
+        return await execute_with_retry(_get_addresses_for_stake, stake_address)
     except Exception as e:
         logger.error(f"Error getting addresses for stake: {str(e)}")
         return []
@@ -2023,8 +2030,7 @@ async def get_addresses_for_stake(stake_address: str) -> list[str]:
 async def update_pool_for_stake(stake_address: str, pool_id: str):
     """Update the pool ID for a stake address"""
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _update_pool_for_stake(conn, stake_address, pool_id):
             await conn.execute(
                 '''
                 UPDATE stake_addresses 
@@ -2035,6 +2041,8 @@ async def update_pool_for_stake(stake_address: str, pool_id: str):
             )
             await conn.commit()
             return True
+        
+        return await execute_with_retry(_update_pool_for_stake, stake_address, pool_id)
     except Exception as e:
         logger.error(f"Error updating pool for stake address: {str(e)}")
         return False
@@ -2042,8 +2050,7 @@ async def update_pool_for_stake(stake_address: str, pool_id: str):
 async def get_wallet_info(address: str) -> dict:
     """Get wallet information including stake address"""
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _get_wallet_info(conn, address):
             async with conn.execute(
                 """
                 SELECT w.address, w.user_id, w.stake_address, w.monitoring_since,
@@ -2065,6 +2072,8 @@ async def get_wallet_info(address: str) -> dict:
                         'last_checked': row[5]
                     }
                 return None
+        
+        return await execute_with_retry(_get_wallet_info, address)
     except Exception as e:
         logger.error(f"Error getting wallet info: {str(e)}")
         return None
@@ -2072,8 +2081,7 @@ async def get_wallet_info(address: str) -> dict:
 async def get_user_wallets(user_id: int) -> list:
     """Get all wallets for a user with their stake and delegation info"""
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _get_user_wallets(conn, user_id):
             async with conn.execute(
                 """
                 SELECT w.address, w.stake_address, w.monitoring_since,
@@ -2095,6 +2103,8 @@ async def get_user_wallets(user_id: int) -> list:
                     }
                     async for row in cursor
                 ]
+        
+        return await execute_with_retry(_get_user_wallets, user_id)
     except Exception as e:
         logger.error(f"Error getting user wallets: {str(e)}")
         return []
@@ -2102,8 +2112,7 @@ async def get_user_wallets(user_id: int) -> list:
 async def update_stake_pool(stake_address: str, pool_id: str) -> bool:
     """Update stake pool for an address"""
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _update_stake_pool(conn, stake_address, pool_id):
             await conn.execute(
                 """
                 INSERT INTO stake_addresses (stake_address, last_pool_id, last_checked)
@@ -2116,6 +2125,8 @@ async def update_stake_pool(stake_address: str, pool_id: str) -> bool:
                 stake_address, pool_id
             )
             return True
+        
+        return await execute_with_retry(_update_stake_pool, stake_address, pool_id)
     except Exception as e:
         logger.error(f"Error updating stake pool: {str(e)}")
         return False
@@ -2132,8 +2143,7 @@ async def add_wallet_for_user(user_id: str, address: str, stake_address: str = N
         bool: Success status
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _add_wallet_for_user(conn, user_id, address, stake_address):
             await conn.execute(
                 """
                 INSERT INTO wallets (user_id, address, stake_address)
@@ -2143,6 +2153,8 @@ async def add_wallet_for_user(user_id: str, address: str, stake_address: str = N
                 user_id, address, stake_address
             )
             return True
+        
+        return await execute_with_retry(_add_wallet_for_user, user_id, address, stake_address)
     except Exception as e:
         logger.error(f"Failed to add wallet: {str(e)}")
         return False
@@ -2158,8 +2170,7 @@ async def remove_wallet_for_user(user_id: str, address: str):
         bool: Success status
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _remove_wallet_for_user(conn, user_id, address):
             await conn.execute(
                 """
                 DELETE FROM wallets
@@ -2168,6 +2179,8 @@ async def remove_wallet_for_user(user_id: str, address: str):
                 user_id, address
             )
             return True
+        
+        return await execute_with_retry(_remove_wallet_for_user, user_id, address)
     except Exception as e:
         logger.error(f"Failed to remove wallet: {str(e)}")
         return False
@@ -2184,8 +2197,7 @@ async def update_notification_settings(user_id: str, setting: str, enabled: bool
         bool: Success status
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _update_notification_settings(conn, user_id, setting, enabled):
             await conn.execute(
                 f"""
                 UPDATE notification_settings
@@ -2195,6 +2207,8 @@ async def update_notification_settings(user_id: str, setting: str, enabled: bool
                 enabled, user_id
             )
             return True
+        
+        return await execute_with_retry(_update_notification_settings, user_id, setting, enabled)
     except Exception as e:
         logger.error(f"Failed to update notification setting: {str(e)}")
         return False
@@ -2209,8 +2223,7 @@ async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
         Optional[str]: Discord user ID or None if not found
     """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
+        async def _get_user_id_for_stake_address(conn, stake_address):
             row = await conn.fetchrow(
                 '''
                 SELECT DISTINCT user_id 
@@ -2220,6 +2233,8 @@ async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
                 stake_address
             )
             return str(row['user_id']) if row else None
+        
+        return await execute_with_retry(_get_user_id_for_stake_address, stake_address)
     except Exception as e:
         logger.error(f"Error getting user ID for stake address {stake_address}: {str(e)}")
         return None

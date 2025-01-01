@@ -123,23 +123,35 @@ def validate_url(value: str, name: str) -> str:
 
 def validate_database_url(value: str, name: str) -> str:
     """Validate and normalize database URL"""
-    if value.startswith('postgres://'):
-        value = value.replace('postgres://', 'postgresql://', 1)
-    
+    if not value:
+        raise ValueError(f"{name} is required")
+        
+    # Handle Heroku's postgres:// format
+    if value.startswith("postgres://"):
+        value = value.replace("postgres://", "postgresql://", 1)
+        
     try:
         result = urlparse(value)
-        if not all([result.scheme, result.netloc, result.path]):
-            raise ValueError("Invalid database URL format")
+        if not all([result.scheme, result.hostname, result.username, result.password]):
+            raise ValueError(f"{name} is missing required components")
+            
         if result.scheme not in ['postgresql', 'postgres']:
-            raise ValueError("Invalid database scheme")
-        return value
+            raise ValueError(f"{name} must be a PostgreSQL URL")
+            
     except Exception as e:
-        raise ValueError(f"Invalid database URL: {str(e)}")
+        raise ValueError(f"Invalid {name}: {str(e)}")
+        
+    return value
 
 def validate_discord_token(value: str, name: str) -> str:
-    """Validate Discord bot token format"""
-    if not re.match(r'^[A-Za-z0-9\-_]{59}$', value):
-        raise ValueError("Invalid Discord token format")
+    """Validate Discord token format"""
+    if not value:
+        raise ValueError(f"{name} cannot be empty")
+        
+    # Check basic format (just length and characters)
+    if not re.match(r'^[A-Za-z0-9._-]{50,100}$', value):
+        raise ValueError(f"{name} has invalid format")
+        
     return value
 
 def validate_blockfrost_project_id(value: str, name: str) -> str:
@@ -439,34 +451,15 @@ def validate_url(value: str, name: str) -> str:
     return value
 
 def validate_discord_token(value: str, name: str) -> str:
-    """Validate Discord token format and test connection"""
+    """Validate Discord token format"""
     if not value:
         raise ValueError(f"{name} cannot be empty")
         
-    # Check basic format
-    if not re.match(r'^[A-Za-z0-9._-]{59,}$', value):
+    # Check basic format (just length and characters)
+    if not re.match(r'^[A-Za-z0-9._-]{50,100}$', value):
         raise ValueError(f"{name} has invalid format")
         
-    # Test Discord API connection
-    try:
-        import aiohttp
-        import asyncio
-        
-        async def test_connection():
-            async with aiohttp.ClientSession() as session:
-                headers = {"Authorization": f"Bot {value}"}
-                url = "https://discord.com/api/v10/users/@me"
-                async with session.get(url, headers=headers, timeout=10) as response:
-                    if response.status != 200:
-                        raise ValueError(f"Discord API test failed with status {response.status}")
-                    return True
-                    
-        asyncio.run(test_connection())
-        logger.info("Discord API connection test successful")
-        return value
-        
-    except Exception as e:
-        raise ValueError(f"Failed to validate Discord token: {str(e)}")
+    return value
 
 def validate_blockfrost_id(value: str, name: str) -> str:
     """Validate Blockfrost project ID format and test connectivity"""
@@ -937,6 +930,20 @@ ENV_VARS = {
         description="Address used for health checks (configurable)"
     )
 }
+
+def validate_webhook_identifier(value: str, name: str) -> str:
+    if not value or not isinstance(value, str):
+        raise ValueError(f"{name} must be a non-empty string")
+    if not re.match(r'^[a-zA-Z0-9_-]+$', value):
+        raise ValueError(f"{name} must contain only alphanumeric characters, underscores, and hyphens")
+    return value
+
+def validate_webhook_auth_token(value: str, name: str) -> str:
+    if not value or not isinstance(value, str):
+        raise ValueError(f"{name} must be a non-empty string")
+    if len(value) < 32:
+        raise ValueError(f"{name} must be at least 32 characters long")
+    return value
 
 # Validate environment variables
 try:
