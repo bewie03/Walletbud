@@ -677,33 +677,30 @@ def validate_policy_id(value: str, name: str) -> str:
 def load_env_file(env_path: str = ".env") -> dict:
     """Load environment variables with graceful fallback"""
     try:
-        # Try loading from .env file
+        # Try loading from .env file if it exists
         if os.path.exists(env_path):
             load_dotenv(env_path)
             logger.info(f"Loaded environment from {env_path}")
         else:
             logger.warning(f"No {env_path} file found, using system environment")
-            
-        # Validate environment
-        return validate_env_vars()
+        
+        # Create environment dictionary from os.getenv
+        env = {}
+        for var_name, var_config in ENV_VARS.items():
+            value = os.getenv(var_name)
+            if value is not None:
+                env[var_name] = value
+            elif var_config.default is not None:
+                env[var_name] = var_config.default
+            elif var_config.required:
+                raise ValueError(f"Required environment variable {var_name} not set")
+        
+        return env
         
     except Exception as e:
         logger.error(f"Error loading environment: {str(e)}")
         # Return minimal configuration if possible
         return get_minimal_config()
-
-def get_minimal_config() -> dict:
-    """Get minimal configuration for basic functionality"""
-    minimal_vars = {
-        'LOG_LEVEL': 'WARNING',  # Conservative logging
-        'MAX_WEBHOOK_SIZE': 1048576,  # 1MB default
-        'RATE_LIMIT_COOLDOWN': 60,
-        'MAX_REQUESTS_PER_SECOND': 10,
-        'BURST_LIMIT': 500
-    }
-    
-    logger.warning("Using minimal configuration - some features will be disabled")
-    return minimal_vars
 
 # Define required environment variables
 ENV_VARS = {
