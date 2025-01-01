@@ -253,7 +253,7 @@ class QueryError(DatabaseError):
     """Database query error"""
     pass
 
-# Database initialization SQL - Split into initial schema and migrations
+# Database initialization SQL
 INIT_SQL = """
 -- Create version tracking tables first
 CREATE TABLE IF NOT EXISTS migration_history (
@@ -267,7 +267,8 @@ CREATE TABLE IF NOT EXISTS migration_history (
 CREATE TABLE IF NOT EXISTS db_version (
     id SERIAL PRIMARY KEY,
     version INTEGER NOT NULL,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Create core tables
@@ -276,6 +277,7 @@ CREATE TABLE IF NOT EXISTS wallets (
     user_id TEXT NOT NULL,
     address TEXT UNIQUE NOT NULL,
     stake_address TEXT,
+    nickname TEXT,
     monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     last_checked TIMESTAMP WITH TIME ZONE,
     last_policy_check TIMESTAMP WITH TIME ZONE,
@@ -283,25 +285,35 @@ CREATE TABLE IF NOT EXISTS wallets (
     token_balances JSONB DEFAULT '{}'::jsonb,
     utxo_state JSONB DEFAULT '{}'::jsonb,
     delegation_pool TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS notification_settings (
     id SERIAL PRIMARY KEY,
     user_id TEXT UNIQUE NOT NULL,
+    min_amount BIGINT DEFAULT 0,
+    notify_deposits BOOLEAN DEFAULT TRUE,
+    notify_withdrawals BOOLEAN DEFAULT TRUE,
+    notify_nfts BOOLEAN DEFAULT TRUE,
     ada_transactions BOOLEAN DEFAULT TRUE,
     token_changes BOOLEAN DEFAULT TRUE,
     nft_updates BOOLEAN DEFAULT TRUE,
     delegation_status BOOLEAN DEFAULT TRUE,
     policy_updates BOOLEAN DEFAULT TRUE,
     balance_alerts BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
     id SERIAL PRIMARY KEY,
     wallet_id INTEGER NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
     tx_hash TEXT NOT NULL,
+    block_height BIGINT,
+    block_time TIMESTAMP WITH TIME ZONE,
+    amount BIGINT,
+    direction TEXT CHECK (direction IN ('in', 'out', 'self')),
     metadata JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(wallet_id, tx_hash)
@@ -313,6 +325,8 @@ CREATE TABLE IF NOT EXISTS failed_transactions (
     tx_hash TEXT NOT NULL,
     error_type TEXT NOT NULL,
     error_details JSONB,
+    retry_count INTEGER DEFAULT 0,
+    last_retry TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -320,24 +334,64 @@ CREATE TABLE IF NOT EXISTS asset_history (
     id SERIAL PRIMARY KEY,
     wallet_id INTEGER NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
     asset_id TEXT NOT NULL,
+    policy_id TEXT NOT NULL,
+    asset_name TEXT,
     tx_hash TEXT NOT NULL,
-    action TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('mint', 'burn', 'transfer_in', 'transfer_out')),
     quantity DECIMAL NOT NULL,
     metadata JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Create indices after tables
-CREATE INDEX IF NOT EXISTS idx_db_version_updated_at ON db_version(updated_at DESC);
+-- Create indices after all tables are created
 CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
 CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
 CREATE INDEX IF NOT EXISTS idx_wallets_stake_address ON wallets(stake_address);
+CREATE INDEX IF NOT EXISTS idx_wallets_updated_at ON wallets(updated_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_notification_settings_user_id ON notification_settings(user_id);
+CREATE INDEX IF NOT EXISTS idx_notification_settings_updated_at ON notification_settings(updated_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_transactions_wallet_tx ON transactions(wallet_id, tx_hash);
 CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transactions_block_time ON transactions(block_time DESC);
+
 CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet ON failed_transactions(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_failed_transactions_created ON failed_transactions(created_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_asset_history_wallet ON asset_history(wallet_id);
 CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id);
+CREATE INDEX IF NOT EXISTS idx_asset_history_policy ON asset_history(policy_id);
+CREATE INDEX IF NOT EXISTS idx_asset_history_created ON asset_history(created_at DESC);
+
+-- Create function to update timestamps
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Create triggers for updated_at columns
+DO $$ 
+BEGIN 
+    -- Wallets table trigger
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_wallets_updated_at') THEN
+        CREATE TRIGGER update_wallets_updated_at 
+            BEFORE UPDATE ON wallets 
+            FOR EACH ROW 
+            EXECUTE FUNCTION update_updated_at_column();
+    END IF;
+
+    -- Notification settings table trigger
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_notification_settings_updated_at') THEN
+        CREATE TRIGGER update_notification_settings_updated_at 
+            BEFORE UPDATE ON notification_settings 
+            FOR EACH ROW 
+            EXECUTE FUNCTION update_updated_at_column();
+    END IF;
+END $$;
 """
 
 # Current database version
