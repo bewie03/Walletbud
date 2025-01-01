@@ -89,6 +89,7 @@ import functools
 from functools import wraps
 from cachetools import TTLCache
 from tenacity import retry, stop_after_attempt, wait_exponential
+from shutdown_manager import ShutdownManager
 
 # Suppress only the single InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
@@ -231,6 +232,10 @@ class WalletBudBot(commands.Bot):
             **kwargs
         )
         
+        # Initialize shutdown manager
+        self.shutdown_manager = ShutdownManager()
+        self.register_cleanup_handlers()
+        
         # Get admin channel ID from environment
         self.admin_channel_id = int(os.getenv('ADMIN_CHANNEL_ID', 0))
         self.admin_channel = None  # Will be set in setup_hook
@@ -297,9 +302,117 @@ class WalletBudBot(commands.Bot):
         # Initialize webhook rate limiting
         self.webhook_rate_limits = {}
         
-    async def setup_hook(self):
-        """Set up the bot's background tasks"""
+        # Initialize health check task
+        self.health_check_task = tasks.loop(minutes=5)(self.monitor_health)
+        self.health_lock = asyncio.Lock()
+        
+    def register_cleanup_handlers(self):
+        """Register all cleanup handlers for graceful shutdown"""
+        # Database cleanup
+        self.shutdown_manager.register_handler(
+            'database',
+            self._cleanup_database
+        )
+        
+        # Webhook cleanup
+        self.shutdown_manager.register_handler(
+            'webhook',
+            self._cleanup_webhook
+        )
+        
+        # Session cleanup
+        self.shutdown_manager.register_handler(
+            'session',
+            self._cleanup_session
+        )
+        
+        # Tasks cleanup
+        self.shutdown_manager.register_handler(
+            'tasks',
+            self._cleanup_tasks
+        )
+        
+    async def _cleanup_database(self):
+        """Cleanup database connections"""
         try:
+            pool = await get_pool()
+            await pool.close()
+            logger.info("Database pool closed successfully")
+        except Exception as e:
+            logger.error(f"Error closing database pool: {e}")
+            
+    async def _cleanup_webhook(self):
+        """Cleanup webhook server and queue"""
+        try:
+            # Cancel webhook processor
+            if self._webhook_processor and not self._webhook_processor.done():
+                self._webhook_processor.cancel()
+                try:
+                    await self._webhook_processor
+                except asyncio.CancelledError:
+                    pass
+                    
+            # Close webhook site
+            if self.site:
+                await self.site.stop()
+                
+            # Close webhook runner
+            if self.runner:
+                await self.runner.cleanup()
+                
+            logger.info("Webhook components cleaned up successfully")
+        except Exception as e:
+            logger.error(f"Error cleaning up webhook components: {e}")
+            
+    async def _cleanup_session(self):
+        """Cleanup aiohttp session"""
+        try:
+            if self.session:
+                await self.session.close()
+            if self.connector:
+                await self.connector.close()
+            logger.info("HTTP session closed successfully")
+        except Exception as e:
+            logger.error(f"Error closing HTTP session: {e}")
+            
+    async def _cleanup_tasks(self):
+        """Cleanup background tasks"""
+        try:
+            # Cancel health check task
+            if hasattr(self, 'health_check_task'):
+                self.health_check_task.cancel()
+                
+            # Cancel YUMMI check task
+            if hasattr(self, 'check_yummi_balances'):
+                self.check_yummi_balances.cancel()
+                
+            logger.info("Background tasks cancelled successfully")
+        except Exception as e:
+            logger.error(f"Error cancelling background tasks: {e}")
+            
+    async def close(self):
+        """Override close to include graceful shutdown"""
+        try:
+            # Execute graceful shutdown
+            await self.shutdown_manager.cleanup()
+            
+            # Send final alert to admin channel
+            try:
+                if self.admin_channel:
+                    await self.admin_channel.send(" Bot is shutting down gracefully...")
+            except:
+                pass
+                
+        finally:
+            # Call parent's close
+            await super().close()
+            
+    async def setup_hook(self):
+        """Set up the bot's background tasks and signal handlers"""
+        try:
+            # Setup signal handlers
+            self.shutdown_manager.setup_signal_handlers(self.loop)
+            
             # Initialize critical components
             await self.validate_and_init_dependencies()
             
@@ -311,29 +424,29 @@ class WalletBudBot(commands.Bot):
                 self.check_yummi_balances.start()
             except RuntimeError as e:
                 logger.error(f"Failed to start YUMMI check task: {e}")
-                await self.send_admin_alert("⚠️ YUMMI check task failed to start", is_error=True)
+                await self.send_admin_alert(" YUMMI check task failed to start", is_error=True)
                 
             try:
                 self._check_connection_task = self.loop.create_task(self._check_connection_loop())
             except Exception as e:
                 logger.error(f"Failed to start connection check task: {e}")
-                await self.send_admin_alert("⚠️ Connection check task failed to start", is_error=True)
+                await self.send_admin_alert(" Connection check task failed to start", is_error=True)
                 
             # Start webhook server
             try:
                 await self.setup_webhook_handler()
             except Exception as e:
                 logger.error(f"Failed to start webhook server: {e}")
-                await self.send_admin_alert("⚠️ Webhook server failed to start", is_error=True)
+                await self.send_admin_alert(" Webhook server failed to start", is_error=True)
                 # Don't raise here as webhook is not critical for core functionality
             
             # Log successful setup
             logger.info("Bot setup completed successfully")
-            await self.send_admin_alert("✅ Bot setup completed successfully", is_error=False)
+            await self.send_admin_alert(" Bot setup completed successfully", is_error=False)
             
         except Exception as e:
             logger.error(f"Failed to set up bot: {e}")
-            await self.send_admin_alert(f"🚨 Bot setup failed: {e}", is_error=True)
+            await self.send_admin_alert(f" Bot setup failed: {e}", is_error=True)
             raise
             
     async def validate_and_init_dependencies(self):
@@ -361,7 +474,7 @@ class WalletBudBot(commands.Bot):
                 await self.init_blockfrost()
             except Exception as e:
                 logger.error(f"Failed to initialize Blockfrost: {e}")
-                await self.send_admin_alert("⚠️ Blockfrost initialization failed, some features may be limited", is_error=True)
+                await self.send_admin_alert(" Blockfrost initialization failed, some features may be limited", is_error=True)
                 # Don't raise here as bot can function without Blockfrost
             
             # Initialize rate limiters
@@ -395,7 +508,7 @@ class WalletBudBot(commands.Bot):
             
         except Exception as e:
             logger.error(f"Failed to initialize dependencies: {e}")
-            await self.send_admin_alert(f"🚨 Dependency initialization failed: {e}", is_error=True)
+            await self.send_admin_alert(f" Dependency initialization failed: {e}", is_error=True)
             raise RuntimeError(f"Dependency initialization failed: {e}")
             
     async def init_database(self):
@@ -419,10 +532,37 @@ class WalletBudBot(commands.Bot):
     def init_ssl_context(self):
         """Initialize SSL context with proper security settings"""
         try:
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            ssl_context.check_hostname = True
+            # Create SSL context with highest available protocol
+            ssl_context = ssl.create_default_context(
+                purpose=ssl.Purpose.SERVER_AUTH,
+                cafile=certifi.where()
+            )
+            
+            # Configure SSL context with secure defaults
+            ssl_context.options |= (
+                ssl.OP_NO_SSLv2 | 
+                ssl.OP_NO_SSLv3 | 
+                ssl.OP_NO_TLSv1 | 
+                ssl.OP_NO_TLSv1_1
+            )
+            
+            # Enable certificate verification
             ssl_context.verify_mode = ssl.CERT_REQUIRED
+            ssl_context.check_hostname = True
+            
+            # Set secure cipher list
+            ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20')
+            
+            # Special handling for Heroku
+            if 'DYNO' in os.environ:
+                logger.info("Running on Heroku, adjusting SSL configuration")
+                # Heroku's SSL termination requires these settings
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+            logger.info("SSL context initialized successfully")
             return ssl_context
+            
         except Exception as e:
             logger.error(f"Failed to initialize SSL context: {e}")
             raise RuntimeError(f"SSL context initialization failed: {e}")
@@ -464,83 +604,6 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error in error handler: {e}")
             
-    async def close(self):
-        """Clean up resources when the bot is shutting down"""
-        try:
-            # Stop background tasks
-            self.check_yummi_balances.cancel()
-            if hasattr(self, '_check_connection_task'):
-                self._check_connection_task.cancel()
-                
-            # Close webhook server
-            if self.site:
-                await self.site.stop()
-            if self.runner:
-                await self.runner.cleanup()
-                
-            # Close aiohttp session
-            if self.session:
-                await self.session.close()
-                
-            # Close database pool
-            if hasattr(self, '_pool') and self._pool:
-                await self._pool.close()
-                
-            # Call parent close
-            await super().close()
-            
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
-            
-        finally:
-            logger.info("Bot shutdown complete")
-            
-    async def send_admin_alert(self, message: str, is_error: bool = True):
-        """Send alert to admin channel with enhanced details"""
-        try:
-            if not self.admin_channel_id:
-                return
-                
-            channel = self.get_channel(int(self.admin_channel_id))
-            if not channel:
-                logger.error("Admin channel not found")
-                return
-                
-            # Create rich embed for alert
-            embed = discord.Embed(
-                title="🚨 Error Alert" if is_error else "ℹ️ System Alert",
-                description=message,
-                color=discord.Color.red() if is_error else discord.Color.blue(),
-                timestamp=datetime.now()
-            )
-            
-            # Add system info
-            embed.add_field(
-                name="System Status",
-                value=f"""
-                • Database: {'✅' if await self.check_database() else '❌'}
-                • Blockfrost: {'✅' if await self.check_blockfrost() else '❌'}
-                • Memory Usage: {psutil.Process().memory_info().rss / 1024 / 1024:.1f} MB
-                • CPU Usage: {psutil.cpu_percent()}%
-                """.strip(),
-                inline=False
-            )
-            
-            # Add error context if available
-            import traceback
-            tb = traceback.format_exc()
-            if tb and tb != "NoneType: None\n":
-                embed.add_field(
-                    name="Error Details",
-                    value=f"```python\n{tb[:1000]}```",
-                    inline=False
-                )
-            
-            await channel.send(embed=embed)
-            
-        except Exception as e:
-            logger.error(f"Failed to send admin alert: {str(e)}")
-
     async def process_interaction(self, interaction: discord.Interaction, ephemeral: bool = True):
         """Process interaction with proper error handling and retry logic"""
         interaction_id = str(interaction.id)
@@ -683,7 +746,7 @@ class WalletBudBot(commands.Bot):
             
             # Send detailed error to admin channel
             await self.send_admin_alert(
-                f"🚨 Command error in {interaction.command.name if interaction.command else 'unknown'}: {error}",
+                f" Error in {interaction.command.name if interaction.command else 'unknown'}: {error}",
                 is_error=True
             )
             
@@ -757,82 +820,88 @@ class WalletBudBot(commands.Bot):
 
     async def health_check(self) -> Dict[str, Any]:
         """Comprehensive health check of all system components"""
-        health = {
-            'status': 'healthy',
-            'components': {},
-            'metrics': {},
-            'errors': []
-        }
-        
         try:
-            # Check Discord connection
-            health['components']['discord'] = {
-                'status': 'connected' if self.is_ready() else 'disconnected',
-                'latency': round(self.latency * 1000, 2),  # ms
-                'guilds': len(self.guilds)
+            current_time = datetime.utcnow()
+            health_data = {
+                'status': 'healthy',
+                'components': {},
+                'last_check': current_time.isoformat(),
+                'uptime': (current_time - self.health_metrics['start_time']).total_seconds() if self.health_metrics['start_time'] else 0
             }
-            
-            # Check Blockfrost
+
+            # Check Discord connection
+            health_data['components']['discord'] = {
+                'status': 'connected' if self.is_ready() else 'disconnected',
+                'latency': round(self.latency * 1000, 2)  # Convert to ms
+            }
+
+            # Check database connection
+            try:
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    await conn.fetchval('SELECT 1')
+                health_data['components']['database'] = {
+                    'status': 'connected',
+                    'last_query': self.health_metrics['last_db_query'].isoformat() if self.health_metrics['last_db_query'] else None
+                }
+            except Exception as e:
+                logger.error(f"Database health check failed: {e}")
+                health_data['components']['database'] = {
+                    'status': 'error',
+                    'error': str(e)
+                }
+                health_data['status'] = 'degraded'
+
+            # Check Blockfrost API
             try:
                 if self.blockfrost:
                     await self.blockfrost.health()
-                    health['components']['blockfrost'] = {
-                        'status': 'healthy',
-                        'last_call': self.health_metrics.get('last_api_call')
+                    health_data['components']['blockfrost'] = {
+                        'status': 'connected',
+                        'last_call': self.health_metrics['last_api_call'].isoformat() if self.health_metrics['last_api_call'] else None
                     }
                 else:
-                    health['components']['blockfrost'] = {
-                        'status': 'not_initialized'
-                    }
+                    health_data['components']['blockfrost'] = {'status': 'not_initialized'}
+                    health_data['status'] = 'degraded'
             except Exception as e:
-                health['components']['blockfrost'] = {
+                logger.error(f"Blockfrost health check failed: {e}")
+                health_data['components']['blockfrost'] = {
                     'status': 'error',
                     'error': str(e)
                 }
-                health['errors'].append(f"Blockfrost error: {str(e)}")
-                
-            # Check database
-            try:
-                async with self.pool.acquire() as conn:
-                    await conn.execute('SELECT 1')
-                    health['components']['database'] = {
-                        'status': 'connected',
-                        'pool_size': self.pool.get_size(),
-                        'free_size': self.pool.get_free_size()
-                    }
-            except Exception as e:
-                health['components']['database'] = {
-                    'status': 'error',
-                    'error': str(e)
-                }
-                health['errors'].append(f"Database error: {str(e)}")
-                
+                health_data['status'] = 'degraded'
+
             # Check webhook server
-            health['components']['webhook'] = {
+            health_data['components']['webhook'] = {
                 'status': 'running' if self.site else 'stopped',
-                'queue_size': self._webhook_queue.qsize(),
-                'success_count': self.health_metrics.get('webhook_success', 0),
-                'failure_count': self.health_metrics.get('webhook_failure', 0)
+                'queue_size': self._webhook_queue.qsize() if self._webhook_queue else 0,
+                'last_webhook': self.health_metrics['last_webhook'].isoformat() if self.health_metrics['last_webhook'] else None
             }
-            
-            # System metrics
-            health['metrics'] = {
-                'uptime': str(datetime.utcnow() - self.health_metrics['start_time']),
-                'memory_usage': psutil.Process().memory_info().rss / 1024 / 1024,  # MB
-                'cpu_percent': psutil.Process().cpu_percent(),
-                'thread_count': psutil.Process().num_threads()
+
+            # Check system resources
+            process = psutil.Process()
+            health_data['components']['system'] = {
+                'cpu_percent': process.cpu_percent(),
+                'memory_percent': process.memory_percent(),
+                'threads': process.num_threads()
             }
-            
-            # Overall status
-            if health['errors']:
-                health['status'] = 'degraded' if len(health['errors']) < 2 else 'unhealthy'
-                
+
+            # Log health status
+            if health_data['status'] != 'healthy':
+                logger.warning(f"Health check returned degraded status: {json.dumps(health_data, indent=2)}")
+            else:
+                logger.info("Health check passed successfully")
+
+            return health_data
+
         except Exception as e:
-            health['status'] = 'error'
-            health['errors'].append(f"Health check error: {str(e)}")
-            
-        return health
-        
+            logger.error(f"Health check failed: {e}\n{traceback.format_exc()}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'timestamp': datetime.utcnow().isoformat()
+            }
+
     @app_commands.command(name="health")
     @app_commands.checks.has_permissions(administrator=True)
     async def health(self, interaction: discord.Interaction):
@@ -843,7 +912,7 @@ class WalletBudBot(commands.Bot):
             
             # Create embed
             embed = discord.Embed(
-                title="🏥 Bot Health Status",
+                title=" Bot Health Status",
                 color=discord.Color.green() if health['status'] == 'healthy'
                 else discord.Color.orange() if health['status'] == 'degraded'
                 else discord.Color.red()
@@ -921,7 +990,7 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error in on_ready: {str(e)}", exc_info=True)
             if self.admin_channel:
-                await self.admin_channel.send(f"⚠️ Error during bot initialization: {str(e)}")
+                await self.admin_channel.send(f" Error during bot initialization: {str(e)}")
 
     async def on_connect(self):
         """Called when the bot connects to Discord"""
@@ -1031,7 +1100,7 @@ class WalletBudBot(commands.Bot):
             
             # Test permissions by sending a message
             try:
-                await channel.send("🔄 Testing admin channel permissions...")
+                await channel.send(" Testing admin channel permissions...")
                 self.admin_channel = channel
                 logger.info(f"Admin channel set up successfully: {channel.name}")
                 return True
@@ -1055,7 +1124,7 @@ class WalletBudBot(commands.Bot):
                         await conn.execute('SELECT 1')
                 except Exception as e:
                     logger.error(f"Database connection check failed: {e}")
-                    await self.send_admin_alert("⚠️ Database connection lost, attempting to reconnect...")
+                    await self.send_admin_alert(" Database connection lost, attempting to reconnect...")
                     await self.init_database()
                 
                 # Check Blockfrost
@@ -1067,7 +1136,7 @@ class WalletBudBot(commands.Bot):
                         await self.blockfrost_request(self.blockfrost.health)
                     except Exception as e:
                         logger.error(f"Blockfrost connection check failed: {e}")
-                        await self.send_admin_alert("⚠️ Blockfrost connection lost, attempting to reconnect...")
+                        await self.send_admin_alert(" Blockfrost connection lost, attempting to reconnect...")
                         await self.init_blockfrost()
                 
                 # Check webhook server
@@ -1077,7 +1146,7 @@ class WalletBudBot(commands.Bot):
                 
             except Exception as e:
                 logger.error(f"Error in connection check loop: {e}")
-                await self.send_admin_alert(f"⚠️ Connection check failed: {e}")
+                await self.send_admin_alert(f" Connection check failed: {e}")
                 await asyncio.sleep(60)  # Wait longer on error
                 
     async def init_blockfrost(self):
@@ -1108,7 +1177,7 @@ class WalletBudBot(commands.Bot):
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(RETRY_DELAY)
                 else:
-                    await self.send_admin_alert(f"🚨 Blockfrost initialization failed: {e}")
+                    await self.send_admin_alert(f" Blockfrost initialization failed: {e}")
                     raise
                     
     async def blockfrost_request(self, method: Callable, *args, **kwargs):
@@ -1178,7 +1247,7 @@ class WalletBudBot(commands.Bot):
             
             # Notify admin channel
             if self.admin_channel:
-                await self.admin_channel.send("🟢 Bot connection resumed!")
+                await self.admin_channel.send(" Bot connection resumed!")
                 
         except Exception as e:
             logger.error(f"Error in on_resumed: {str(e)}", exc_info=True)
@@ -1310,36 +1379,81 @@ class WalletBudBot(commands.Bot):
         """Process webhooks from queue with error handling"""
         while True:
             try:
-                # Get webhook from queue
-                webhook_data = await self._webhook_queue.get()
+                # Get webhook data from queue with timeout
+                webhook_data = await asyncio.wait_for(
+                    self._webhook_queue.get(),
+                    timeout=30.0
+                )
                 
-                # Extract metadata
-                metadata = webhook_data.pop('_metadata', {})
-                request_id = metadata.get('request_id', 'unknown')
+                request_id = webhook_data.get('request_id', str(uuid.uuid4()))
+                retry_count = webhook_data.get('retry_count', 0)
                 
                 try:
                     # Process webhook with timeout
-                    await asyncio.wait_for(
-                        self._process_single_webhook(webhook_data, request_id),
-                        timeout=30.0
-                    )
+                    async with asyncio.timeout(30):
+                        await self._process_single_webhook(webhook_data, request_id)
+                        
+                    # Update success metrics
+                    self.health_metrics['webhook_success'] += 1
+                    self.health_metrics['last_webhook'] = datetime.utcnow()
                     
                 except asyncio.TimeoutError:
                     logger.error(f"Webhook processing timed out: {request_id}")
-                    await self.send_admin_alert(f"⚠️ Webhook processing timed out: {request_id}", is_error=True)
+                    await self._handle_webhook_failure(webhook_data, request_id, "Timeout")
                     
                 except Exception as e:
                     logger.error(f"Error processing webhook {request_id}: {e}")
-                    await self.send_admin_alert(f"⚠️ Webhook processing error: {e}", is_error=True)
+                    await self._handle_webhook_failure(webhook_data, request_id, str(e))
                     
                 finally:
-                    # Always mark task as done
                     self._webhook_queue.task_done()
+                    
+            except asyncio.TimeoutError:
+                # No webhooks in queue, continue waiting
+                continue
                 
             except Exception as e:
-                logger.error(f"Webhook queue processor error: {e}")
-                await asyncio.sleep(1)  # Prevent tight loop on error
+                logger.error(f"Critical error in webhook processor: {e}")
+                if hasattr(self, 'send_admin_alert'):
+                    await self.send_admin_alert(
+                        f" Webhook processor error:\n```\n{traceback.format_exc()}```"
+                    )
+                await asyncio.sleep(5)  # Prevent tight error loop
                 
+    async def _handle_webhook_failure(self, webhook_data: dict, request_id: str, error: str):
+        """Handle webhook processing failure with smart retry logic"""
+        retry_count = webhook_data.get('retry_count', 0)
+        max_retries = WEBHOOK_CONFIG['retry_attempts']
+        
+        if retry_count >= max_retries:
+            logger.error(f"Webhook {request_id} failed permanently after {retry_count} retries")
+            self.health_metrics['webhook_failure'] += 1
+            if hasattr(self, 'send_admin_alert'):
+                await self.send_admin_alert(
+                    f" Webhook {request_id} failed permanently:\n"
+                    f"Error: {error}\n"
+                    f"Data: ```json\n{json.dumps(webhook_data, indent=2)}```"
+                )
+            return
+            
+        # Calculate backoff delay with jitter
+        base_delay = WEBHOOK_CONFIG['backoff_factor'] ** retry_count
+        jitter = random.uniform(0, 0.1 * base_delay)  # 10% jitter
+        delay = min(base_delay + jitter, WEBHOOK_CONFIG['max_backoff'])
+        
+        # Add retry information
+        webhook_data.update({
+            'retry_count': retry_count + 1,
+            'last_error': error,
+            'last_attempt': datetime.utcnow().isoformat()
+        })
+        
+        logger.info(f"Retrying webhook {request_id} in {delay:.2f}s (attempt {retry_count + 1}/{max_retries})")
+        
+        # Schedule retry with delay
+        await asyncio.sleep(delay)
+        await self._webhook_queue.put(webhook_data)
+
     async def _process_single_webhook(self, webhook_data: dict, request_id: str):
         """Process a single webhook with proper error handling"""
         try:
@@ -1641,89 +1755,6 @@ class WalletBudBot(commands.Bot):
     async def check_environment(self) -> bool:
         """Check if all required environment variables are set"""
         required_vars = {
-            "DISCORD_TOKEN": "Discord bot token",
-            "APPLICATION_ID": "Discord application ID",
-            "ADMIN_CHANNEL_ID": "Admin channel ID",
-            "BLOCKFROST_PROJECT_ID": "Blockfrost project ID",
-            "BLOCKFROST_BASE_URL": "Blockfrost base URL",
-            "DATABASE_URL": "Database connection URL"
-        }
-        
-        missing_vars = []
-        invalid_vars = []
-        
-        for var, description in required_vars.items():
-            value = os.getenv(var)
-            if not value:
-                missing_vars.append(f"{var} ({description})")
-                continue
-                
-            # Validate specific variables
-            try:
-                if var == "APPLICATION_ID":
-                    int(value)  # Should be a valid integer
-                elif var == "ADMIN_CHANNEL_ID":
-                    int(value)  # Should be a valid integer
-                elif var == "BLOCKFROST_PROJECT_ID":
-                    if not value.startswith(("mainnet", "preprod", "preview")):
-                        invalid_vars.append(f"{var} (Should start with mainnet, preprod, or preview)")
-                elif var == "DATABASE_URL":
-                    if not value.startswith(("postgresql://", "postgres://")):
-                        invalid_vars.append(f"{var} (Invalid PostgreSQL URL format)")
-            except ValueError:
-                invalid_vars.append(f"{var} (Invalid format)")
-        
-        if missing_vars or invalid_vars:
-            if missing_vars:
-                logger.error("Missing required environment variables:\n" + 
-                           "\n".join(f"• {var}" for var in missing_vars))
-            if invalid_vars:
-                logger.error("Invalid environment variables:\n" + 
-                           "\n".join(f"• {var}" for var in invalid_vars))
-            return False
-            
-        return True
-
-    async def validate_and_init_dependencies(self):
-        """Validate and initialize all critical dependencies"""
-        try:
-            # 1. Validate environment variables
-            if not await self.validate_environment():
-                raise RuntimeError("Environment validation failed")
-
-            # 2. Initialize SSL context
-            if not await self.init_ssl_context():
-                raise RuntimeError("SSL context initialization failed")
-
-            # 3. Initialize database
-            if not await self.init_database():
-                raise RuntimeError("Database initialization failed")
-
-            # 4. Initialize Blockfrost
-            if not await self.init_blockfrost():
-                logger.error("⚠️ Blockfrost initialization failed. Starting in fallback mode.")
-                self.fallback_mode = True
-            else:
-                self.fallback_mode = False
-
-            # 5. Initialize rate limiters
-            self.init_rate_limiters()
-
-            # 6. Initialize webhook handler if secret is present
-            if os.getenv('WEBHOOK_SECRET'):
-                await self.setup_webhook_handler()
-            else:
-                logger.warning("WEBHOOK_SECRET not set. Webhook functionality disabled.")
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to initialize dependencies: {e}", exc_info=True)
-            return False
-
-    async def validate_environment(self) -> bool:
-        """Validate all required environment variables"""
-        required_vars = {
             'DISCORD_TOKEN': {
                 'description': 'Discord bot token',
                 'validator': lambda x: len(x) > 50  # Basic token length check
@@ -1769,51 +1800,46 @@ class WalletBudBot(commands.Bot):
                 logger.error("Invalid environment variables:\n" + 
                            "\n".join(f"• {var}" for var in invalid_vars))
             return False
-
+            
         return True
 
     async def init_ssl_context(self) -> bool:
         """Initialize SSL context with proper security settings"""
         try:
-            # Create SSL context with strong security settings
+            # Create SSL context with highest available protocol
             ssl_context = ssl.create_default_context(
                 purpose=ssl.Purpose.SERVER_AUTH,
                 cafile=certifi.where()
             )
             
-            # Set minimum TLS version to 1.2
-            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            # Configure SSL context with secure defaults
+            ssl_context.options |= (
+                ssl.OP_NO_SSLv2 | 
+                ssl.OP_NO_SSLv3 | 
+                ssl.OP_NO_TLSv1 | 
+                ssl.OP_NO_TLSv1_1
+            )
             
             # Enable certificate verification
             ssl_context.verify_mode = ssl.CERT_REQUIRED
             ssl_context.check_hostname = True
             
-            # Disable weak ciphers
+            # Set secure cipher list
             ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20')
             
+            # Special handling for Heroku
+            if 'DYNO' in os.environ:
+                logger.info("Running on Heroku, adjusting SSL configuration")
+                # Heroku's SSL termination requires these settings
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+            logger.info("SSL context initialized successfully")
             return ssl_context
+            
         except Exception as e:
             logger.error(f"Failed to initialize SSL context: {e}")
             raise RuntimeError(f"SSL context initialization failed: {e}")
-
-    def init_rate_limiters(self):
-        """Initialize rate limiters for different services"""
-        self.rate_limiters = {
-            'blockfrost': {
-                'global': RateLimiter(
-                    rate=RATE_LIMITS['blockfrost']['calls_per_second'],
-                    burst=RATE_LIMITS['blockfrost']['burst']
-                ),
-                'endpoints': defaultdict(lambda: RateLimiter(
-                    rate=RATE_LIMITS['blockfrost']['calls_per_second'] / 2,
-                    burst=RATE_LIMITS['blockfrost']['burst'] / 2
-                ))
-            },
-            'discord': RateLimiter(
-                rate=RATE_LIMITS['discord']['global_rate_limit'],
-                burst=RATE_LIMITS['discord']['command_rate_limit']
-            )
-        }
 
     async def blockfrost_request(self, method: Callable, *args, **kwargs) -> Any:
         """Execute a rate-limited request to Blockfrost API with retries and error handling"""

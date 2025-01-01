@@ -270,8 +270,6 @@ CREATE TABLE IF NOT EXISTS db_version (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_db_version_updated_at ON db_version(updated_at DESC);
-
 -- Create core tables
 CREATE TABLE IF NOT EXISTS wallets (
     id SERIAL PRIMARY KEY,
@@ -288,9 +286,58 @@ CREATE TABLE IF NOT EXISTS wallets (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS notification_settings (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT UNIQUE NOT NULL,
+    ada_transactions BOOLEAN DEFAULT TRUE,
+    token_changes BOOLEAN DEFAULT TRUE,
+    nft_updates BOOLEAN DEFAULT TRUE,
+    delegation_status BOOLEAN DEFAULT TRUE,
+    policy_updates BOOLEAN DEFAULT TRUE,
+    balance_alerts BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id SERIAL PRIMARY KEY,
+    wallet_id INTEGER NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+    tx_hash TEXT NOT NULL,
+    metadata JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(wallet_id, tx_hash)
+);
+
+CREATE TABLE IF NOT EXISTS failed_transactions (
+    id SERIAL PRIMARY KEY,
+    wallet_id INTEGER NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+    tx_hash TEXT NOT NULL,
+    error_type TEXT NOT NULL,
+    error_details JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS asset_history (
+    id SERIAL PRIMARY KEY,
+    wallet_id INTEGER NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+    asset_id TEXT NOT NULL,
+    tx_hash TEXT NOT NULL,
+    action TEXT NOT NULL,
+    quantity DECIMAL NOT NULL,
+    metadata JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create indices after tables
+CREATE INDEX IF NOT EXISTS idx_db_version_updated_at ON db_version(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
 CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
 CREATE INDEX IF NOT EXISTS idx_wallets_stake_address ON wallets(stake_address);
+CREATE INDEX IF NOT EXISTS idx_notification_settings_user_id ON notification_settings(user_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_wallet_tx ON transactions(wallet_id, tx_hash);
+CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet ON failed_transactions(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_asset_history_wallet ON asset_history(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id);
 """
 
 # Current database version
@@ -357,31 +404,30 @@ async def get_db_version(conn) -> int:
 async def run_migration(conn, version: int, sql: str) -> bool:
     """Run a single migration with proper error handling"""
     try:
-        async with conn.transaction():
-            # Run the migration
-            await conn.execute(sql)
-            
-            # Record successful migration
-            await conn.execute(
-                """
-                INSERT INTO migration_history (version, applied_at, success)
-                VALUES ($1, NOW(), TRUE)
-                """,
-                version
-            )
-            
-            # Update db version
-            await conn.execute(
-                """
-                INSERT INTO db_version (version, updated_at)
-                VALUES ($1, NOW())
-                """,
-                version
-            )
-            
-            logger.info(f"Successfully applied migration {version}")
-            return True
-            
+        # Run the migration
+        await conn.execute(sql)
+        
+        # Record successful migration
+        await conn.execute(
+            """
+            INSERT INTO migration_history (version, applied_at, success)
+            VALUES ($1, NOW(), TRUE)
+            """,
+            version
+        )
+        
+        # Update db version
+        await conn.execute(
+            """
+            INSERT INTO db_version (version, updated_at)
+            VALUES ($1, NOW())
+            """,
+            version
+        )
+        
+        logger.info(f"Successfully applied migration {version}")
+        return True
+        
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error applying migration {version}: {error_msg}")
@@ -2251,3 +2297,93 @@ def init_db_sync():
     except Exception as e:
         logger.error(f"Failed to initialize database: {str(e)}")
         raise
+
+class DatabaseManager:
+    """Manages database operations with prepared statements"""
+    
+    def __init__(self, pool):
+        self.pool = pool
+        self.statements = {}
+        
+    async def init_statements(self):
+        """Initialize prepared statements"""
+        async with self.pool.acquire() as conn:
+            self.statements['get_wallet'] = await conn.prepare("""
+                SELECT w.*, ns.* 
+                FROM wallets w 
+                LEFT JOIN notification_settings ns ON w.user_id = ns.user_id 
+                WHERE w.address = $1
+            """)
+            
+            self.statements['get_user_wallets'] = await conn.prepare("""
+                SELECT w.*, ns.* 
+                FROM wallets w 
+                LEFT JOIN notification_settings ns ON w.user_id = ns.user_id 
+                WHERE w.user_id = $1
+            """)
+            
+            self.statements['insert_wallet'] = await conn.prepare("""
+                INSERT INTO wallets (user_id, address, nickname, created_at)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id, address) DO UPDATE
+                SET nickname = EXCLUDED.nickname
+                RETURNING id
+            """)
+            
+            self.statements['update_notification_settings'] = await conn.prepare("""
+                INSERT INTO notification_settings 
+                (user_id, min_amount, notify_deposits, notify_withdrawals, notify_nfts)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (user_id) DO UPDATE
+                SET min_amount = EXCLUDED.min_amount,
+                    notify_deposits = EXCLUDED.notify_deposits,
+                    notify_withdrawals = EXCLUDED.notify_withdrawals,
+                    notify_nfts = EXCLUDED.notify_nfts
+            """)
+            
+            self.statements['get_transaction_history'] = await conn.prepare("""
+                SELECT * FROM transactions 
+                WHERE wallet_address = $1
+                ORDER BY timestamp DESC 
+                LIMIT $2
+            """)
+            
+            logger.info("Database prepared statements initialized successfully")
+            
+    async def get_wallet(self, address: str):
+        """Get wallet information using prepared statement"""
+        return await self.statements['get_wallet'].fetchrow(address)
+        
+    async def get_user_wallets(self, user_id: int):
+        """Get all wallets for a user using prepared statement"""
+        return await self.statements['get_user_wallets'].fetch(user_id)
+        
+    async def insert_wallet(self, user_id: int, address: str, nickname: str):
+        """Insert or update wallet using prepared statement"""
+        return await self.statements['insert_wallet'].fetchval(
+            user_id, address, nickname, datetime.utcnow()
+        )
+        
+    async def update_notification_settings(self, user_id: int, settings: dict):
+        """Update notification settings using prepared statement"""
+        await self.statements['update_notification_settings'].execute(
+            user_id,
+            settings.get('min_amount', 0),
+            settings.get('notify_deposits', True),
+            settings.get('notify_withdrawals', True),
+            settings.get('notify_nfts', True)
+        )
+        
+    async def get_transaction_history(self, address: str, limit: int = 10):
+        """Get transaction history using prepared statement"""
+        return await self.statements['get_transaction_history'].fetch(address, limit)
+        
+    async def cleanup(self):
+        """Cleanup database resources"""
+        try:
+            # Close all prepared statements
+            for stmt in self.statements.values():
+                await stmt.close()
+            logger.info("Database statements cleaned up successfully")
+        except Exception as e:
+            logger.error(f"Error cleaning up database statements: {e}")

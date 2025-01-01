@@ -16,33 +16,85 @@ def handle_errors():
         async def wrapper(self, interaction: discord.Interaction, *args, **kwargs):
             try:
                 return await func(self, interaction, *args, **kwargs)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as e:
+                logger.error(
+                    f"Timeout in {func.__name__}:\n"
+                    f"User: {interaction.user.id}\n"
+                    f"Command: {interaction.command.name if interaction.command else 'Unknown'}\n"
+                    f"Error: {e}\n{traceback.format_exc()}"
+                )
                 await interaction.followup.send(
                     "❌ The operation timed out. Please try again.",
                     ephemeral=True
                 )
-                logger.error(f"Timeout in {func.__name__}: {traceback.format_exc()}")
-            except discord.errors.NotFound:
-                await interaction.followup.send(
-                    "❌ The interaction expired. Please try the command again.",
-                    ephemeral=True
+            except discord.errors.NotFound as e:
+                logger.warning(
+                    f"Interaction not found in {func.__name__}:\n"
+                    f"User: {interaction.user.id}\n"
+                    f"Command: {interaction.command.name if interaction.command else 'Unknown'}\n"
+                    f"Error: {e}"
                 )
+                try:
+                    await interaction.followup.send(
+                        "❌ The interaction expired. Please try the command again.",
+                        ephemeral=True
+                    )
+                except:
+                    pass  # Interaction might be completely invalid
             except discord.errors.HTTPException as e:
+                logger.error(
+                    f"HTTP error in {func.__name__}:\n"
+                    f"User: {interaction.user.id}\n"
+                    f"Command: {interaction.command.name if interaction.command else 'Unknown'}\n"
+                    f"Status: {e.status}\n"
+                    f"Error: {e.text}\n{traceback.format_exc()}"
+                )
                 await interaction.followup.send(
                     "❌ There was an error processing your request. Please try again later.",
                     ephemeral=True
                 )
-                logger.error(f"HTTP error in {func.__name__}: {e}\n{traceback.format_exc()}")
-            except Exception as e:
-                await interaction.followup.send(
-                    "❌ An unexpected error occurred. The issue has been logged.",
-                    ephemeral=True
-                )
-                logger.error(f"Unexpected error in {func.__name__}: {e}\n{traceback.format_exc()}")
                 if hasattr(self, 'send_admin_alert'):
                     await self.send_admin_alert(
-                        f"Error in {func.__name__}:\n```{traceback.format_exc()}```"
+                        f"🚨 HTTP error in {func.__name__}:\n"
+                        f"Status: {e.status}\n"
+                        f"Error: {e.text}"
                     )
+            except Exception as e:
+                # Log full error details
+                error_details = (
+                    f"Critical error in {func.__name__}:\n"
+                    f"User: {interaction.user.id}\n"
+                    f"Command: {interaction.command.name if interaction.command else 'Unknown'}\n"
+                    f"Args: {args}\n"
+                    f"Kwargs: {kwargs}\n"
+                    f"Error Type: {type(e).__name__}\n"
+                    f"Error: {str(e)}\n"
+                    f"Traceback:\n{traceback.format_exc()}"
+                )
+                logger.critical(error_details)
+                
+                # Send error message to user
+                await interaction.followup.send(
+                    "❌ An unexpected error occurred. The issue has been logged and will be investigated.",
+                    ephemeral=True
+                )
+                
+                # Alert admins
+                if hasattr(self, 'send_admin_alert'):
+                    await self.send_admin_alert(
+                        f"🚨 Critical error in {func.__name__}:\n```\n{error_details}```",
+                        is_error=True
+                    )
+                
+                # Update health metrics
+                if hasattr(self, 'health_metrics'):
+                    self.health_metrics['errors'].append({
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'command': func.__name__,
+                        'error': str(e),
+                        'type': type(e).__name__
+                    })
+                
         return wrapper
     return decorator
 
@@ -105,41 +157,52 @@ def has_blockfrost(func=None):
 
 def command_cooldown(seconds: int = 60):
     """Decorator to add cooldown to commands with proper cleanup"""
-    def decorator(func):
+    def decorator(func: Callable):
+        # Store cooldowns in a class-level dictionary with expiry times
+        cooldowns: Dict[int, datetime] = {}
+        cleanup_lock = asyncio.Lock()
+        
+        async def cleanup_expired_cooldowns():
+            """Remove expired cooldowns to prevent memory bloat"""
+            async with cleanup_lock:
+                current_time = datetime.utcnow()
+                expired = [
+                    user_id for user_id, expiry in cooldowns.items()
+                    if current_time > expiry
+                ]
+                for user_id in expired:
+                    del cooldowns[user_id]
+                
         @wraps(func)
         async def wrapper(self, interaction: discord.Interaction, *args, **kwargs):
-            # Get user's cooldown key
-            cooldown_key = f"{func.__name__}:{interaction.user.id}"
+            user_id = interaction.user.id
+            current_time = datetime.utcnow()
             
-            # Check if user is in cooldown
-            if cooldown_key in self.interaction_cooldowns:
-                remaining = self.interaction_cooldowns[cooldown_key] - datetime.utcnow()
-                if remaining.total_seconds() > 0:
+            # Cleanup expired cooldowns before checking
+            await cleanup_expired_cooldowns()
+            
+            # Check if user is on cooldown
+            if user_id in cooldowns:
+                expiry = cooldowns[user_id]
+                if current_time < expiry:
+                    remaining = (expiry - current_time).seconds
                     await interaction.response.send_message(
-                        f"⏳ Please wait {int(remaining.total_seconds())} seconds before using this command again.",
+                        f"⏳ Please wait {remaining} seconds before using this command again.",
                         ephemeral=True
                     )
                     return
-                    
+            
+            # Execute command and set cooldown
             try:
-                # Set cooldown before executing command
-                self.interaction_cooldowns[cooldown_key] = datetime.utcnow() + timedelta(seconds=seconds)
-                
-                # Execute command
                 result = await func(self, interaction, *args, **kwargs)
+                cooldowns[user_id] = current_time + timedelta(seconds=seconds)
                 return result
-                
             except Exception as e:
-                logger.error(f"Error in command {func.__name__}: {e}")
+                # Remove cooldown if command fails
+                if user_id in cooldowns:
+                    del cooldowns[user_id]
                 raise
                 
-            finally:
-                # Clean up cooldown after command execution or error
-                try:
-                    del self.interaction_cooldowns[cooldown_key]
-                except KeyError:
-                    pass
-                    
         return wrapper
     return decorator
 
