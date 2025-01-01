@@ -10,6 +10,7 @@ import time
 import os
 import hmac
 import hashlib
+import re
 from typing import Dict, Any, Optional, List, Callable
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -30,6 +31,29 @@ from config import (
 PORT = int(os.environ.get('PORT', 8080))
 
 logger = logging.getLogger(__name__)
+
+def validate_webhook_secret(secret: str) -> bool:
+    """Validate webhook secret
+    
+    Args:
+        secret: Webhook secret to validate
+        
+    Returns:
+        bool: True if secret is valid
+    """
+    if not secret:
+        logger.warning("Webhook secret is empty")
+        return False
+        
+    if len(secret) < 32:
+        logger.warning("Webhook secret is too short (min 32 chars)")
+        return False
+        
+    if not re.match(r'^[a-zA-Z0-9-_]+$', secret):
+        logger.warning("Webhook secret contains invalid characters")
+        return False
+        
+    return True
 
 @dataclass
 class WebhookEvent:
@@ -149,8 +173,13 @@ class RateLimiter:
 class WebhookQueue:
     """Queue for processing webhooks with rate limiting and retries"""
     
-    def __init__(self):
-        """Initialize the webhook queue"""
+    def __init__(self, secret: Optional[str] = None):
+        """Initialize webhook queue
+        
+        Args:
+            secret: Optional webhook secret for validation
+        """
+        self.secret = secret
         self.queue = deque(maxlen=MAX_QUEUE_SIZE)
         self.processing = False
         self.process_lock = asyncio.Lock()
@@ -332,20 +361,30 @@ class WebhookQueue:
         """Register handler for event type"""
         self.event_handlers[event_type] = handler
         
-    def _validate_signature(self, payload: bytes, signature: str) -> bool:
-        """Validate webhook signature"""
-        if not WEBHOOK_SECRET or not signature:
+    def validate_signature(self, signature: str, payload: str) -> bool:
+        """Validate webhook signature
+        
+        Args:
+            signature: Webhook signature from request
+            payload: Raw request payload
+            
+        Returns:
+            bool: True if signature is valid
+        """
+        if not self.secret:
+            logger.warning("No webhook secret configured - skipping signature validation")
+            return True
+            
+        if not validate_webhook_secret(self.secret):
+            logger.error("Invalid webhook secret configuration")
             return False
             
         try:
-            # Calculate expected signature
             expected = hmac.new(
-                WEBHOOK_SECRET.encode(),
-                payload,
+                self.secret.encode(),
+                payload.encode(),
                 hashlib.sha256
             ).hexdigest()
-            
-            # Constant-time comparison
             return hmac.compare_digest(signature, expected)
         except Exception as e:
             logger.error(f"Error validating signature: {e}")

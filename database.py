@@ -819,36 +819,54 @@ async def get_wallet_info(address: str) -> Dict[str, Any]:
         Dict containing wallet info, stake address, and delegation status
     """
     query = """
-        SELECT 
-            w.*,
-            s.stake_address,
-            s.pool_id as delegation_pool,
-            s.rewards_address,
-            s.active_stake
+        SELECT w.*, ns.ada_transactions, ns.token_changes, ns.nft_updates,
+               ns.delegation_status, ns.policy_updates, ns.balance_alerts,
+               s.stake_address, s.pool_id as delegation_pool
         FROM wallets w
+        LEFT JOIN notification_settings ns ON w.user_id = ns.user_id
         LEFT JOIN stake_addresses s ON w.stake_address = s.stake_address
         WHERE w.address = $1
     """
     
     try:
-        async with get_pool().acquire() as conn:
-            row = await conn.fetchrow(query, address)
-            if not row:
+        async with get_pool() as pool:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(query, address)
+                if row:
+                    return dict(row)
                 return None
-                
-            return {
-                'wallet_id': row['id'],
-                'address': row['address'],
-                'stake_address': row['stake_address'],
-                'delegation_pool': row['delegation_pool'],
-                'rewards_address': row['rewards_address'],
-                'active_stake': row['active_stake'],
-                'created_at': row['created_at'],
-                'last_checked': row['last_checked']
-            }
     except Exception as e:
-        logger.error(f"Error getting wallet info for {address}: {str(e)}")
-        raise QueryError(f"Failed to get wallet info: {str(e)}")
+        logger.error(f"Error getting wallet info: {e}")
+        raise DatabaseError(f"Failed to get wallet info: {e}")
+
+async def get_user_wallets(user_id: str) -> List[Dict[str, Any]]:
+    """Get all wallets for a user with optimized query
+    
+    Args:
+        user_id: Discord user ID
+        
+    Returns:
+        List of wallet records with all relevant information
+    """
+    query = """
+        SELECT w.*, ns.ada_transactions, ns.token_changes, ns.nft_updates,
+               ns.delegation_status, ns.policy_updates, ns.balance_alerts,
+               s.stake_address, s.pool_id as delegation_pool
+        FROM wallets w
+        LEFT JOIN notification_settings ns ON w.user_id = ns.user_id
+        LEFT JOIN stake_addresses s ON w.stake_address = s.stake_address
+        WHERE w.user_id = $1
+        ORDER BY w.created_at DESC
+    """
+    
+    try:
+        async with get_pool() as pool:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(query, user_id)
+                return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting user wallets: {e}")
+        raise DatabaseError(f"Failed to get user wallets: {e}")
 
 async def update_wallet_state(address: str, updates: Dict[str, Any]) -> bool:
     """Update multiple wallet attributes in a single transaction
@@ -912,49 +930,6 @@ async def update_wallet_state(address: str, updates: Dict[str, Any]) -> bool:
     except QueryError as e:
         logger.error(f"Failed to update wallet state: {str(e)}")
         return False
-
-async def get_user_wallets(user_id: str) -> List[Dict[str, Any]]:
-    """Get all wallets for a user with optimized query
-    
-    Args:
-        user_id: Discord user ID
-        
-    Returns:
-        List of wallet records with all relevant information
-    """
-    query = """
-        SELECT 
-            w.address,
-            w.stake_address,
-            w.monitoring_since,
-            w.ada_balance,
-            w.token_balances,
-            d.pool_id as delegation_pool,
-            (
-                SELECT json_agg(json_build_object(
-                    'tx_hash', t.tx_hash,
-                    'created_at', t.created_at,
-                    'metadata', t.metadata
-                ))
-                FROM (
-                    SELECT tx_hash, created_at, metadata
-                    FROM transactions
-                    WHERE wallet_id = w.id
-                    ORDER BY created_at DESC
-                    LIMIT 10
-                ) t
-            ) as recent_transactions
-        FROM wallets w
-        LEFT JOIN delegation_status d ON d.address = w.address
-        WHERE w.user_id = $1
-        ORDER BY w.monitoring_since DESC
-    """
-    try:
-        records = await fetch_all(query, user_id)
-        return [dict(record) for record in records]
-    except QueryError as e:
-        logger.error(f"Failed to get user wallets: {str(e)}")
-        return []
 
 async def check_ada_balance(address: str) -> tuple[bool, int]:
     """Check if ADA balance is below threshold
@@ -1996,68 +1971,6 @@ async def update_pool_for_stake(stake_address: str, pool_id: str):
     except Exception as e:
         logger.error(f"Error updating pool for stake address: {e}")
         return False
-
-async def get_wallet_info(address: str) -> dict:
-    """Get wallet information including stake address"""
-    try:
-        async def _get_wallet_info(conn, address):
-            async with conn.execute(
-                """
-                SELECT w.address, w.user_id, w.stake_address, w.monitoring_since,
-                       s.last_pool_id, s.last_checked
-                FROM wallets w
-                LEFT JOIN stake_addresses s ON w.stake_address = s.stake_address
-                WHERE w.address = $1
-                """,
-                address
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    return {
-                        'address': row[0],
-                        'user_id': row[1],
-                        'stake_address': row[2],
-                        'monitoring_since': row[3],
-                        'last_pool_id': row[4],
-                        'last_checked': row[5]
-                    }
-                return None
-        
-        return await execute_with_retry(_get_wallet_info, address)
-    except Exception as e:
-        logger.error(f"Error getting wallet info: {e}")
-        return None
-
-async def get_user_wallets(user_id: int) -> list:
-    """Get all wallets for a user with their stake and delegation info"""
-    try:
-        async def _get_user_wallets(conn, user_id):
-            async with conn.execute(
-                """
-                SELECT w.address, w.stake_address, w.monitoring_since,
-                       s.last_pool_id, s.last_checked
-                FROM wallets w
-                LEFT JOIN stake_addresses s ON w.stake_address = s.stake_address
-                WHERE w.user_id = $1
-                ORDER BY w.monitoring_since DESC
-                """,
-                user_id
-            ) as cursor:
-                return [
-                    {
-                        'address': row[0],
-                        'stake_address': row[1],
-                        'monitoring_since': row[2],
-                        'last_pool_id': row[3],
-                        'last_checked': row[4]
-                    }
-                    async for row in cursor
-                ]
-        
-        return await execute_with_retry(_get_user_wallets, user_id)
-    except Exception as e:
-        logger.error(f"Error getting user wallets: {e}")
-        return []
 
 async def update_stake_pool(stake_address: str, pool_id: str) -> bool:
     """Update stake pool for an address"""

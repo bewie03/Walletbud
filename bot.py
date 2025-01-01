@@ -1187,60 +1187,47 @@ class WalletBudBot(commands.Bot):
                     await self.send_admin_alert(f" Blockfrost initialization failed: {e}")
                     raise
                     
-    async def blockfrost_request(self, method: Callable, *args, **kwargs):
-        """Execute a rate-limited request to Blockfrost API with retries"""
+    async def blockfrost_request(
+        self, 
+        method: Callable, 
+        endpoint: Optional[str] = None,
+        *args, 
+        **kwargs
+    ) -> Any:
+        """Make a request to Blockfrost API with rate limiting and error handling
+        
+        Args:
+            method: Blockfrost API method to call
+            endpoint: Optional API endpoint (for logging)
+            *args: Positional arguments for the method
+            **kwargs: Keyword arguments for the method
+            
+        Returns:
+            API response
+            
+        Raises:
+            BlockfrostError: If API request fails
+        """
         if not self.blockfrost:
-            raise ValueError("Blockfrost client not initialized")
-
-        if self.fallback_mode:
-            logger.warning(f"Blockfrost request attempted in fallback mode: {method.__name__}")
-            raise RuntimeError("Blockfrost is in fallback mode")
-
-        # Get rate limiters
-        global_limiter = self.rate_limiters['blockfrost']['global']
-        endpoint_limiter = self.rate_limiters['blockfrost']['endpoints'][method.__name__]
-
-        for attempt in range(WEBHOOK_RETRY_ATTEMPTS):
-            try:
-                # Apply both global and endpoint-specific rate limiting
-                async with global_limiter:
-                    async with endpoint_limiter:
-                        response = await method(*args, **kwargs)
-                        
-                        # Update metrics
-                        self.update_health_metrics('last_api_call', datetime.now())
-                        return response
-
-            except Exception as e:
-                error_msg = str(e).lower()
-                wait_time = min(2 ** attempt * 1.5, 30)  # Max 30 second delay
-
-                if "rate limit" in error_msg:
-                    logger.warning(f"Rate limit hit: {error_msg}")
-                    if attempt < WEBHOOK_RETRY_ATTEMPTS - 1:
-                        logger.info(f"Waiting {wait_time}s before retry...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    raise ValueError("Rate limit exceeded. Please try again later.")
-
-                elif "not found" in error_msg:
-                    logger.info(f"Resource not found: {error_msg}")
-                    return None
-
-                elif any(msg in error_msg for msg in ["timeout", "connection", "network"]):
-                    if attempt < WEBHOOK_RETRY_ATTEMPTS - 1:
-                        logger.warning(f"Connection error, retrying in {wait_time}s: {error_msg}")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    logger.error(f"Connection failed after {WEBHOOK_RETRY_ATTEMPTS} retries")
-                    raise
-
-                else:
-                    logger.error(f"Blockfrost API error: {error_msg}")
-                    if hasattr(e, '__dict__'):
-                        logger.error(f"Error details: {e.__dict__}")
-                    raise
-
+            raise BlockfrostError("Blockfrost client not initialized")
+            
+        try:
+            async with self.rate_limiter.acquire("blockfrost"):
+                async with asyncio.timeout(30):  # 30 second timeout
+                    response = await method(*args, **kwargs)
+                    self.health_metrics['last_api_call'] = datetime.utcnow()
+                    return response
+                    
+        except asyncio.TimeoutError as e:
+            logger.error(f"Blockfrost request timed out: {endpoint or method.__name__}")
+            await self.send_admin_alert(f"⚠️ Blockfrost request timed out: {endpoint or method.__name__}")
+            raise BlockfrostError(f"Request timed out: {str(e)}")
+            
+        except Exception as e:
+            logger.error(f"Blockfrost request failed: {endpoint or method.__name__} - {str(e)}")
+            await self.send_admin_alert(f"🚨 Blockfrost request failed: {endpoint or method.__name__}")
+            raise BlockfrostError(f"Request failed: {str(e)}")
+            
     async def on_resumed(self):
         """Called when the bot resumes a session"""
         logger.info("Session resumed")
@@ -1542,60 +1529,47 @@ class WalletBudBot(commands.Bot):
         log_method = getattr(logger, level.lower(), logger.info)
         log_method(message, **safe_kwargs)
 
-    async def blockfrost_request(self, method: Callable, endpoint: str = None, *args, **kwargs) -> Any:
-        """Execute a rate-limited request to Blockfrost API with retries and error handling"""
+    async def blockfrost_request(
+        self, 
+        method: Callable, 
+        endpoint: Optional[str] = None,
+        *args, 
+        **kwargs
+    ) -> Any:
+        """Make a request to Blockfrost API with rate limiting and error handling
+        
+        Args:
+            method: Blockfrost API method to call
+            endpoint: Optional API endpoint (for logging)
+            *args: Positional arguments for the method
+            **kwargs: Keyword arguments for the method
+            
+        Returns:
+            API response
+            
+        Raises:
+            BlockfrostError: If API request fails
+        """
         if not self.blockfrost:
-            raise ValueError("Blockfrost client not initialized")
-
-        if self.fallback_mode:
-            logger.warning(f"Blockfrost request attempted in fallback mode: {method.__name__}")
-            raise RuntimeError("Blockfrost is in fallback mode")
-
-        # Get rate limiters
-        global_limiter = self.rate_limiters['blockfrost']['global']
-        endpoint_limiter = self.rate_limiters['blockfrost']['endpoints'][endpoint or method.__name__]
-
-        for attempt in range(WEBHOOK_RETRY_ATTEMPTS):
-            try:
-                # Apply both global and endpoint-specific rate limiting
-                async with global_limiter:
-                    async with endpoint_limiter:
-                        response = await method(*args, **kwargs)
-                        
-                        # Update metrics
-                        self.update_health_metrics('last_api_call', datetime.now())
-                        return response
-
-            except Exception as e:
-                error_msg = str(e).lower()
-                wait_time = min(2 ** attempt * 1.5, 30)  # Max 30 second delay
-
-                if "rate limit" in error_msg:
-                    logger.warning(f"Rate limit hit: {error_msg}")
-                    if attempt < WEBHOOK_RETRY_ATTEMPTS - 1:
-                        logger.info(f"Waiting {wait_time}s before retry...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    raise ValueError("Rate limit exceeded. Please try again later.")
-
-                elif "not found" in error_msg:
-                    logger.info(f"Resource not found: {error_msg}")
-                    return None
-
-                elif any(msg in error_msg for msg in ["timeout", "connection", "network"]):
-                    if attempt < WEBHOOK_RETRY_ATTEMPTS - 1:
-                        logger.warning(f"Connection error, retrying in {wait_time}s: {error_msg}")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    logger.error(f"Connection failed after {WEBHOOK_RETRY_ATTEMPTS} retries")
-                    raise
-
-                else:
-                    logger.error(f"Blockfrost API error: {error_msg}")
-                    if hasattr(e, '__dict__'):
-                        logger.error(f"Error details: {e.__dict__}")
-                    raise
-
+            raise BlockfrostError("Blockfrost client not initialized")
+            
+        try:
+            async with self.rate_limiter.acquire("blockfrost"):
+                async with asyncio.timeout(30):  # 30 second timeout
+                    response = await method(*args, **kwargs)
+                    self.health_metrics['last_api_call'] = datetime.utcnow()
+                    return response
+                    
+        except asyncio.TimeoutError as e:
+            logger.error(f"Blockfrost request timed out: {endpoint or method.__name__}")
+            await self.send_admin_alert(f"⚠️ Blockfrost request timed out: {endpoint or method.__name__}")
+            raise BlockfrostError(f"Request timed out: {str(e)}")
+            
+        except Exception as e:
+            logger.error(f"Blockfrost request failed: {endpoint or method.__name__} - {str(e)}")
+            await self.send_admin_alert(f"🚨 Blockfrost request failed: {endpoint or method.__name__}")
+            raise BlockfrostError(f"Request failed: {str(e)}")
+            
     async def init_blockfrost(self):
         """Initialize Blockfrost API client with proper error handling and retries"""
         if not os.getenv('BLOCKFROST_PROJECT_ID'):
@@ -1617,29 +1591,47 @@ class WalletBudBot(commands.Bot):
             self.blockfrost = None
             raise
 
-    async def blockfrost_request(self, method: Callable, *args, **kwargs):
-        """Execute a rate-limited request to Blockfrost API with retries"""
-        if not self.blockfrost:
-            raise RuntimeError("Blockfrost client not initialized")
-            
-        max_retries = 3
-        retry_delay = 1.0
+    async def blockfrost_request(
+        self, 
+        method: Callable, 
+        endpoint: Optional[str] = None,
+        *args, 
+        **kwargs
+    ) -> Any:
+        """Make a request to Blockfrost API with rate limiting and error handling
         
-        for attempt in range(max_retries):
-            try:
-                async with self.rate_limiter.acquire("blockfrost"):
+        Args:
+            method: Blockfrost API method to call
+            endpoint: Optional API endpoint (for logging)
+            *args: Positional arguments for the method
+            **kwargs: Keyword arguments for the method
+            
+        Returns:
+            API response
+            
+        Raises:
+            BlockfrostError: If API request fails
+        """
+        if not self.blockfrost:
+            raise BlockfrostError("Blockfrost client not initialized")
+            
+        try:
+            async with self.rate_limiter.acquire("blockfrost"):
+                async with asyncio.timeout(30):  # 30 second timeout
                     response = await method(*args, **kwargs)
                     self.health_metrics['last_api_call'] = datetime.utcnow()
                     return response
                     
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Blockfrost request failed after {max_retries} attempts: {e}")
-                    raise
-                    
-                logger.warning(f"Blockfrost request failed (attempt {attempt + 1}/{max_retries}): {e}")
-                await asyncio.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
-                
+        except asyncio.TimeoutError as e:
+            logger.error(f"Blockfrost request timed out: {endpoint or method.__name__}")
+            await self.send_admin_alert(f"⚠️ Blockfrost request timed out: {endpoint or method.__name__}")
+            raise BlockfrostError(f"Request timed out: {str(e)}")
+            
+        except Exception as e:
+            logger.error(f"Blockfrost request failed: {endpoint or method.__name__} - {str(e)}")
+            await self.send_admin_alert(f"🚨 Blockfrost request failed: {endpoint or method.__name__}")
+            raise BlockfrostError(f"Request failed: {str(e)}")
+            
     async def should_notify(self, user_id: int, notification_type: str) -> bool:
         """Check if we should send a notification to the user"""
         try:
@@ -1847,60 +1839,6 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to initialize SSL context: {e}")
             raise RuntimeError(f"SSL context initialization failed: {e}")
-
-    async def blockfrost_request(self, method: Callable, *args, **kwargs) -> Any:
-        """Execute a rate-limited request to Blockfrost API with retries and error handling"""
-        if not self.blockfrost:
-            raise ValueError("Blockfrost client not initialized")
-
-        if self.fallback_mode:
-            logger.warning(f"Blockfrost request attempted in fallback mode: {method.__name__}")
-            raise RuntimeError("Blockfrost is in fallback mode")
-
-        # Get rate limiters
-        global_limiter = self.rate_limiters['blockfrost']['global']
-        endpoint_limiter = self.rate_limiters['blockfrost']['endpoints'][method.__name__]
-
-        for attempt in range(WEBHOOK_RETRY_ATTEMPTS):
-            try:
-                # Apply both global and endpoint-specific rate limiting
-                async with global_limiter:
-                    async with endpoint_limiter:
-                        response = await method(*args, **kwargs)
-                        
-                        # Update metrics
-                        self.update_health_metrics('last_api_call', datetime.now())
-                        return response
-
-            except Exception as e:
-                error_msg = str(e).lower()
-                wait_time = min(2 ** attempt * 1.5, 30)  # Max 30 second delay
-
-                if "rate limit" in error_msg:
-                    logger.warning(f"Rate limit hit: {error_msg}")
-                    if attempt < WEBHOOK_RETRY_ATTEMPTS - 1:
-                        logger.info(f"Waiting {wait_time}s before retry...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    raise ValueError("Rate limit exceeded. Please try again later.")
-
-                elif "not found" in error_msg:
-                    logger.info(f"Resource not found: {error_msg}")
-                    return None
-
-                elif any(msg in error_msg for msg in ["timeout", "connection", "network"]):
-                    if attempt < WEBHOOK_RETRY_ATTEMPTS - 1:
-                        logger.warning(f"Connection error, retrying in {wait_time}s: {error_msg}")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    logger.error(f"Connection failed after {WEBHOOK_RETRY_ATTEMPTS} retries")
-                    raise
-
-                else:
-                    logger.error(f"Blockfrost API error: {error_msg}")
-                    if hasattr(e, '__dict__'):
-                        logger.error(f"Error details: {e.__dict__}")
-                    raise
 
 if __name__ == "__main__":
     try:
