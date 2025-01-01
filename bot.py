@@ -476,6 +476,11 @@ class WalletBudBot(commands.Bot):
             # Set up admin channel
             await self.setup_admin_channel()
             
+            # Load cogs
+            self.load_extension("cogs.system_commands")
+            self.load_extension("cogs.wallet_commands")
+            logger.info("Loaded all cogs")
+            
             # Start background tasks
             self.health_check_task.start()
             self.check_yummi_balances.start()

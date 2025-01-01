@@ -517,6 +517,6 @@ class SystemCommands(commands.Cog):
                 ephemeral=True
             )
 
-async def setup(bot):
+def setup(bot):
     """Set up the SystemCommands cog"""
-    await bot.add_cog(SystemCommands(bot))
+    bot.add_cog(SystemCommands(bot))

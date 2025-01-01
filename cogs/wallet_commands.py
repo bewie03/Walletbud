@@ -314,6 +314,6 @@ class WalletCommands(commands.Cog):
                 ephemeral=True
             )
 
-async def setup(bot):
+def setup(bot):
     """Set up the WalletCommands cog"""
-    await bot.add_cog(WalletCommands(bot))
+    bot.add_cog(WalletCommands(bot))
