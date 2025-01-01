@@ -406,8 +406,7 @@ class WalletBudBot(commands.Bot):
         """Cleanup Blockfrost client"""
         if self.blockfrost:
             try:
-                if hasattr(self.blockfrost, 'session') and self.blockfrost.session:
-                    await self.blockfrost.session.close()
+                # BlockFrostApi manages its own session cleanup
                 self.blockfrost = None
                 logger.info("Blockfrost client cleaned up")
             except Exception as e:
@@ -657,7 +656,7 @@ class WalletBudBot(commands.Bot):
             'health': self.health
         }
         return handlers.get(command_name)
-        
+
     async def _handle_discord_error(self, interaction: discord.Interaction, error: Exception):
         """Handle Discord-specific errors"""
         try:
@@ -1096,32 +1095,30 @@ class WalletBudBot(commands.Bot):
             raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
             
         try:
-            # Initialize Blockfrost client with proper session management
-            async with aiohttp.ClientSession() as session:
-                self.blockfrost = BlockFrostApi(
-                    project_id=BLOCKFROST_PROJECT_ID,
-                    base_url=ApiUrls.mainnet.value,
-                    session=session  # Use the managed session
-                )
+            # Initialize Blockfrost client with predefined mainnet URL
+            self.blockfrost = BlockFrostApi(
+                project_id=BLOCKFROST_PROJECT_ID,
+                base_url=ApiUrls.mainnet.value
+            )
+            
+            # Test connection by checking root endpoint first
+            root = await self.blockfrost.root()
+            if root:
+                logger.info("Blockfrost root endpoint accessible")
                 
-                # Test connection by checking root endpoint first
-                root = await self.blockfrost.root()
-                if root:
-                    logger.info("Blockfrost root endpoint accessible")
+                # Now check health endpoint
+                health = await self.blockfrost.health()
+                if health.get('is_healthy'):
+                    logger.info("Blockfrost client initialized successfully")
+                    if self.admin_channel:
+                        await self.admin_channel.send("Blockfrost API connection established")
                     
-                    # Now check health endpoint
-                    health = await self.blockfrost.health()
-                    if health.get('is_healthy'):
-                        logger.info("Blockfrost client initialized successfully")
-                        if self.admin_channel:
-                            await self.admin_channel.send("Blockfrost API connection established")
-                        
-                        # Update health metrics
-                        self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
-                    else:
-                        raise Exception(f"Blockfrost API is not healthy: {health}")
+                    # Update health metrics
+                    self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
                 else:
-                    raise Exception("Could not access Blockfrost root endpoint")
+                    raise Exception(f"Blockfrost API is not healthy: {health}")
+            else:
+                raise Exception("Could not access Blockfrost root endpoint")
             
         except Exception as e:
             logger.error(f"Failed to initialize Blockfrost client: {e}")
