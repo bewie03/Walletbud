@@ -42,11 +42,6 @@ class SystemCommands(commands.Cog):
         """Clean up tasks on unload"""
         self.health_monitor.cancel()
 
-    async def cog_load(self):
-        """Register commands when cog is loaded"""
-        for cmd in [self.help, self.health, self.toggle_fallback, self.get_logs, self.notifications, self.toggle]:
-            self.bot.tree.add_command(cmd)
-
     @tasks.loop(seconds=HEALTH_CHECK_INTERVAL)
     async def health_monitor(self):
         """Background task to monitor system health"""
@@ -524,4 +519,5 @@ class SystemCommands(commands.Cog):
 
 async def setup(bot):
     """Set up the SystemCommands cog"""
-    await bot.add_cog(SystemCommands(bot))
+    cog = SystemCommands(bot)
+    await bot.add_cog(cog)
