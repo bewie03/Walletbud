@@ -41,10 +41,8 @@ class WalletCommands(commands.Cog):
 
     async def cog_load(self):
         """Register commands when cog is loaded"""
-        self.bot.tree.add_command(self.add)
-        self.bot.tree.add_command(self.remove)
-        self.bot.tree.add_command(self.list_wallets)
-        self.bot.tree.add_command(self.balance)
+        for cmd in [self.add, self.remove, self.list_wallets, self.balance]:
+            self.bot.tree.add_command(cmd)
 
     @tasks.loop(minutes=5)
     async def cleanup_cache(self):
@@ -321,6 +319,6 @@ class WalletCommands(commands.Cog):
                 ephemeral=True
             )
 
-def setup(bot):
+async def setup(bot):
     """Set up the WalletCommands cog"""
-    bot.add_cog(WalletCommands(bot))
+    await bot.add_cog(WalletCommands(bot))

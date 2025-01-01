@@ -44,12 +44,8 @@ class SystemCommands(commands.Cog):
 
     async def cog_load(self):
         """Register commands when cog is loaded"""
-        self.bot.tree.add_command(self.help)
-        self.bot.tree.add_command(self.health)
-        self.bot.tree.add_command(self.toggle_fallback)
-        self.bot.tree.add_command(self.get_logs)
-        self.bot.tree.add_command(self.notifications)
-        self.bot.tree.add_command(self.toggle)
+        for cmd in [self.help, self.health, self.toggle_fallback, self.get_logs, self.notifications, self.toggle]:
+            self.bot.tree.add_command(cmd)
 
     @tasks.loop(seconds=HEALTH_CHECK_INTERVAL)
     async def health_monitor(self):
@@ -526,6 +522,6 @@ class SystemCommands(commands.Cog):
                 ephemeral=True
             )
 
-def setup(bot):
+async def setup(bot):
     """Set up the SystemCommands cog"""
-    bot.add_cog(SystemCommands(bot))
+    await bot.add_cog(SystemCommands(bot))
