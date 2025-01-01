@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import asyncpg
+import asyncpg.exceptions
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Union, Tuple
 from dotenv import load_dotenv
@@ -267,7 +268,11 @@ async def init_db(conn):
     """
     try:
         # Create version tracking tables first
-        await conn.execute(INIT_SQL)
+        try:
+            await conn.execute(INIT_SQL)
+            logger.info("Database tables created successfully")
+        except asyncpg.exceptions.DuplicateTableError:
+            logger.info("Database tables already exist, continuing with migrations...")
         
         # Get current version
         version = await get_db_version(conn)
@@ -287,6 +292,8 @@ async def init_db(conn):
         
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
         raise DatabaseError(f"Database initialization failed: {e}")
 
 async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
@@ -381,12 +388,6 @@ async def update_notification_setting(user_id: str, setting: str, enabled: bool)
 # Database initialization SQL
 INIT_SQL = """
 -- Create version tracking tables first
-CREATE TABLE IF NOT EXISTS db_version (
-    version INTEGER NOT NULL,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (version)
-);
-
 CREATE TABLE IF NOT EXISTS migration_history (
     version INTEGER NOT NULL,
     started_at TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -396,15 +397,8 @@ CREATE TABLE IF NOT EXISTS migration_history (
     PRIMARY KEY (version)
 );
 
--- Initialize version
-INSERT INTO db_version (version) VALUES (0)
-ON CONFLICT (version) DO NOTHING;
-
 -- Main tables
-DROP TABLE IF EXISTS wallets CASCADE;
-DROP TABLE IF EXISTS notification_settings CASCADE;
-
-CREATE TABLE wallets (
+CREATE TABLE IF NOT EXISTS wallets (
     id SERIAL PRIMARY KEY,
     user_id TEXT NOT NULL,
     address TEXT UNIQUE NOT NULL,
@@ -418,17 +412,17 @@ CREATE TABLE wallets (
 );
 
 -- Add indices for frequently queried fields
-CREATE INDEX idx_wallets_user_id ON wallets(user_id);
-CREATE INDEX idx_wallets_address ON wallets(address);
-CREATE INDEX idx_wallets_stake_address ON wallets(stake_address);
-CREATE INDEX idx_wallets_delegation_pool ON wallets(delegation_pool);
-CREATE INDEX idx_wallets_last_checked ON wallets(last_checked);
+CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
+CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
+CREATE INDEX IF NOT EXISTS idx_wallets_stake_address ON wallets(stake_address);
+CREATE INDEX IF NOT EXISTS idx_wallets_delegation_pool ON wallets(delegation_pool);
+CREATE INDEX IF NOT EXISTS idx_wallets_last_checked ON wallets(last_checked);
 
 -- Add GiST index for JSONB fields for faster querying
-CREATE INDEX idx_wallets_token_balances ON wallets USING gin (token_balances);
-CREATE INDEX idx_wallets_utxo_state ON wallets USING gin (utxo_state);
+CREATE INDEX IF NOT EXISTS idx_wallets_token_balances ON wallets USING gin (token_balances);
+CREATE INDEX IF NOT EXISTS idx_wallets_utxo_state ON wallets USING gin (utxo_state);
 
-CREATE TABLE notification_settings (
+CREATE TABLE IF NOT EXISTS notification_settings (
     user_id TEXT PRIMARY KEY,
     ada_transactions BOOLEAN DEFAULT true,
     token_changes BOOLEAN DEFAULT true,
@@ -440,9 +434,9 @@ CREATE TABLE notification_settings (
 );
 
 -- Add index for notification settings user_id
-CREATE INDEX idx_notification_settings_user_id ON notification_settings(user_id);
+CREATE INDEX IF NOT EXISTS idx_notification_settings_user_id ON notification_settings(user_id);
 
-CREATE TABLE processed_rewards (
+CREATE TABLE IF NOT EXISTS processed_rewards (
     stake_address TEXT NOT NULL,
     epoch INTEGER NOT NULL,
     amount BIGINT NOT NULL,
@@ -451,10 +445,10 @@ CREATE TABLE processed_rewards (
 );
 
 -- Add index for processed rewards lookup
-CREATE INDEX idx_processed_rewards_stake_address ON processed_rewards(stake_address);
-CREATE INDEX idx_processed_rewards_epoch ON processed_rewards(epoch);
+CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewards(stake_address);
+CREATE INDEX IF NOT EXISTS idx_processed_rewards_epoch ON processed_rewards(epoch);
 
-CREATE TABLE processed_token_changes (
+CREATE TABLE IF NOT EXISTS processed_token_changes (
     wallet_id INTEGER REFERENCES wallets(id),
     tx_hash TEXT NOT NULL,
     processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -462,10 +456,10 @@ CREATE TABLE processed_token_changes (
 );
 
 -- Add index for token changes lookup
-CREATE INDEX idx_processed_token_changes_wallet ON processed_token_changes(wallet_id);
-CREATE INDEX idx_processed_token_changes_tx ON processed_token_changes(tx_hash);
+CREATE INDEX IF NOT EXISTS idx_processed_token_changes_wallet ON processed_token_changes(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_processed_token_changes_tx ON processed_token_changes(tx_hash);
 
-CREATE TABLE failed_transactions (
+CREATE TABLE IF NOT EXISTS failed_transactions (
     id SERIAL PRIMARY KEY,
     wallet_id INTEGER REFERENCES wallets(id),
     tx_hash TEXT NOT NULL,
@@ -475,11 +469,11 @@ CREATE TABLE failed_transactions (
 );
 
 -- Add indices for failed transactions
-CREATE INDEX idx_failed_transactions_wallet ON failed_transactions(wallet_id);
-CREATE INDEX idx_failed_transactions_tx ON failed_transactions(tx_hash);
-CREATE INDEX idx_failed_transactions_error ON failed_transactions(error_type);
+CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet ON failed_transactions(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_failed_transactions_tx ON failed_transactions(tx_hash);
+CREATE INDEX IF NOT EXISTS idx_failed_transactions_error ON failed_transactions(error_type);
 
-CREATE TABLE asset_history (
+CREATE TABLE IF NOT EXISTS asset_history (
     id SERIAL PRIMARY KEY,
     wallet_id INTEGER REFERENCES wallets(id),
     asset_id TEXT NOT NULL,
@@ -491,21 +485,21 @@ CREATE TABLE asset_history (
 );
 
 -- Add indices for asset history
-CREATE INDEX idx_asset_history_wallet ON asset_history(wallet_id);
-CREATE INDEX idx_asset_history_asset ON asset_history(asset_id);
-CREATE INDEX idx_asset_history_tx ON asset_history(tx_hash);
-CREATE INDEX idx_asset_history_action ON asset_history(action);
+CREATE INDEX IF NOT EXISTS idx_asset_history_wallet ON asset_history(wallet_id);
+CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id);
+CREATE INDEX IF NOT EXISTS idx_asset_history_tx ON asset_history(tx_hash);
+CREATE INDEX IF NOT EXISTS idx_asset_history_action ON asset_history(action);
 
-CREATE TABLE policy_expiry (
+CREATE TABLE IF NOT EXISTS policy_expiry (
     policy_id TEXT PRIMARY KEY,
     expiry_slot BIGINT NOT NULL,
     last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Add index for policy expiry lookup
-CREATE INDEX idx_policy_expiry_slot ON policy_expiry(expiry_slot);
+CREATE INDEX IF NOT EXISTS idx_policy_expiry_slot ON policy_expiry(expiry_slot);
 
-CREATE TABLE dapp_interactions (
+CREATE TABLE IF NOT EXISTS dapp_interactions (
     wallet_id INTEGER REFERENCES wallets(id),
     last_tx TEXT,
     last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -513,9 +507,9 @@ CREATE TABLE dapp_interactions (
 );
 
 -- Add index for dapp interactions
-CREATE INDEX idx_dapp_interactions_tx ON dapp_interactions(last_tx);
+CREATE INDEX IF NOT EXISTS idx_dapp_interactions_tx ON dapp_interactions(last_tx);
 
-CREATE TABLE db_version (
+CREATE TABLE IF NOT EXISTS db_version (
     version INTEGER PRIMARY KEY,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -537,7 +531,7 @@ MIGRATIONS = {
         ADD COLUMN IF NOT EXISTS last_policy_check TIMESTAMP;
         """,
         """
-        UPDATE db_version SET version = $1 WHERE version = $1 - 1;
+        UPDATE db_version SET version = $1;
         """
     ],
     3: [
@@ -547,7 +541,7 @@ MIGRATIONS = {
         DROP COLUMN IF EXISTS asset_history;
         """,
         """
-        UPDATE db_version SET version = $1 WHERE version = $1 - 1;
+        UPDATE db_version SET version = $1;
         """
     ]
 }
@@ -671,15 +665,6 @@ async def run_migrations(conn) -> None:
                 CREATE TABLE IF NOT EXISTS db_version (
                     version INTEGER NOT NULL,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (version)
-                );
-
-                CREATE TABLE IF NOT EXISTS migration_history (
-                    version INTEGER NOT NULL,
-                    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                    completed_at TIMESTAMP WITH TIME ZONE,
-                    success BOOLEAN,
-                    error TEXT,
                     PRIMARY KEY (version)
                 );
             """)
@@ -949,16 +934,22 @@ async def get_wallet_info(address: str) -> Dict[str, Any]:
         SELECT w.address, w.stake_address, w.monitoring_since,
                w.last_updated, w.ada_balance,
                d.pool_id as delegation_pool,
-               json_build_object(
-                   'ada_transactions', ns.ada_transactions,
-                   'token_transfers', ns.token_transfers,
-                   'nft_updates', ns.nft_updates,
-                   'delegation_status', ns.delegation_status,
-                   'policy_updates', ns.policy_updates
-               ) as notification_settings
+               (
+                SELECT json_agg(json_build_object(
+                    'tx_hash', t.tx_hash,
+                    'created_at', t.created_at,
+                    'metadata', t.metadata
+                ))
+                FROM (
+                    SELECT tx_hash, created_at, metadata
+                    FROM transactions
+                    WHERE wallet_id = w.id
+                    ORDER BY created_at DESC
+                    LIMIT 10
+                ) t
+            ) as recent_transactions
         FROM wallets w
         LEFT JOIN delegation_status d ON d.stake_address = w.stake_address
-        LEFT JOIN notification_settings ns ON ns.user_id = w.user_id
         WHERE w.address = $1
     """
     try:
