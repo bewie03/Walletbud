@@ -1615,6 +1615,20 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error checking balance for {address}: {e}")
             raise
 
+    async def monitor_health(self):
+        """Background task to monitor system health"""
+        try:
+            # Run health check
+            await self.health_check()
+            
+            # Log results
+            logger.info("Health check completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Error in health monitoring: {e}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"Error: Health monitoring failed: {e}")
+
 if __name__ == "__main__":
     try:
         # Configure logging for production
