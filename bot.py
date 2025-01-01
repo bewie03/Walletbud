@@ -300,6 +300,9 @@ class WalletBudBot(commands.Bot):
         # Initialize aiohttp connector with default settings
         self.connector = aiohttp.TCPConnector(ssl=self.ssl_context, limit=100)
         
+        # Initialize session with the connector
+        self.session = aiohttp.ClientSession(connector=self.connector)
+        
         # Add command locks
         self.command_locks = {}
         self.health_lock = asyncio.Lock()  # Specific lock for health command
@@ -379,11 +382,18 @@ class WalletBudBot(commands.Bot):
     async def _cleanup_session(self):
         """Cleanup aiohttp session"""
         try:
-            if self.session:
+            if self.session and not self.session.closed:
                 await self.session.close()
-            if self.connector:
+                self.session = None
+            
+            # Wait a bit to ensure all connections are properly closed
+            await asyncio.sleep(0.25)
+            
+            if self.connector and not self.connector.closed:
                 await self.connector.close()
-            logger.info("HTTP session closed successfully")
+                self.connector = None
+                
+            logger.info("HTTP session and connector closed successfully")
         except Exception as e:
             logger.error(f"Error closing HTTP session: {e}")
             
@@ -421,9 +431,8 @@ class WalletBudBot(commands.Bot):
             # Cancel background tasks first
             await self._cancel_background_tasks()
             
-            # Close sessions in order
-            await self._cleanup_blockfrost()
-            await self._cleanup_database()
+            # Run shutdown handlers through shutdown manager
+            await self.shutdown_manager.cleanup(timeout=30.0)
             
             # Finally call parent close
             await super().close()
