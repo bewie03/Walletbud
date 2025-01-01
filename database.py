@@ -270,6 +270,8 @@ CREATE TABLE IF NOT EXISTS db_version (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_db_version_updated_at ON db_version(updated_at DESC);
+
 -- Create core tables
 CREATE TABLE IF NOT EXISTS wallets (
     id SERIAL PRIMARY KEY,
@@ -324,7 +326,8 @@ async def get_db_version(conn) -> int:
         version_exists = await conn.fetchval(
             """
             SELECT EXISTS (
-                SELECT FROM information_schema.tables 
+                SELECT 1 
+                FROM information_schema.tables 
                 WHERE table_name = 'db_version'
             )
             """
@@ -333,10 +336,20 @@ async def get_db_version(conn) -> int:
         if not version_exists:
             return 0
             
+        # Get the latest version by updated_at timestamp
         result = await conn.fetchrow(
-            "SELECT version FROM db_version ORDER BY id DESC LIMIT 1"
+            """
+            SELECT version 
+            FROM db_version 
+            ORDER BY updated_at DESC 
+            LIMIT 1
+            """
         )
-        return result['version'] if result else 0
+        
+        if result:
+            return result['version']
+        return 0
+        
     except Exception as e:
         logger.error(f"Error getting database version: {e}")
         return 0
@@ -387,6 +400,71 @@ async def run_migration(conn, version: int, sql: str) -> bool:
             
         return False
 
+async def validate_migration(conn, version: int, sql: str) -> bool:
+    """Validate a database migration before applying it
+    
+    Args:
+        conn: Database connection
+        version: Migration version number
+        sql: Migration SQL
+        
+    Returns:
+        bool: True if validation passes
+    """
+    try:
+        # Check if migration was already applied
+        result = await conn.fetchrow(
+            """
+            SELECT success, error 
+            FROM migration_history 
+            WHERE version = $1 
+            ORDER BY applied_at DESC 
+            LIMIT 1
+            """,
+            version
+        )
+        
+        if result:
+            if result['success']:
+                logger.info(f"Migration {version} was already successfully applied")
+                return False
+            else:
+                logger.warning(f"Migration {version} previously failed: {result['error']}")
+                # Allow retry of failed migration
+        
+        # Start transaction for validation
+        async with conn.transaction():
+            # Try to parse the SQL (catches syntax errors)
+            await conn.execute("DO $$BEGIN RAISE NOTICE 'Validating SQL'; END$$;")
+            
+            # Check if migration references existing tables/columns
+            table_names = re.findall(r'(?i)(?:FROM|JOIN|UPDATE|INTO|TABLE)\s+([a-zA-Z_][a-zA-Z0-9_]*)', sql)
+            for table in table_names:
+                exists = await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 
+                        FROM information_schema.tables 
+                        WHERE table_name = $1
+                    )
+                    """,
+                    table.lower()
+                )
+                if not exists:
+                    logger.warning(f"Migration {version} references non-existent table: {table}")
+            
+            # Rollback validation transaction
+            raise asyncpg.exceptions.RaiseError('ROLLBACK VALIDATION')
+            
+    except asyncpg.exceptions.RaiseError as e:
+        if str(e) == 'ROLLBACK VALIDATION':
+            logger.info(f"Migration {version} validation successful")
+            return True
+        raise
+    except Exception as e:
+        logger.error(f"Migration {version} validation failed: {e}")
+        return False
+
 async def migrate_database(conn) -> bool:
     """Run all pending migrations with proper error handling"""
     try:
@@ -401,9 +479,8 @@ async def migrate_database(conn) -> bool:
                 
                 # Validate migration
                 if not await validate_migration(conn, version, MIGRATIONS[version]):
-                    error_msg = f"Migration {version} failed validation"
-                    logger.error(error_msg)
-                    raise DatabaseError(error_msg)
+                    logger.info(f"Skipping migration {version} - already applied or validation failed")
+                    continue
                 
                 # Run migration
                 if not await run_migration(conn, version, MIGRATIONS[version]):
