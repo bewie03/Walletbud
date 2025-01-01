@@ -5,60 +5,35 @@ import ssl
 import sys
 import time
 import json
-import uuid
-import hmac
-import hashlib
 import asyncio
 import logging
-import traceback
-from datetime import datetime, timedelta
-from ipaddress import ip_network
-from collections import defaultdict
-from typing import Dict, List, Any, Optional, Union, Callable
-
-# Third-party imports
 import certifi
 import discord
-from discord import app_commands
 import aiohttp
+from aiohttp import web
+from typing import Any, Dict, List, Optional, Callable, Coroutine
+from discord.ext import commands, tasks
+from collections import defaultdict
+from cachetools import TTLCache
+
+# Import configuration
+from config import (
+    DISCORD_TOKEN, APPLICATION_ID, ADMIN_CHANNEL_ID,
+    BLOCKFROST_PROJECT_ID, DATABASE_URL, WEBHOOK_SECRET,
+    MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_COOLDOWN,
+    validate_config
+)
+from shutdown_manager import ShutdownManager
+
+# Third-party imports
 import asyncpg
 import requests
 import psutil
-from aiohttp import web
-from discord.ext import commands, tasks
 from blockfrost import BlockFrostApi, ApiUrls
 from blockfrost.api.cardano.network import network
 from urllib3.exceptions import InsecureRequestWarning
 
 # Local imports
-from config import (
-    DISCORD_TOKEN,
-    APPLICATION_ID,
-    BLOCKFROST_PROJECT_ID,
-    DATABASE_URL,
-    ADMIN_CHANNEL_ID,
-    WEBHOOK_SECRET,
-    MAX_REQUESTS_PER_SECOND,
-    BURST_LIMIT,
-    RATE_LIMIT_COOLDOWN,
-    ARCHIVE_AFTER_DAYS,
-    DELETE_AFTER_DAYS,
-    MAINTENANCE_BATCH_SIZE,
-    MAINTENANCE_MAX_RETRIES,
-    MAINTENANCE_HOUR,
-    MAINTENANCE_MINUTE,
-    COMMAND_COOLDOWN,
-    RATE_LIMIT_WINDOW,
-    RATE_LIMIT_MAX_REQUESTS,
-    MAX_QUEUE_SIZE,
-    MAX_RETRIES,
-    MAX_EVENT_AGE,
-    BATCH_SIZE,
-    MINIMUM_YUMMI,
-    YUMMI_POLICY_ID,
-    YUMMI_TOKEN_NAME,
-    ASSET_ID
-)
 from database import (
     get_pool,
     add_wallet_for_user,
@@ -83,9 +58,7 @@ import uuid
 import random
 import functools
 from functools import wraps
-from cachetools import TTLCache
 from tenacity import retry, stop_after_attempt, wait_exponential
-from shutdown_manager import ShutdownManager
 
 def get_request_id() -> str:
     """Generate a unique request ID for logging"""
@@ -1509,6 +1482,17 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error checking notification settings: {str(e)}")
             return False  # Default to not notifying on error
 
+    async def check_environment(self) -> bool:
+        """Check if all required environment variables are set"""
+        try:
+            # Validate configuration through config module
+            from config import validate_config
+            validate_config()
+            return True
+        except Exception as e:
+            logger.error(f"Environment validation failed: {e}")
+            return False
+
     async def _check_yummi_balances(self):
         """Check YUMMI token balances with proper concurrency control"""
         # Use a task name based lock to prevent duplicate runs
@@ -1611,120 +1595,6 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error checking balance for {address}: {e}")
             raise
-
-    async def check_environment(self) -> bool:
-        """Check if all required environment variables are set"""
-        required_vars = {
-            'DISCORD_TOKEN': {
-                'description': 'Discord bot token',
-                'validator': lambda x: len(x) > 50  # Basic token length check
-            },
-            'DATABASE_URL': {
-                'description': 'PostgreSQL connection URL',
-                'validator': lambda x: x.startswith(('postgresql://', 'postgres://'))
-            },
-            'BLOCKFROST_PROJECT_ID': {
-                'description': 'Blockfrost project ID',
-                'validator': lambda x: x.startswith(('mainnet', 'preprod', 'preview'))
-            },
-            'BLOCKFROST_BASE_URL': {
-                'description': 'Blockfrost API base URL',
-                'validator': lambda x: x.startswith('https://')
-            },
-            'ADMIN_CHANNEL_ID': {
-                'description': 'Admin channel ID for notifications',
-                'validator': lambda x: x.isdigit()
-            }
-        }
-
-        missing_vars = []
-        invalid_vars = []
-
-        for var_name, config in required_vars.items():
-            value = globals()[var_name]
-            if not value:
-                missing_vars.append(f"{var_name} ({config['description']})")
-                continue
-                
-            try:
-                if not config['validator'](value):
-                    invalid_vars.append(f"{var_name} (invalid format)")
-            except Exception:
-                invalid_vars.append(f"{var_name} (validation error)")
-
-        if missing_vars or invalid_vars:
-            if missing_vars:
-                logger.error("Missing required environment variables:\n" + 
-                           "\n".join(f"• {var}" for var in missing_vars))
-            if invalid_vars:
-                logger.error("Invalid environment variables:\n" + 
-                           "\n".join(f"• {var}" for var in invalid_vars))
-            return False
-            
-        return True
-
-    async def init_ssl_context(self) -> bool:
-        """Initialize SSL context with proper security settings"""
-        try:
-            # Create SSL context with highest available protocol
-            ssl_context = ssl.create_default_context(
-                purpose=ssl.Purpose.SERVER_AUTH,
-                cafile=certifi.where()
-            )
-            
-            # Configure SSL context with secure defaults
-            ssl_context.options |= (
-                ssl.OP_NO_SSLv2 | 
-                ssl.OP_NO_SSLv3 | 
-                ssl.OP_NO_TLSv1 | 
-                ssl.OP_NO_TLSv1_1
-            )
-            
-            # Enable certificate verification
-            ssl_context.verify_mode = ssl.CERT_REQUIRED
-            ssl_context.check_hostname = True
-            
-            # Set secure cipher list
-            ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20')
-            
-            # Special handling for Heroku
-            if 'DYNO' in os.environ:
-                logger.info("Running on Heroku, adjusting SSL configuration")
-                # Heroku's SSL termination requires these settings
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-                
-            logger.info("SSL context initialized successfully")
-            return ssl_context
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize SSL context: {e}")
-            raise RuntimeError(f"SSL context initialization failed: {e}")
-
-    async def monitor_health(self):
-        """Background task to monitor bot health and log issues"""
-        try:
-            # Perform health check
-            health_status = await self.health_check()
-            
-            # Log any issues
-            if not health_status['all_healthy']:
-                logger.warning("Health check detected issues")
-                if self.admin_channel:
-                    issues = [f"- {component}: {status['error']}" 
-                            for component, status in health_status['components'].items() 
-                            if not status['healthy']]
-                    await self.admin_channel.send(
-                        "⚠️ WARNING: Health check detected issues:\n" + "\n".join(issues)
-                    )
-            
-            # Update metrics
-            self.health_metrics.update(health_status['metrics'])
-            
-        except Exception as e:
-            logger.error(f"Error in health monitor: {e}")
-            if self.admin_channel:
-                await self.admin_channel.send(f"🚨 ERROR: Health monitor failed: {e}")
 
 if __name__ == "__main__":
     try:
