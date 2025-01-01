@@ -204,7 +204,7 @@ async def execute_with_retry(func, *args, retries=None):
             
     raise QueryError(f"Database operation failed after {retries} attempts: {str(last_error)}")
 
-async def get_database_url() -> str:
+def get_database_url() -> str:
     """Get and validate database URL with proper Heroku postgres:// to postgresql:// conversion"""
     url = os.getenv('DATABASE_URL')
     if not url:
@@ -2383,73 +2383,21 @@ async def main():
             logger.error(f"Error details: {e.__dict__}")
 
 def init_db_sync():
-    """Synchronous version of init_db for Heroku release phase"""
-    import asyncio
-    from asyncio import TimeoutError
-    import time
-    
-    max_retries = 3
-    retry_delay = 5  # seconds
-    
-    for attempt in range(max_retries):
-        # Create new event loop for each attempt
+    """Initialize database synchronously"""
+    try:
+        # Get database URL synchronously since we've made get_database_url sync
+        database_url = get_database_url()
+        
+        # Create event loop and run async init
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
         try:
-            # Create SSL context
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            
-            # Get database URL
-            database_url = get_database_url()
-            
-            # Create pool and get connection
-            pool = loop.run_until_complete(
-                asyncpg.create_pool(
-                    database_url,
-                    min_size=5,
-                    max_size=20,
-                    command_timeout=60,
-                    ssl=ssl_context
-                )
-            )
-            
-            try:
-                # Get connection from pool
-                conn = loop.run_until_complete(pool.acquire())
-                try:
-                    # Initialize database with connection
-                    loop.run_until_complete(init_db(conn))
-                    logger.info("Database initialized successfully")
-                    return
-                finally:
-                    # Always release the connection
-                    loop.run_until_complete(pool.release(conn))
-            finally:
-                # Always close the pool
-                loop.run_until_complete(pool.close())
-                
-        except Exception as e:
-            if "already exists" in str(e):
-                logger.info("Database tables already exist, continuing...")
-                return
-            logger.error(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-            else:
-                logger.error("All initialization attempts failed")
-                raise
+            loop.run_until_complete(init_db(database_url))
+            logger.info("Database initialized successfully")
         finally:
-            try:
-                loop.close()
-            except Exception as e:
-                logger.error(f"Error closing event loop: {e}")
-                
-if __name__ == "__main__":
-    # For direct script execution (e.g., in Heroku release phase)
-    init_db_sync()
+            loop.close()
+            
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {str(e)}")
+        raise
