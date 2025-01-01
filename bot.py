@@ -91,6 +91,17 @@ from cachetools import TTLCache
 from tenacity import retry, stop_after_attempt, wait_exponential
 from shutdown_manager import ShutdownManager
 
+def get_request_id() -> str:
+    """Generate a unique request ID for logging"""
+    return str(uuid.uuid4())
+
+def init_ssl_context() -> ssl.SSLContext:
+    """Initialize SSL context with proper security settings"""
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    ssl_context.verify_mode = ssl.CERT_REQUIRED
+    ssl_context.check_hostname = True
+    return ssl_context
+
 # Suppress only the single InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
@@ -103,10 +114,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-def get_request_id():
-    """Generate a unique request ID for logging"""
-    return str(uuid.uuid4())
 
 class RateLimiter:
     """Rate limiter with burst support and per-endpoint tracking"""

@@ -22,6 +22,19 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable not set")
 
+# Add input validation for wallet addresses
+WALLET_ADDRESS_PATTERN = re.compile(r'^addr1[a-zA-Z0-9]{98}$')
+STAKE_ADDRESS_PATTERN = re.compile(r'^stake1[a-zA-Z0-9]{50}$')
+
+def validate_address(address: str, address_type: str = 'wallet') -> bool:
+    """Validate Cardano address format"""
+    if address_type == 'wallet':
+        return bool(WALLET_ADDRESS_PATTERN.match(address))
+    elif address_type == 'stake':
+        return bool(STAKE_ADDRESS_PATTERN.match(address))
+    else:
+        raise ValueError(f"Invalid address type: {address_type}")
+
 # Database configuration constants
 DB_CONFIG = {
     'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '2')),
@@ -528,28 +541,11 @@ async def fetch_one(query: str, *args, retries=None) -> Optional[asyncpg.Record]
     return await execute_with_retry(_fetch, *args, retries=retries)
 
 # Add input validation for wallet addresses
-WALLET_ADDRESS_PATTERN = re.compile(r'^addr1[a-zA-Z0-9]{98}$')
-STAKE_ADDRESS_PATTERN = re.compile(r'^stake1[a-zA-Z0-9]{50}$')
-
-def validate_address(address: str, address_type: str = 'wallet') -> bool:
-    """Validate Cardano address format"""
-    if address_type == 'wallet':
-        return bool(WALLET_ADDRESS_PATTERN.match(address))
-    elif address_type == 'stake':
-        return bool(STAKE_ADDRESS_PATTERN.match(address))
-    raise ValueError(f"Invalid address type: {address_type}")
-
-class DatabaseError(Exception):
-    """Base class for database exceptions"""
-    pass
-
-class ConnectionError(DatabaseError):
-    """Database connection error"""
-    pass
-
-class QueryError(DatabaseError):
-    """Database query error"""
-    pass
+def validate_column_name(table: str, column: str) -> bool:
+    """Validate column name"""
+    if table == 'notification_settings':
+        return column in DB_CONFIG['ALLOWED_COLUMNS']['notification_settings']
+    raise ValueError(f"Invalid table: {table}")
 
 async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
     """Add a wallet with proper validation and error handling"""
@@ -814,7 +810,7 @@ async def get_recent_transactions(address: str, hours: int = 1) -> List[asyncpg.
         return []
 
 async def get_wallet_info(address: str) -> Dict[str, Any]:
-    """Get wallet information with a single optimized query
+    """Get comprehensive wallet information including stake address and delegation status
     
     Args:
         address: Wallet address
@@ -823,35 +819,36 @@ async def get_wallet_info(address: str) -> Dict[str, Any]:
         Dict containing wallet info, stake address, and delegation status
     """
     query = """
-        SELECT w.address, w.stake_address, w.monitoring_since,
-               w.last_updated, w.ada_balance,
-               d.pool_id as delegation_pool,
-               (
-                SELECT json_agg(json_build_object(
-                    'tx_hash', t.tx_hash,
-                    'created_at', t.created_at,
-                    'metadata', t.metadata
-                ))
-                FROM (
-                    SELECT tx_hash, created_at, metadata
-                    FROM transactions
-                    WHERE wallet_id = w.id
-                    ORDER BY created_at DESC
-                    LIMIT 10
-                ) t
-            ) as recent_transactions
+        SELECT 
+            w.*,
+            s.stake_address,
+            s.pool_id as delegation_pool,
+            s.rewards_address,
+            s.active_stake
         FROM wallets w
-        LEFT JOIN delegation_status d ON d.address = w.address
+        LEFT JOIN stake_addresses s ON w.stake_address = s.stake_address
         WHERE w.address = $1
     """
+    
     try:
-        record = await fetch_one(query, address)
-        if record:
-            return dict(record)
-        return {}
-    except QueryError as e:
-        logger.error(f"Failed to get wallet info: {str(e)}")
-        return {}
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow(query, address)
+            if not row:
+                return None
+                
+            return {
+                'wallet_id': row['id'],
+                'address': row['address'],
+                'stake_address': row['stake_address'],
+                'delegation_pool': row['delegation_pool'],
+                'rewards_address': row['rewards_address'],
+                'active_stake': row['active_stake'],
+                'created_at': row['created_at'],
+                'last_checked': row['last_checked']
+            }
+    except Exception as e:
+        logger.error(f"Error getting wallet info for {address}: {str(e)}")
+        raise QueryError(f"Failed to get wallet info: {str(e)}")
 
 async def update_wallet_state(address: str, updates: Dict[str, Any]) -> bool:
     """Update multiple wallet attributes in a single transaction
@@ -2279,95 +2276,17 @@ def init_db_sync():
         logger.error(f"Failed to initialize database: {str(e)}")
         raise
 
-class DatabaseManager:
-    """Manages database operations with prepared statements"""
-    
-    def __init__(self, pool):
-        self.pool = pool
-        self.statements = {}
-        
-    async def init_statements(self):
-        """Initialize prepared statements"""
-        async with self.pool.acquire() as conn:
-            self.statements['get_wallet'] = await conn.prepare("""
-                SELECT w.*, ns.* 
-                FROM wallets w 
-                LEFT JOIN notification_settings ns ON w.user_id = ns.user_id 
-                WHERE w.address = $1
-            """)
-            
-            self.statements['get_user_wallets'] = await conn.prepare("""
-                SELECT w.*, ns.* 
-                FROM wallets w 
-                LEFT JOIN notification_settings ns ON w.user_id = ns.user_id 
-                WHERE w.user_id = $1
-            """)
-            
-            self.statements['insert_wallet'] = await conn.prepare("""
-                INSERT INTO wallets (user_id, address, nickname, created_at)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (user_id, address) DO UPDATE
-                SET nickname = EXCLUDED.nickname
-                RETURNING id
-            """)
-            
-            self.statements['update_notification_settings'] = await conn.prepare("""
-                INSERT INTO notification_settings 
-                (user_id, min_amount, notify_deposits, notify_withdrawals, notify_nfts)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (user_id) DO UPDATE
-                SET min_amount = EXCLUDED.min_amount,
-                    notify_deposits = EXCLUDED.notify_deposits,
-                    notify_withdrawals = EXCLUDED.notify_withdrawals,
-                    notify_nfts = EXCLUDED.notify_nfts
-            """)
-            
-            self.statements['get_transaction_history'] = await conn.prepare("""
-                SELECT * FROM transactions 
-                WHERE wallet_address = $1
-                ORDER BY timestamp DESC 
-                LIMIT $2
-            """)
-            
-            logger.info("Database prepared statements initialized successfully")
-            
-    async def get_wallet(self, address: str):
-        """Get wallet information using prepared statement"""
-        return await self.statements['get_wallet'].fetchrow(address)
-        
-    async def get_user_wallets(self, user_id: int):
-        """Get all wallets for a user using prepared statement"""
-        return await self.statements['get_user_wallets'].fetch(user_id)
-        
-    async def insert_wallet(self, user_id: int, address: str, nickname: str):
-        """Insert or update wallet using prepared statement"""
-        return await self.statements['insert_wallet'].fetchval(
-            user_id, address, nickname, datetime.utcnow()
-        )
-        
-    async def update_notification_settings(self, user_id: int, settings: dict):
-        """Update notification settings using prepared statement"""
-        await self.statements['update_notification_settings'].execute(
-            user_id,
-            settings.get('min_amount', 0),
-            settings.get('notify_deposits', True),
-            settings.get('notify_withdrawals', True),
-            settings.get('notify_nfts', True)
-        )
-        
-    async def get_transaction_history(self, address: str, limit: int = 10):
-        """Get transaction history using prepared statement"""
-        return await self.statements['get_transaction_history'].fetch(address, limit)
-        
-    async def cleanup(self):
-        """Cleanup database resources"""
-        try:
-            # Close all prepared statements
-            for stmt in self.statements.values():
-                await stmt.close()
-            logger.info("Database statements cleaned up successfully")
-        except Exception as e:
-            logger.error(f"Error cleaning up database statements: {e}")
+class DatabaseError(Exception):
+    """Base class for database exceptions"""
+    pass
+
+class ConnectionError(DatabaseError):
+    """Database connection error"""
+    pass
+
+class QueryError(DatabaseError):
+    """Database query error"""
+    pass
 
 async def get_db_version(conn) -> int:
     """Get current database version"""

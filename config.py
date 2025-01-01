@@ -1,3 +1,207 @@
+def validate_positive_int(value: str, name: str) -> int:
+    """Validate and convert to positive integer"""
+    try:
+        result = int(value)
+        if result <= 0:
+            raise ValueError
+        return result
+    except (ValueError, TypeError):
+        raise ValueError(f"{name} must be a positive integer, got: {value}")
+
+def validate_url(value: str, name: str) -> str:
+    """Validate URL format"""
+    try:
+        result = urlparse(value)
+        if not all([result.scheme, result.netloc]):
+            raise ValueError
+        return value
+    except ValueError:
+        raise ValueError(f"{name} must be a valid URL")
+
+def validate_database_url(value: str, name: str) -> str:
+    """Validate PostgreSQL database URL"""
+    if not value:
+        raise ValueError(f"{name} cannot be empty")
+    try:
+        result = urlparse(value)
+        if not all([result.scheme, result.netloc]):
+            raise ValueError
+        if result.scheme not in ['postgres', 'postgresql']:
+            raise ValueError(f"{name} must use postgres:// or postgresql:// scheme")
+        return value
+    except ValueError as e:
+        raise ValueError(f"{name} must be a valid PostgreSQL URL: {str(e)}")
+
+def validate_discord_token(value: str, name: str) -> str:
+    """Validate Discord token format"""
+    if not value or len(value) < 10:  # Basic length check
+        raise ValueError(f"{name} must be at least 10 characters long")
+    return value
+
+def validate_blockfrost_id(value: str, name: str) -> str:
+    """Validate Blockfrost project ID format"""
+    if not value or len(value) < 32:
+        raise ValueError(f"{name} must be at least 32 characters long")
+    return value
+
+def validate_blockfrost_project_id(value: str, name: str) -> str:
+    """Validate Blockfrost project ID format and network"""
+    networks = ['mainnet', 'testnet', 'preview', 'preprod']
+    if not any(value.startswith(network) for network in networks):
+        raise ValueError(f"Project ID must start with one of: {', '.join(networks)}")
+    if not re.match(r'^[a-z]+[A-Za-z0-9]{32}$', value):
+        raise ValueError("Invalid project ID format")
+    return value
+
+def validate_blockfrost_url(value: str, name: str) -> str:
+    """Validate Blockfrost API URL"""
+    valid_urls = list(BLOCKFROST_NETWORKS.values())
+    if value not in valid_urls:
+        raise ValueError(f"Must be one of: {', '.join(valid_urls)}")
+    return value
+
+def validate_blockfrost_webhook_id(value: str, name: str) -> str:
+    """Validate Blockfrost webhook ID format"""
+    if not value or not re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', value):
+        raise ValueError(f"{name} must be a valid Blockfrost webhook ID, got: {value}")
+    return value
+
+def validate_blockfrost_webhook_secret(value: str, name: str) -> str:
+    """Validate webhook secret format and strength"""
+    if not value:
+        raise ValueError(f"{name} cannot be empty")
+        
+    # Check minimum length
+    if len(value) < 32:
+        raise ValueError(f"{name} must be at least 32 characters long")
+        
+    # Check character set (allow UUID format)
+    if not re.match(r'^[0-9a-f-]+$', value):
+        raise ValueError(f"{name} must be a valid UUID format")
+        
+    return value
+
+def validate_ip_ranges(value: str, name: str) -> list:
+    """Validate IP ranges in CIDR notation"""
+    if not value:
+        logger.warning("No IP ranges specified - all IPs will be allowed")
+        return []
+        
+    try:
+        ranges = json.loads(value)
+        if not isinstance(ranges, list):
+            raise ValueError("IP ranges must be a JSON array")
+            
+        validated_ranges = []
+        for ip_range in ranges:
+            try:
+                # Validate CIDR notation
+                network = ipaddress.ip_network(ip_range, strict=False)
+                validated_ranges.append(str(network))
+            except ValueError as e:
+                raise ValueError(f"Invalid IP range '{ip_range}': {str(e)}")
+                
+        if not validated_ranges:
+            logger.warning("Empty IP range list - all IPs will be allowed")
+            
+        return validated_ranges
+        
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse IP ranges JSON: {str(e)}")
+
+def validate_base_url(value: str, name: str) -> str:
+    """Validate Blockfrost base URL"""
+    if not value:
+        raise ValueError(f"{name} cannot be empty")
+        
+    # Known valid endpoints (from official docs)
+    valid_endpoints = {
+        "https://cardano-mainnet.blockfrost.io/api/v0": "mainnet",
+        "https://cardano-testnet.blockfrost.io/api/v0": "testnet", 
+        "https://cardano-preview.blockfrost.io/api/v0": "preview",
+        "https://cardano-preprod.blockfrost.io/api/v0": "preprod"
+    }
+    
+    # Normalize URL
+    value = value.rstrip('/')
+    
+    if value not in valid_endpoints:
+        raise ValueError(ERROR_MESSAGES['invalid_base_url'](valid_endpoints.keys()))
+
+    # Check that project ID prefix matches base URL
+    project_id = os.getenv('BLOCKFROST_PROJECT_ID')
+    if project_id:
+        match = re.match(r'^(mainnet|testnet|preview|preprod)[a-zA-Z0-9]{32}$', project_id)
+        if not match:
+            logger.warning("Project ID format is invalid, skipping network prefix check")
+            return value
+            
+        network_prefix = match.group(1)
+        expected_network = valid_endpoints[value]
+        if network_prefix != expected_network:
+            raise ValueError(
+                ERROR_MESSAGES['network_prefix_mismatch'](network_prefix, expected_network, value)
+            )
+            
+    return value
+
+def validate_minute(value: str, name: str) -> int:
+    """Validate and convert to minute value (0-59)"""
+    try:
+        result = int(value)
+        if result < 0 or result > 59:
+            raise ValueError
+        return result
+    except (ValueError, TypeError):
+        raise ValueError(f"{name} must be an integer between 0 and 59, got: {value}")
+
+def validate_hour(value: str, name: str) -> int:
+    """Validate and convert to hour value (0-23)"""
+    try:
+        result = int(value)
+        if result < 0 or result > 23:
+            raise ValueError
+        return result
+    except (ValueError, TypeError):
+        raise ValueError(f"{name} must be an integer between 0 and 23, got: {value}")
+
+def validate_asset_id(value: str, name: str) -> str:
+    """Validate Cardano asset ID format"""
+    try:
+        value = value.strip()
+        if not re.match(r'^[0-9a-fA-F]{56,}$', value):
+            raise ValueError
+        return value.lower()
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} must be a valid Cardano asset ID (hex format), got: {value}")
+
+def validate_token_name(value: str, name: str) -> str:
+    """Validate token name format"""
+    try:
+        value = value.strip()
+        # Check if it's a valid hex string and not too long
+        if not re.match(r'^[0-9a-fA-F]{1,64}$', value):
+            raise ValueError
+        return value.lower()
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} must be a valid hex-encoded token name, got: {value}")
+
+def validate_policy_id(value: str, name: str) -> str:
+    """Validate Cardano policy ID format"""
+    try:
+        value = value.strip()
+        if not re.match(r'^[0-9a-fA-F]{56}$', value):
+            raise ValueError
+        return value.lower()
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} must be a valid Cardano policy ID (56-character hex), got: {value}")
+
+def validate_hex(value: str, length: int, name: str) -> str:
+    """Validate hexadecimal string of specific length"""
+    if not value or not re.fullmatch(rf"(?i)[a-f0-9]{{{length}}}", value):
+        raise ValueError(f"{name} must be a {length}-character hexadecimal string, got: {value}")
+    return value.lower()
+
 import os
 import re
 import ssl
@@ -112,65 +316,6 @@ class EnvVar:
                 raise ValueError(f"Invalid {self.name}: {str(e)}")
                 
         return value
-
-def validate_url(value: str, name: str) -> str:
-    """Validate URL format"""
-    try:
-        result = urlparse(value)
-        if not all([result.scheme, result.netloc]):
-            raise ValueError("Invalid URL format")
-        return value
-    except Exception as e:
-        raise ValueError(f"Invalid URL format: {str(e)}")
-
-def validate_database_url(value: str, name: str) -> str:
-    """Validate and normalize database URL"""
-    if not value:
-        raise ValueError(f"{name} is required")
-        
-    # Handle Heroku's postgres:// format
-    if value.startswith("postgres://"):
-        value = value.replace("postgres://", "postgresql://", 1)
-        
-    try:
-        result = urlparse(value)
-        if not all([result.scheme, result.hostname, result.username, result.password]):
-            raise ValueError(f"{name} is missing required components")
-            
-        if result.scheme not in ['postgresql', 'postgres']:
-            raise ValueError(f"{name} must be a PostgreSQL URL")
-            
-    except Exception as e:
-        raise ValueError(f"Invalid {name}: {str(e)}")
-        
-    return value
-
-def validate_discord_token(value: str, name: str) -> str:
-    """Validate Discord token format"""
-    if not value:
-        raise ValueError(f"{name} cannot be empty")
-        
-    # Just check that it's not empty and has reasonable length
-    if len(value) < 10:
-        raise ValueError(f"{name} is too short")
-        
-    return value
-
-def validate_blockfrost_project_id(value: str, name: str) -> str:
-    """Validate Blockfrost project ID format and network"""
-    networks = ['mainnet', 'testnet', 'preview', 'preprod']
-    if not any(value.startswith(network) for network in networks):
-        raise ValueError(f"Project ID must start with one of: {', '.join(networks)}")
-    if not re.match(r'^[a-z]+[A-Za-z0-9]{32}$', value):
-        raise ValueError("Invalid project ID format")
-    return value
-
-def validate_blockfrost_url(value: str, name: str) -> str:
-    """Validate Blockfrost API URL"""
-    valid_urls = list(BLOCKFROST_NETWORKS.values())
-    if value not in valid_urls:
-        raise ValueError(f"Must be one of: {', '.join(valid_urls)}")
-    return value
 
 # Required environment variables with validation
 ENV_VARS = {
@@ -537,16 +682,6 @@ class EnvVar:
     default: Any = None
     validator: Optional[callable] = None
     description: str = ""
-
-def validate_positive_int(value: str, name: str) -> int:
-    """Validate and convert to positive integer"""
-    try:
-        result = int(value)
-        if result <= 0:
-            raise ValueError
-        return result
-    except (ValueError, TypeError):
-        raise ValueError(f"{name} must be a positive integer, got: {value}")
 
 def validate_hex(value: str, length: int, name: str) -> str:
     """Validate hexadecimal string of specific length"""
