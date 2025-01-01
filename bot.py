@@ -31,6 +31,34 @@ from blockfrost.api.cardano.network import network
 from urllib3.exceptions import InsecureRequestWarning
 
 # Local imports
+from config import (
+    DISCORD_TOKEN,
+    APPLICATION_ID,
+    BLOCKFROST_PROJECT_ID,
+    DATABASE_URL,
+    ADMIN_CHANNEL_ID,
+    WEBHOOK_SECRET,
+    MAX_REQUESTS_PER_SECOND,
+    BURST_LIMIT,
+    RATE_LIMIT_COOLDOWN,
+    ARCHIVE_AFTER_DAYS,
+    DELETE_AFTER_DAYS,
+    MAINTENANCE_BATCH_SIZE,
+    MAINTENANCE_MAX_RETRIES,
+    MAINTENANCE_HOUR,
+    MAINTENANCE_MINUTE,
+    COMMAND_COOLDOWN,
+    RATE_LIMIT_WINDOW,
+    RATE_LIMIT_MAX_REQUESTS,
+    MAX_QUEUE_SIZE,
+    MAX_RETRIES,
+    MAX_EVENT_AGE,
+    BATCH_SIZE,
+    MINIMUM_YUMMI,
+    YUMMI_POLICY_ID,
+    YUMMI_TOKEN_NAME,
+    ASSET_ID
+)
 from database import (
     get_pool,
     add_wallet_for_user,
@@ -51,27 +79,6 @@ from database import (
 from database_maintenance import DatabaseMaintenance
 from webhook_queue import WebhookQueue
 from decorators import dm_only, has_blockfrost, command_cooldown
-from config import (
-    DISCORD_TOKEN,
-    APPLICATION_ID,
-    ADMIN_CHANNEL_ID,
-    BLOCKFROST_PROJECT_ID,
-    BLOCKFROST_BASE_URL,
-    WEBHOOK_SECRET,
-    MAX_REQUESTS_PER_SECOND,
-    BURST_LIMIT,
-    RATE_LIMIT_COOLDOWN,
-    RATE_LIMIT_WINDOW,
-    RATE_LIMIT_MAX_REQUESTS,
-    MAX_QUEUE_SIZE,
-    MAX_RETRIES,
-    MAX_EVENT_AGE,
-    BATCH_SIZE,
-    COMMAND_COOLDOWN,
-    MINIMUM_YUMMI,
-    DB_CONFIG
-)
-
 import uuid
 import random
 import functools
@@ -223,7 +230,7 @@ class WalletBudBot(commands.Bot):
         super().__init__(
             command_prefix='!',  # Required but not used since we use slash commands
             intents=intents,
-            application_id=os.getenv('APPLICATION_ID'),
+            application_id=APPLICATION_ID,  # Use imported APPLICATION_ID
             *args,
             **kwargs
         )
@@ -233,7 +240,7 @@ class WalletBudBot(commands.Bot):
         self.register_cleanup_handlers()
         
         # Get admin channel ID from environment
-        self.admin_channel_id = int(os.getenv('ADMIN_CHANNEL_ID', 0))
+        self.admin_channel_id = ADMIN_CHANNEL_ID  # Use imported ADMIN_CHANNEL_ID
         self.admin_channel = None  # Will be set in setup_hook
         
         # Initialize components
@@ -406,200 +413,95 @@ class WalletBudBot(commands.Bot):
     async def setup_hook(self):
         """Set up the bot's background tasks and signal handlers"""
         try:
-            # Setup signal handlers
-            self.shutdown_manager.setup_signal_handlers(self.loop)
+            # Set up admin channel first
+            await self.setup_admin_channel()
+            if self.admin_channel:
+                await self.admin_channel.send("🚀 Bot is starting up...")
             
-            # Initialize critical components
+            # Initialize critical dependencies
             await self.validate_and_init_dependencies()
             
-            # Set up admin channel
-            await self.setup_admin_channel()
+            # Set up webhook routing
+            self.app.router.add_post('/webhook', self.handle_webhook)
             
-            # Start background tasks with proper error handling
-            try:
-                self.check_yummi_balances.start()
-            except RuntimeError as e:
-                logger.error(f"Failed to start YUMMI check task: {e}")
-                await self.send_admin_alert(" YUMMI check task failed to start", is_error=True)
-                
-            try:
-                self._check_connection_task = self.loop.create_task(self._check_connection_loop())
-            except Exception as e:
-                logger.error(f"Failed to start connection check task: {e}")
-                await self.send_admin_alert(" Connection check task failed to start", is_error=True)
-                
-            # Start webhook server
-            try:
-                await self.setup_webhook_handler()
-            except Exception as e:
-                logger.error(f"Failed to start webhook server: {e}")
-                await self.send_admin_alert(" Webhook server failed to start", is_error=True)
-                # Don't raise here as webhook is not critical for core functionality
+            # Start webhook processor
+            self._webhook_processor = asyncio.create_task(self._process_webhook_queue())
+            
+            # Start health check task
+            self.health_check_task.start()
+            
+            # Start YUMMI balance check task
+            self.check_yummi_balances.start()
             
             # Log successful setup
             logger.info("Bot setup completed successfully")
-            await self.send_admin_alert(" Bot setup completed successfully", is_error=False)
+            if self.admin_channel:
+                await self.admin_channel.send("✅ Bot setup completed successfully")
             
         except Exception as e:
             logger.error(f"Failed to set up bot: {e}")
-            await self.send_admin_alert(f" Bot setup failed: {e}", is_error=True)
+            if self.admin_channel:
+                await self.admin_channel.send(f"🚨 ERROR: Failed to set up bot: {e}")
             raise
             
     async def validate_and_init_dependencies(self):
         """Validate and initialize all critical dependencies"""
         try:
-            # Validate environment first
-            self.validate_environment()
+            # Check environment variables
+            self.check_environment()
+            logger.info("Environment variables validated")
+            if self.admin_channel:
+                await self.admin_channel.send("✅ Environment variables validated")
             
-            # Initialize database with retries
-            retry_count = 0
-            max_retries = 3
-            while retry_count < max_retries:
-                try:
-                    await self.init_database()
-                    break
-                except Exception as e:
-                    retry_count += 1
-                    if retry_count >= max_retries:
-                        raise RuntimeError(f"Database initialization failed after {max_retries} attempts: {e}")
-                    logger.warning(f"Database initialization attempt {retry_count} failed: {e}")
-                    await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+            # Initialize database
+            await self.init_database()
+            logger.info("Database initialized")
+            if self.admin_channel:
+                await self.admin_channel.send("✅ Database initialized")
             
             # Initialize Blockfrost client
-            try:
-                await self.init_blockfrost()
-            except Exception as e:
-                logger.error(f"Failed to initialize Blockfrost: {e}")
-                await self.send_admin_alert(" Blockfrost initialization failed, some features may be limited", is_error=True)
-                # Don't raise here as bot can function without Blockfrost
+            await self.init_blockfrost()
+            logger.info("Blockfrost client initialized")
+            if self.admin_channel:
+                await self.admin_channel.send("✅ Blockfrost client initialized")
             
-            # Initialize rate limiters
-            self.init_rate_limiters()
+            # Initialize HTTP session
+            self.session = aiohttp.ClientSession(connector=self.connector)
+            logger.info("HTTP session initialized")
+            if self.admin_channel:
+                await self.admin_channel.send("✅ HTTP session initialized")
             
-            # Initialize SSL context
-            self.ssl_context = self.init_ssl_context()
-            
-            # Initialize aiohttp session with proper error handling
-            try:
-                if self.session and not self.session.closed:
-                    await self.session.close()
-                    
-                self.session = aiohttp.ClientSession(
-                    connector=aiohttp.TCPConnector(
-                        ssl=self.ssl_context,
-                        limit=100,
-                        ttl_dns_cache=300,
-                        force_close=False
-                    ),
-                    timeout=aiohttp.ClientTimeout(
-                        total=30,
-                        connect=10,
-                        sock_read=30
-                    ),
-                    raise_for_status=True
-                )
-            except Exception as e:
-                logger.error(f"Failed to initialize aiohttp session: {e}")
-                raise RuntimeError(f"HTTP session initialization failed: {e}")
+            # Log successful initialization
+            logger.info("All dependencies initialized successfully")
+            if self.admin_channel:
+                await self.admin_channel.send("✅ All dependencies initialized successfully")
             
         except Exception as e:
             logger.error(f"Failed to initialize dependencies: {e}")
-            await self.send_admin_alert(f" Dependency initialization failed: {e}", is_error=True)
-            raise RuntimeError(f"Dependency initialization failed: {e}")
-            
-    async def init_database(self):
-        """Initialize database connection with proper error handling"""
-        try:
-            # Initialize the database pool
-            self.pool = await get_pool()
-            if not self.pool:
-                raise RuntimeError("Failed to create database pool")
-                
-            # Test the connection
-            async with self.pool.acquire() as conn:
-                await conn.fetchval('SELECT 1')
-                
-            logger.info("Database initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Database initialization failed: {e}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"🚨 ERROR: Failed to initialize dependencies: {e}")
             raise
             
-    def init_ssl_context(self):
-        """Initialize SSL context with proper security settings"""
-        try:
-            # Create SSL context with highest available protocol
-            ssl_context = ssl.create_default_context(
-                purpose=ssl.Purpose.SERVER_AUTH,
-                cafile=certifi.where()
-            )
-            
-            # Configure SSL context with secure defaults
-            ssl_context.options |= (
-                ssl.OP_NO_SSLv2 | 
-                ssl.OP_NO_SSLv3 | 
-                ssl.OP_NO_TLSv1 | 
-                ssl.OP_NO_TLSv1_1
-            )
-            
-            # Enable certificate verification
-            ssl_context.verify_mode = ssl.CERT_REQUIRED
-            ssl_context.check_hostname = True
-            
-            # Set secure cipher list
-            ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20')
-            
-            # Special handling for Heroku
-            if 'DYNO' in os.environ:
-                logger.info("Running on Heroku, adjusting SSL configuration")
-                # Heroku's SSL termination requires these settings
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-                
-            logger.info("SSL context initialized successfully")
-            return ssl_context
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize SSL context: {e}")
-            raise RuntimeError(f"SSL context initialization failed: {e}")
-
     async def on_error(self, event_method: str, *args, **kwargs):
         """Called when an error occurs in an event"""
-        try:
-            error = sys.exc_info()
+        error = sys.exc_info()
+        if error:
+            error_type, error_value, error_traceback = error
             
-            # Format error details
-            error_details = {
-                'event': event_method,
-                'error_type': error[0].__name__ if error[0] else 'Unknown',
-                'error_message': str(error[1]) if error[1] else 'No message',
-                'traceback': ''.join(traceback.format_tb(error[2])) if error[2] else 'No traceback'
-            }
-            
-            # Log error
+            # Log the error
             logger.error(
-                f"Error in {event_method}:\n"
-                f"Type: {error_details['error_type']}\n"
-                f"Message: {error_details['error_message']}\n"
-                f"Traceback:\n{error_details['traceback']}"
+                f"Error in {event_method}: {error_type.__name__}: {str(error_value)}",
+                exc_info=error
             )
             
-            # Send alert to admin channel
-            alert_msg = (
-                f"Error in event {event_method}:\n"
-                f"```\n"
-                f"Type: {error_details['error_type']}\n"
-                f"Message: {error_details['error_message']}\n"
-                f"```"
-            )
-            await self.send_admin_alert(alert_msg, is_error=True)
-            
-            # Update health metrics
-            self.update_health_metrics('errors', error_details)
-            
-        except Exception as e:
-            logger.error(f"Error in error handler: {e}")
-            
+            # Send error to admin channel
+            if self.admin_channel:
+                tb_str = "".join(traceback.format_tb(error_traceback))
+                await self.admin_channel.send(
+                    f"🚨 ERROR in {event_method}:\n"
+                    f"```\n{error_type.__name__}: {str(error_value)}\n\n{tb_str}```"
+                )
+                
     async def process_interaction(self, interaction: discord.Interaction, ephemeral: bool = True):
         """Process interaction with proper error handling and retry logic"""
         interaction_id = str(interaction.id)
@@ -741,10 +643,7 @@ class WalletBudBot(commands.Bot):
             )
             
             # Send detailed error to admin channel
-            await self.send_admin_alert(
-                f" Error in {interaction.command.name if interaction.command else 'unknown'}: {error}",
-                is_error=True
-            )
+            await self._handle_command_error(interaction, error)
             
         except Exception as e:
             logger.error(f"Error handling command error: {e}")
@@ -1080,34 +979,22 @@ class WalletBudBot(commands.Bot):
         """Set up admin channel for bot notifications"""
         try:
             if not self.admin_channel_id:
-                logger.warning("No admin channel ID configured")
-                return False
-            
-            # Wait for bot to be ready
-            if not self.is_ready():
-                logger.info("Waiting for bot to be ready...")
-                await self.wait_until_ready()
-            
-            # Get the channel
-            channel = self.get_channel(self.admin_channel_id)
-            if not channel:
-                logger.error(f"Could not find channel with ID {self.admin_channel_id}")
-                return False
-            
-            # Test permissions by sending a message
-            try:
-                await channel.send(" Testing admin channel permissions...")
-                self.admin_channel = channel
-                logger.info(f"Admin channel set up successfully: {channel.name}")
-                return True
-            except Exception as e:
-                logger.error(f"Could not send message to admin channel: {e}")
-                return False
+                logger.warning("Admin channel ID not set")
+                return
                 
+            # Get the admin channel
+            self.admin_channel = await self.fetch_channel(self.admin_channel_id)
+            if not self.admin_channel:
+                logger.error("Could not find admin channel")
+                return
+                
+            logger.info("Admin channel setup successful")
+            await self.admin_channel.send("🤖 Bot is starting up...")
+            
         except Exception as e:
-            logger.error(f"Error setting up admin channel: {e}")
-            return False
-    
+            logger.error(f"Failed to set up admin channel: {e}")
+            # Don't raise here as bot can function without admin channel
+
     async def _check_connection_loop(self):
         """Background task to periodically check connection status"""
         while True:
@@ -1147,35 +1034,32 @@ class WalletBudBot(commands.Bot):
                 
     async def init_blockfrost(self):
         """Initialize Blockfrost API client with proper error handling and retries"""
-        MAX_RETRIES = 3
-        RETRY_DELAY = 5
-        
-        for attempt in range(MAX_RETRIES):
-            try:
-                project_id = os.getenv('BLOCKFROST_PROJECT_ID')
-                if not project_id:
-                    raise ValueError("BLOCKFROST_PROJECT_ID not set")
-                    
-                # Create client with proper SSL context
-                self.blockfrost = BlockFrostApi(
-                    project_id=project_id,
-                    base_url=os.getenv('BLOCKFROST_BASE_URL', ApiUrls.mainnet.value),
-                    session_args={'ssl': self.ssl_context}
-                )
-                
-                # Test connection
-                await self.blockfrost_request(self.blockfrost.health)
-                logger.info("Blockfrost client initialized successfully")
-                return
-                
-            except Exception as e:
-                logger.error(f"Blockfrost initialization attempt {attempt + 1} failed: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY)
-                else:
-                    await self.send_admin_alert(f" Blockfrost initialization failed: {e}")
-                    raise
-                    
+        if not BLOCKFROST_PROJECT_ID:
+            logger.error("BLOCKFROST_PROJECT_ID environment variable is not set")
+            if self.admin_channel:
+                await self.admin_channel.send("🚨 ERROR: BLOCKFROST_PROJECT_ID not set")
+            raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
+            
+        try:
+            base_url = os.getenv('BLOCKFROST_BASE_URL', ApiUrls.mainnet.value)
+            self.blockfrost = BlockFrostApi(
+                project_id=BLOCKFROST_PROJECT_ID,
+                base_url=base_url
+            )
+            # Test connection
+            await self.blockfrost.health()
+            logger.info("Blockfrost client initialized successfully")
+            self.health_metrics['blockfrost_init'] = datetime.utcnow()
+            if self.admin_channel:
+                await self.admin_channel.send("ℹ️ INFO: Blockfrost API connection established")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Blockfrost client: {e}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"🚨 ERROR: Failed to initialize Blockfrost client: {e}")
+            self.blockfrost = None
+            raise
+
     async def blockfrost_request(
         self, 
         method: Callable, 
@@ -1209,12 +1093,14 @@ class WalletBudBot(commands.Bot):
                     
         except asyncio.TimeoutError as e:
             logger.error(f"Blockfrost request timed out: {endpoint or method.__name__}")
-            await self.send_admin_alert(f"⚠️ Blockfrost request timed out: {endpoint or method.__name__}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"⚠️ WARNING: Blockfrost request timed out: {endpoint or method.__name__}")
             raise BlockfrostError(f"Request timed out: {str(e)}")
             
         except Exception as e:
             logger.error(f"Blockfrost request failed: {endpoint or method.__name__} - {str(e)}")
-            await self.send_admin_alert(f"🚨 Blockfrost request failed: {endpoint or method.__name__}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"🚨 ERROR: Blockfrost request failed: {endpoint or method.__name__}")
             raise BlockfrostError(f"Request failed: {str(e)}")
             
     async def on_resumed(self):
@@ -1332,7 +1218,7 @@ class WalletBudBot(commands.Bot):
             try:
                 payload = await request.read()
                 expected_signature = hmac.new(
-                    os.getenv('WEBHOOK_SECRET').encode(),
+                    WEBHOOK_SECRET.encode(),
                     payload,
                     hashlib.sha512
                 ).hexdigest()
@@ -1363,100 +1249,118 @@ class WalletBudBot(commands.Bot):
         while True:
             try:
                 # Get webhook data from queue with timeout
-                webhook_data = await asyncio.wait_for(
-                    self._webhook_queue.get(),
-                    timeout=30.0
-                )
+                webhook_data, request_id = await self._webhook_queue.get()
                 
-                request_id = webhook_data.get('request_id', str(uuid.uuid4()))
-                retry_count = webhook_data.get('retry_count', 0)
-                
+                # Process the webhook
                 try:
-                    # Process webhook with timeout
-                    async with asyncio.timeout(30):
-                        await self._process_single_webhook(webhook_data, request_id)
-                        
-                    # Update success metrics
+                    await self._process_single_webhook(webhook_data, request_id)
                     self.health_metrics['webhook_success'] += 1
-                    self.health_metrics['last_webhook'] = datetime.utcnow()
-                    
-                except asyncio.TimeoutError:
-                    logger.error(f"Webhook processing timed out: {request_id}")
-                    await self._handle_webhook_failure(webhook_data, request_id, "Timeout")
+                    if self.admin_channel:
+                        await self.admin_channel.send(f"✅ SUCCESS: Processed webhook {request_id}")
                     
                 except Exception as e:
-                    logger.error(f"Error processing webhook {request_id}: {e}")
+                    # Handle webhook processing failure
                     await self._handle_webhook_failure(webhook_data, request_id, str(e))
                     
                 finally:
+                    # Mark task as done
                     self._webhook_queue.task_done()
                     
-            except asyncio.TimeoutError:
-                # No webhooks in queue, continue waiting
-                continue
+            except asyncio.CancelledError:
+                logger.info("Webhook processor task cancelled")
+                break
                 
             except Exception as e:
-                logger.error(f"Critical error in webhook processor: {e}")
-                if hasattr(self, 'send_admin_alert'):
-                    await self.send_admin_alert(
-                        f" Webhook processor error:\n```\n{traceback.format_exc()}```"
-                    )
-                await asyncio.sleep(5)  # Prevent tight error loop
+                logger.error(f"Error in webhook processor: {e}")
+                if self.admin_channel:
+                    await self.admin_channel.send(f"🚨 ERROR: Webhook processor error: {e}")
+                await asyncio.sleep(1)  # Prevent tight loop on persistent errors
                 
     async def _handle_webhook_failure(self, webhook_data: dict, request_id: str, error: str):
         """Handle webhook processing failure with smart retry logic"""
-        retry_count = webhook_data.get('retry_count', 0)
-        max_retries = WEBHOOK_CONFIG['retry_attempts']
-        
-        if retry_count >= max_retries:
-            logger.error(f"Webhook {request_id} failed permanently after {retry_count} retries")
+        try:
+            # Update health metrics
             self.health_metrics['webhook_failure'] += 1
-            if hasattr(self, 'send_admin_alert'):
-                await self.send_admin_alert(
-                    f" Webhook {request_id} failed permanently:\n"
-                    f"Error: {error}\n"
-                    f"Data: ```json\n{json.dumps(webhook_data, indent=2)}```"
-                )
-            return
             
-        # Calculate backoff delay with jitter
-        base_delay = WEBHOOK_CONFIG['backoff_factor'] ** retry_count
-        jitter = random.uniform(0, 0.1 * base_delay)  # 10% jitter
-        delay = min(base_delay + jitter, WEBHOOK_CONFIG['max_backoff'])
-        
-        # Add retry information
-        webhook_data.update({
-            'retry_count': retry_count + 1,
-            'last_error': error,
-            'last_attempt': datetime.utcnow().isoformat()
-        })
-        
-        logger.info(f"Retrying webhook {request_id} in {delay:.2f}s (attempt {retry_count + 1}/{max_retries})")
-        
-        # Schedule retry with delay
-        await asyncio.sleep(delay)
-        await self._webhook_queue.put(webhook_data)
+            # Log the failure
+            logger.error(f"Webhook processing failed for request {request_id}: {error}")
+            
+            # Get current retry count
+            retry_count = self.webhook_retries.get(request_id, 0)
+            
+            if retry_count < MAX_RETRIES:
+                # Increment retry count
+                self.webhook_retries[request_id] = retry_count + 1
+                
+                # Calculate delay with exponential backoff
+                delay = min(300, 2 ** retry_count)  # Cap at 5 minutes
+                
+                # Log retry attempt
+                logger.info(f"Retrying webhook {request_id} in {delay} seconds (attempt {retry_count + 1}/{MAX_RETRIES})")
+                
+                # Send admin notification
+                if self.admin_channel:
+                    await self.admin_channel.send(
+                        f"⚠️ WARNING: Webhook processing failed for request {request_id}. "
+                        f"Retrying in {delay} seconds (attempt {retry_count + 1}/{MAX_RETRIES})"
+                    )
+                
+                # Schedule retry
+                await asyncio.sleep(delay)
+                await self._webhook_queue.put({
+                    'data': webhook_data,
+                    'request_id': request_id,
+                    'timestamp': time.time()
+                })
 
+            else:
+                # Log permanent failure
+                logger.error(f"Webhook {request_id} failed permanently after {MAX_RETRIES} retries")
+                
+                # Send admin notification
+                if self.admin_channel:
+                    await self.admin_channel.send(
+                        f"🚨 ERROR: Webhook {request_id} failed permanently after {MAX_RETRIES} retries.\n"
+                        f"Error: {error}"
+                    )
+                
+                # Clean up retry counter
+                self.webhook_retries.pop(request_id, None)
+                
+        except Exception as e:
+            logger.error(f"Error handling webhook failure: {e}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"🚨 ERROR: Failed to handle webhook failure: {e}")
+                
     async def _process_single_webhook(self, webhook_data: dict, request_id: str):
         """Process a single webhook with proper error handling"""
         try:
-            # Validate webhook data structure
+            # Validate webhook structure
             if not self._validate_webhook_structure(webhook_data):
-                logger.error(f"Invalid webhook structure: {request_id}")
+                logger.error(f"Invalid webhook structure for request {request_id}")
+                if self.admin_channel:
+                    await self.admin_channel.send(f"🚨 ERROR: Invalid webhook structure for request {request_id}")
                 return
-            
-            # Process based on webhook type
+                
+            # Get webhook type and handler
             webhook_type = webhook_data.get('type')
-            processor = self._get_webhook_processor(webhook_type)
+            handler = self._get_webhook_processor(webhook_type)
             
-            if processor:
-                await processor(webhook_data)
-            else:
-                logger.warning(f"Unknown webhook type: {webhook_type}")
+            if not handler:
+                logger.error(f"No handler found for webhook type: {webhook_type}")
+                if self.admin_channel:
+                    await self.admin_channel.send(f"🚨 ERROR: No handler found for webhook type: {webhook_type}")
+                return
+                
+            # Process webhook
+            await handler(webhook_data)
+            logger.info(f"Successfully processed webhook {request_id}")
             
         except Exception as e:
             logger.error(f"Error processing webhook {request_id}: {e}")
-            raise  # Re-raise for the main processor to handle
+            if self.admin_channel:
+                await self.admin_channel.send(f"🚨 ERROR: Failed to process webhook {request_id}: {e}")
+            raise
             
     def _validate_webhook_structure(self, webhook_data: dict) -> bool:
         """Validate webhook data structure"""
@@ -1551,74 +1455,14 @@ class WalletBudBot(commands.Bot):
                     
         except asyncio.TimeoutError as e:
             logger.error(f"Blockfrost request timed out: {endpoint or method.__name__}")
-            await self.send_admin_alert(f"⚠️ Blockfrost request timed out: {endpoint or method.__name__}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"⚠️ WARNING: Blockfrost request timed out: {endpoint or method.__name__}")
             raise BlockfrostError(f"Request timed out: {str(e)}")
             
         except Exception as e:
             logger.error(f"Blockfrost request failed: {endpoint or method.__name__} - {str(e)}")
-            await self.send_admin_alert(f"🚨 Blockfrost request failed: {endpoint or method.__name__}")
-            raise BlockfrostError(f"Request failed: {str(e)}")
-            
-    async def init_blockfrost(self):
-        """Initialize Blockfrost API client with proper error handling and retries"""
-        if not os.getenv('BLOCKFROST_PROJECT_ID'):
-            raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
-            
-        try:
-            base_url = os.getenv('BLOCKFROST_BASE_URL', ApiUrls.mainnet.value)
-            self.blockfrost = BlockFrostApi(
-                project_id=os.getenv('BLOCKFROST_PROJECT_ID'),
-                base_url=base_url
-            )
-            # Test connection
-            await self.blockfrost.health()
-            logger.info("Blockfrost client initialized successfully")
-            self.health_metrics['blockfrost_init'] = datetime.utcnow()
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Blockfrost client: {e}")
-            self.blockfrost = None
-            raise
-
-    async def blockfrost_request(
-        self, 
-        method: Callable, 
-        endpoint: Optional[str] = None,
-        *args, 
-        **kwargs
-    ) -> Any:
-        """Make a request to Blockfrost API with rate limiting and error handling
-        
-        Args:
-            method: Blockfrost API method to call
-            endpoint: Optional API endpoint (for logging)
-            *args: Positional arguments for the method
-            **kwargs: Keyword arguments for the method
-            
-        Returns:
-            API response
-            
-        Raises:
-            BlockfrostError: If API request fails
-        """
-        if not self.blockfrost:
-            raise BlockfrostError("Blockfrost client not initialized")
-            
-        try:
-            async with self.rate_limiter.acquire("blockfrost"):
-                async with asyncio.timeout(30):  # 30 second timeout
-                    response = await method(*args, **kwargs)
-                    self.health_metrics['last_api_call'] = datetime.utcnow()
-                    return response
-                    
-        except asyncio.TimeoutError as e:
-            logger.error(f"Blockfrost request timed out: {endpoint or method.__name__}")
-            await self.send_admin_alert(f"⚠️ Blockfrost request timed out: {endpoint or method.__name__}")
-            raise BlockfrostError(f"Request timed out: {str(e)}")
-            
-        except Exception as e:
-            logger.error(f"Blockfrost request failed: {endpoint or method.__name__} - {str(e)}")
-            await self.send_admin_alert(f"🚨 Blockfrost request failed: {endpoint or method.__name__}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"🚨 ERROR: Blockfrost request failed: {endpoint or method.__name__}")
             raise BlockfrostError(f"Request failed: {str(e)}")
             
     async def should_notify(self, user_id: int, notification_type: str) -> bool:
@@ -1769,7 +1613,7 @@ class WalletBudBot(commands.Bot):
         invalid_vars = []
 
         for var_name, config in required_vars.items():
-            value = os.getenv(var_name)
+            value = globals()[var_name]
             if not value:
                 missing_vars.append(f"{var_name} ({config['description']})")
                 continue
@@ -1832,27 +1676,27 @@ class WalletBudBot(commands.Bot):
     async def monitor_health(self):
         """Background task to monitor bot health and log issues"""
         try:
-            # Check connections
-            await self.check_connections()
-            
-            # Check Blockfrost API
-            if self.blockfrost is None:
-                logger.warning("Blockfrost client not initialized")
-                await self.init_blockfrost()
-            
-            # Update health metrics
-            self.update_health_metrics('health_check')
+            # Perform health check
+            health_status = await self.health_check()
             
             # Log any issues
-            if len(self.health_metrics['errors']) > 0:
-                logger.warning(f"Health check found {len(self.health_metrics['errors'])} issues")
-                
-                # Clear old errors after logging
-                self.health_metrics['errors'] = []
-                
+            if not health_status['all_healthy']:
+                logger.warning("Health check detected issues")
+                if self.admin_channel:
+                    issues = [f"- {component}: {status['error']}" 
+                            for component, status in health_status['components'].items() 
+                            if not status['healthy']]
+                    await self.admin_channel.send(
+                        "⚠️ WARNING: Health check detected issues:\n" + "\n".join(issues)
+                    )
+            
+            # Update metrics
+            self.health_metrics.update(health_status['metrics'])
+            
         except Exception as e:
-            logger.error(f"Error in health monitoring: {e}")
-            self.health_metrics['errors'].append(str(e))
+            logger.error(f"Error in health monitor: {e}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"🚨 ERROR: Health monitor failed: {e}")
 
 if __name__ == "__main__":
     try:
@@ -1921,7 +1765,7 @@ if __name__ == "__main__":
         
         # Run the bot and webhook server
         loop.create_task(start_webhook())
-        bot.run(os.getenv('DISCORD_TOKEN'))
+        bot.run(DISCORD_TOKEN)
         
     except Exception as e:
         logger.error(f"Failed to start bot: {str(e)}", exc_info=True)

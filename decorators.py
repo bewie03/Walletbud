@@ -81,8 +81,8 @@ def has_blockfrost(func=None):
                 "❌ Blockfrost API is not available. Please try again later.",
                 ephemeral=True
             )
-            if hasattr(interaction.client, 'send_admin_alert'):
-                await interaction.client.send_admin_alert("🚨 Command failed: Blockfrost client not initialized")
+            if hasattr(interaction.client, 'admin_channel') and interaction.client.admin_channel:
+                await interaction.client.admin_channel.send("🚨 ERROR: Command failed: Blockfrost client not initialized")
             return False
             
         # Check if Blockfrost is responding with rate limiting and timeouts
@@ -100,18 +100,18 @@ def has_blockfrost(func=None):
                 "❌ Blockfrost API is not responding. Please try again later.",
                 ephemeral=True
             )
-            if hasattr(interaction.client, 'send_admin_alert'):
-                await interaction.client.send_admin_alert("⚠️ Blockfrost health check timed out")
+            if hasattr(interaction.client, 'admin_channel') and interaction.client.admin_channel:
+                await interaction.client.admin_channel.send("⚠️ WARNING: Blockfrost health check timed out")
             return False
             
         except Exception as e:
             logger.error(f"Blockfrost health check failed: {e}")
             await interaction.response.send_message(
-                "❌ Blockfrost API is experiencing issues. Please try again later.",
+                "❌ Blockfrost API is not available. Please try again later.",
                 ephemeral=True
             )
-            if hasattr(interaction.client, 'send_admin_alert'):
-                await interaction.client.send_admin_alert(f"⚠️ Blockfrost health check failed: {str(e)}")
+            if hasattr(interaction.client, 'admin_channel') and interaction.client.admin_channel:
+                await interaction.client.admin_channel.send(f"🚨 ERROR: Blockfrost health check failed: {e}")
             return False
         
     if func is None:
