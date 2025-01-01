@@ -1411,6 +1411,31 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Environment validation failed: {e}")
             return False
 
+    async def validate_and_init_dependencies(self):
+        """Validate and initialize all critical dependencies"""
+        try:
+            # Initialize database
+            await self.init_database()
+            logger.info("Database initialized")
+            
+            # Initialize Blockfrost client
+            await self.init_blockfrost()
+            logger.info("Blockfrost client initialized")
+            
+            # Initialize webhook server
+            await self.start_webhook()
+            logger.info("Webhook server initialized")
+            
+            # Start webhook processor
+            self._webhook_processor = asyncio.create_task(self._process_webhook_queue())
+            logger.info("Webhook processor started")
+            
+            logger.info("All dependencies initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize dependencies: {e}")
+            raise
+
     async def _check_yummi_balances(self):
         """Check YUMMI token balances with proper concurrency control"""
         # Use a task name based lock to prevent duplicate runs
