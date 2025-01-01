@@ -5,13 +5,16 @@ from discord.ext import commands, tasks
 from typing import Optional
 from database import (
     get_user_wallets,
-    add_wallet_for_user,
-    remove_wallet_for_user,
+    add_wallet,
+    remove_wallet,
     get_notification_settings,
     update_notification_setting,
     get_wallet_for_user,
     get_yummi_warning_count,
-    reset_yummi_warning
+    reset_yummi_warning,
+    validate_address,
+    get_stake_address,
+    update_stake_address
 )
 from decorators import dm_only, has_blockfrost, check_yummi_balance, command_cooldown
 from cardano.address_validation import validate_cardano_address
@@ -106,7 +109,7 @@ class WalletCommands(commands.Cog):
                 return
 
             # Add wallet to database
-            success = await add_wallet_for_user(str(interaction.user.id), address)
+            success = await add_wallet(str(interaction.user.id), address)
             
             if success:
                 await interaction.followup.send(
@@ -151,7 +154,7 @@ class WalletCommands(commands.Cog):
             
             # Remove wallet from database
             try:
-                await remove_wallet_for_user(str(interaction.user.id), address)
+                await remove_wallet(str(interaction.user.id), address)
                 await interaction.followup.send(
                     f"✅ Successfully removed wallet from monitoring: `{address}`",
                     ephemeral=True
