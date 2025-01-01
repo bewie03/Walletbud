@@ -586,237 +586,145 @@ END $$;
 """
 
 # Database version tracking
-CURRENT_VERSION = 3
+CURRENT_VERSION = 4
 
-# Migration scripts
+# Migration SQL statements
 MIGRATIONS = {
     1: """
-    -- Version 1: Initial schema
-    INSERT INTO db_version (version) VALUES ($1);
+        -- Initial schema
+        CREATE TABLE IF NOT EXISTS migration_history (
+            version INTEGER PRIMARY KEY,
+            applied_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            success BOOLEAN DEFAULT TRUE
+        );
+        
+        CREATE TABLE IF NOT EXISTS db_version (
+            version INTEGER PRIMARY KEY,
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
     """,
-    2: [
-        """
-        -- Version 2: Add last_policy_check column to wallets table
-        ALTER TABLE wallets
-        ADD COLUMN IF NOT EXISTS last_policy_check TIMESTAMP;
-        """,
-        """
-        UPDATE db_version SET version = $1;
-        """
-    ],
-    3: [
-        """
-        -- Version 3: Remove asset_history column from notification_settings table
-        ALTER TABLE notification_settings 
-        DROP COLUMN IF EXISTS asset_history;
-        """,
-        """
-        UPDATE db_version SET version = $1;
-        """
-    ]
+    2: """
+        -- Add delegation_pool column if it doesn't exist
+        DO $$ 
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 
+                FROM information_schema.columns 
+                WHERE table_name = 'wallets' 
+                AND column_name = 'delegation_pool'
+            ) THEN
+                ALTER TABLE wallets ADD COLUMN delegation_pool TEXT;
+                CREATE INDEX IF NOT EXISTS idx_wallets_delegation_pool ON wallets(delegation_pool);
+            END IF;
+        END $$;
+    """,
+    3: """
+        -- Add last_policy_check column if it doesn't exist
+        DO $$ 
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 
+                FROM information_schema.columns 
+                WHERE table_name = 'wallets' 
+                AND column_name = 'last_policy_check'
+            ) THEN
+                ALTER TABLE wallets ADD COLUMN last_policy_check TIMESTAMP WITH TIME ZONE;
+            END IF;
+        END $$;
+    """,
+    4: """
+        -- Add monitoring_since column if it doesn't exist
+        DO $$ 
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 
+                FROM information_schema.columns 
+                WHERE table_name = 'wallets' 
+                AND column_name = 'monitoring_since'
+            ) THEN
+                ALTER TABLE wallets ADD COLUMN monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+            END IF;
+        END $$;
+    """
 }
 
 async def get_db_version(conn) -> int:
     """Get current database version"""
     try:
-        # Check if version table exists
-        exists = await conn.fetchval("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                AND table_name = 'db_version'
+        async with conn.transaction():
+            result = await conn.fetchrow(
+                "SELECT version FROM db_version ORDER BY version DESC LIMIT 1"
             )
-        """)
-        
-        if not exists:
-            return 0
-            
-        version = await conn.fetchval("SELECT version FROM db_version")
-        return version or 0
-            
+            return result['version'] if result else 0
     except Exception as e:
-        logger.error(f"Failed to get database version: {str(e)}")
+        logger.error(f"Error getting database version: {e}")
         return 0
 
-async def check_database_schema(conn) -> None:
-    """Verify database schema including tables, columns, constraints and indices
-    
-    Raises:
-        DatabaseError: If schema verification fails
-    """
-    try:
-        # Check tables
-        tables = await conn.fetch("""
-            SELECT table_name, column_name, data_type, 
-                   is_nullable, column_default,
-                   character_maximum_length
-            FROM information_schema.columns 
-            WHERE table_schema = 'public'
-            ORDER BY table_name, ordinal_position
-        """)
-        
-        # Check constraints
-        constraints = await conn.fetch("""
-            SELECT tc.table_name, tc.constraint_name, tc.constraint_type,
-                   kcu.column_name
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu 
-                ON tc.constraint_name = kcu.constraint_name
-            WHERE tc.table_schema = 'public'
-        """)
-        
-        # Check indices
-        indices = await conn.fetch("""
-            SELECT schemaname, tablename, indexname, indexdef
-            FROM pg_indexes
-            WHERE schemaname = 'public'
-        """)
-        
-        # Validate expected schema
-        expected_tables = {
-            'wallets': {
-                'columns': {'id', 'user_id', 'address', 'stake_address', 'created_at'},
-                'constraints': {'wallets_pkey', 'wallets_address_key'},
-                'indices': {'idx_wallets_user_id', 'idx_wallets_address'}
-            },
-            'notification_settings': {
-                'columns': {'user_id', 'ada_transactions', 'token_transfers', 
-                          'nft_updates', 'delegation_status', 'policy_updates'},
-                'constraints': {'notification_settings_pkey'},
-                'indices': {'idx_notification_settings_user_id'}
-            },
-            # Add other tables here
-        }
-        
-        # Verify tables and columns
-        found_tables = {t['table_name'] for t in tables}
-        for table, expected in expected_tables.items():
-            if table not in found_tables:
-                raise DatabaseError(f"Missing required table: {table}")
-                
-            found_columns = {t['column_name'] for t in tables if t['table_name'] == table}
-            missing_columns = expected['columns'] - found_columns
-            if missing_columns:
-                raise DatabaseError(f"Missing columns in {table}: {missing_columns}")
-                
-        # Verify constraints
-        for table, expected in expected_tables.items():
-            found_constraints = {c['constraint_name'] for c in constraints 
-                              if c['table_name'] == table}
-            missing_constraints = expected['constraints'] - found_constraints
-            if missing_constraints:
-                raise DatabaseError(f"Missing constraints in {table}: {missing_constraints}")
-                
-        # Verify indices
-        for table, expected in expected_tables.items():
-            found_indices = {i['indexname'] for i in indices if i['tablename'] == table}
-            missing_indices = expected['indices'] - found_indices
-            if missing_indices:
-                raise DatabaseError(f"Missing indices in {table}: {missing_indices}")
-                
-        logger.info("Database schema verification completed successfully")
-        
-    except asyncpg.PostgresError as e:
-        raise DatabaseError(f"Schema verification failed: {str(e)}")
-        
-    except Exception as e:
-        raise DatabaseError(f"Unexpected error during schema verification: {str(e)}")
-
-async def run_migrations(conn) -> None:
-    """Run database migrations with proper error handling and validation
-    
-    Raises:
-        DatabaseError: If migrations fail
-    """
+async def run_migration(conn, version: int, sql: str) -> bool:
+    """Run a single migration"""
     try:
         async with conn.transaction():
-            # Ensure version tables exist
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS db_version (
-                    version INTEGER NOT NULL,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (version)
-                );
-            """)
+            # Run the migration
+            await conn.execute(sql)
             
-            # Get current version
-            try:
-                current_version = await conn.fetchval("""
-                    SELECT version FROM db_version 
-                    ORDER BY updated_at DESC LIMIT 1
-                """)
-            except asyncpg.UndefinedTableError:
-                # If table doesn't exist, start from version 0
-                current_version = 0
-                await conn.execute("""
-                    INSERT INTO db_version (version) VALUES (0)
-                """)
+            # Record migration
+            await conn.execute(
+                """
+                INSERT INTO migration_history (version, applied_at, success)
+                VALUES ($1, NOW(), TRUE)
+                """,
+                version
+            )
             
-            if current_version is None:
-                current_version = 0
-                await conn.execute("""
-                    INSERT INTO db_version (version) VALUES (0)
-                """)
-                
-            # Get all migrations after current version
-            pending_migrations = {v: sql for v, sql in MIGRATIONS.items() 
-                               if v > current_version}
+            # Update db version
+            await conn.execute(
+                """
+                INSERT INTO db_version (version, updated_at)
+                VALUES ($1, NOW())
+                ON CONFLICT (version) 
+                DO UPDATE SET updated_at = NOW()
+                """,
+                version
+            )
             
-            if not pending_migrations:
-                logger.info(f"Database is up to date at version {current_version}")
-                return
-                
-            # Run migrations in version order
-            for version in sorted(pending_migrations.keys()):
-                logger.info(f"Running migration to version {version}")
-                
-                # Start migration
-                await conn.execute("""
-                    INSERT INTO migration_history (version, started_at)
-                    VALUES ($1, CURRENT_TIMESTAMP)
-                """, version)
-                
-                try:
-                    # Run migration SQL
-                    await conn.execute(pending_migrations[version], version)
-                    
-                    # Update version
-                    await conn.execute("""
-                        UPDATE db_version SET version = $1, 
-                        updated_at = CURRENT_TIMESTAMP
-                        WHERE version = $2
-                    """, version, current_version)
-                    
-                    # Mark migration as completed
-                    await conn.execute("""
-                        UPDATE migration_history 
-                        SET completed_at = CURRENT_TIMESTAMP,
-                            success = true
-                        WHERE version = $1
-                    """, version)
-                    
-                    logger.info(f"Successfully migrated to version {version}")
-                    current_version = version
-                    
-                except Exception as e:
-                    # Log migration failure
-                    await conn.execute("""
-                        UPDATE migration_history 
-                        SET completed_at = CURRENT_TIMESTAMP,
-                            success = false,
-                            error = $2
-                        WHERE version = $1
-                    """, version, str(e))
-                    
-                    raise DatabaseError(
-                        f"Migration to version {version} failed: {str(e)}"
-                    )
-                    
-    except asyncpg.PostgresError as e:
-        raise DatabaseError(f"Database migration failed: {str(e)}")
-        
+            logger.info(f"Successfully applied migration {version}")
+            return True
     except Exception as e:
-        raise DatabaseError(f"Unexpected error during migration: {str(e)}")
+        logger.error(f"Error applying migration {version}: {e}")
+        return False
+
+async def migrate_database(conn) -> bool:
+    """Run all pending migrations"""
+    try:
+        current_version = await get_db_version(conn)
+        logger.info(f"Current database version: {current_version}")
+        
+        # Run each pending migration in order
+        for version in range(current_version + 1, CURRENT_VERSION + 1):
+            if version in MIGRATIONS:
+                logger.info(f"Applying migration {version}...")
+                if not await run_migration(conn, version, MIGRATIONS[version]):
+                    raise DatabaseError(f"Migration {version} failed")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Database migration failed: {e}")
+        raise DatabaseError(f"Database migration failed: {e}")
+
+async def init_db():
+    """Initialize database and run migrations"""
+    try:
+        # Create initial pool
+        pool = await get_pool()
+        
+        # Run migrations
+        await migrate_database(pool)
+        
+        logger.info("Database initialization and migration completed successfully")
+        return pool
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        raise DatabaseError(f"Database initialization failed: {e}")
 
 async def add_transaction(wallet_id: int, tx_hash: str, metadata: dict = None) -> bool:
     """Add a transaction to the database with metadata
@@ -1742,8 +1650,7 @@ async def update_delegation_status(address: str, pool_id: str):
                 ON CONFLICT (address) DO UPDATE
                 SET pool_id = $2
                 """,
-                address,
-                pool_id
+                address, pool_id
             )
             return True
         
@@ -1797,8 +1704,7 @@ async def update_policy_expiry(policy_id: str, expiry_slot: int):
                 ON CONFLICT (policy_id) DO UPDATE
                 SET expiry_slot = $2
                 """,
-                policy_id,
-                expiry_slot
+                policy_id, expiry_slot
             )
             return True
         

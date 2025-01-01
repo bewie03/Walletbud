@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from ipaddress import ip_network
+import json
 
 # Environment and logging configuration
 ENV = os.getenv('ENV', 'development')
@@ -1117,3 +1118,81 @@ logger.info(
     f"  WEBHOOK_AUTH_TOKEN: {'*' * 8}\n"
     f"  WEBHOOK_CONFIRMATIONS: {WEBHOOK_CONFIRMATIONS}\n"
 )
+
+def validate_config():
+    """Validate entire configuration with proper fallbacks"""
+    errors = []
+    warnings = []
+    
+    # Critical environment variables that must be present
+    critical_vars = {
+        'DISCORD_TOKEN': 'Discord bot token is required',
+        'DATABASE_URL': 'Database URL is required',
+        'BLOCKFROST_PROJECT_ID': 'Blockfrost project ID is required',
+    }
+    
+    # Optional environment variables with defaults
+    optional_vars = {
+        'PORT': ('8080', int),
+        'MAX_REQUESTS_PER_SECOND': ('10', int),
+        'BURST_LIMIT': ('50', int),
+        'RATE_LIMIT_COOLDOWN': ('30', int),
+        'MAX_RETRIES': ('3', int),
+        'BATCH_SIZE': ('1000', int),
+        'MAINTENANCE_HOUR': ('2', int),
+        'MAINTENANCE_MINUTE': ('0', int),
+        'LOG_LEVEL': ('INFO', str),
+        'WEBHOOK_TIMEOUT': ('30', int),
+        'MINIMUM_YUMMI': ('1000', int)
+    }
+    
+    # Validate critical variables
+    for var, message in critical_vars.items():
+        value = os.getenv(var)
+        if not value:
+            errors.append(f"Missing {message}")
+        else:
+            try:
+                if var == 'DISCORD_TOKEN':
+                    validate_discord_token(value, var)
+                elif var == 'DATABASE_URL':
+                    validate_database_url(value, var)
+                elif var == 'BLOCKFROST_PROJECT_ID':
+                    validate_blockfrost_project_id(value, var)
+            except ValueError as e:
+                errors.append(f"Invalid {var}: {str(e)}")
+    
+    # Set defaults for optional variables
+    for var, (default, type_func) in optional_vars.items():
+        try:
+            value = os.getenv(var, default)
+            if type_func == int:
+                value = int(value)
+                if value < 0:
+                    raise ValueError("Value must be non-negative")
+            os.environ[var] = str(value)
+        except ValueError as e:
+            warnings.append(f"Invalid {var}, using default {default}: {str(e)}")
+            os.environ[var] = default
+    
+    # Database SSL configuration
+    db_url = os.getenv('DATABASE_URL', '')
+    if 'sslmode=require' not in db_url.lower():
+        warnings.append("Database URL does not enforce SSL. Adding sslmode=require")
+        if '?' in db_url:
+            os.environ['DATABASE_URL'] = f"{db_url}&sslmode=require"
+        else:
+            os.environ['DATABASE_URL'] = f"{db_url}?sslmode=require"
+    
+    # Log warnings and errors
+    if warnings:
+        logger.warning("Configuration warnings:\n" + "\n".join(f"- {w}" for w in warnings))
+    
+    if errors:
+        error_msg = "Configuration errors:\n" + "\n".join(f"- {e}" for e in errors)
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+    
+    logger.info("Configuration validated successfully")
+
+validate_config()

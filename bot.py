@@ -285,8 +285,7 @@ class WalletBudBot(commands.Bot):
         self.check_yummi_balances = tasks.loop(hours=6)(self._check_yummi_balances)
         
         # Initialize SSL context with certificate verification enabled
-        import ssl
-        self.ssl_context = ssl.create_default_context()
+        self.ssl_context = init_ssl_context()
         
         # Initialize aiohttp connector with default settings
         self.connector = aiohttp.TCPConnector(ssl=self.ssl_context, limit=100)
@@ -1581,19 +1580,28 @@ class WalletBudBot(commands.Bot):
         return True
 
     async def init_ssl_context(self) -> bool:
-        """Initialize SSL context with proper error handling"""
+        """Initialize SSL context with proper security settings"""
         try:
-            self.ssl_context = ssl.create_default_context(cafile=certifi.where())
-            self.connector = aiohttp.TCPConnector(
-                ssl=self.ssl_context,
-                enable_cleanup_closed=True,
-                force_close=True,
-                limit=100  # Connection pool limit
+            # Create SSL context with strong security settings
+            ssl_context = ssl.create_default_context(
+                purpose=ssl.Purpose.SERVER_AUTH,
+                cafile=certifi.where()
             )
-            return True
+            
+            # Set minimum TLS version to 1.2
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+            
+            # Enable certificate verification
+            ssl_context.verify_mode = ssl.CERT_REQUIRED
+            ssl_context.check_hostname = True
+            
+            # Disable weak ciphers
+            ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20')
+            
+            return ssl_context
         except Exception as e:
-            logger.error(f"Failed to initialize SSL context: {e}", exc_info=True)
-            return False
+            logger.error(f"Failed to initialize SSL context: {e}")
+            raise RuntimeError(f"SSL context initialization failed: {e}")
 
     def init_rate_limiters(self):
         """Initialize rate limiters for different services"""

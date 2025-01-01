@@ -148,6 +148,7 @@ class RateLimiter:
 
 class WebhookQueue:
     """Queue for processing webhooks with rate limiting and retries"""
+    
     def __init__(self):
         """Initialize the webhook queue"""
         self.queue = deque(maxlen=MAX_QUEUE_SIZE)
@@ -169,8 +170,164 @@ class WebhookQueue:
             'processing_time_avg': 0.0,
             'retry_success_rate': 0.0
         }
-        self.event_handlers: Dict[str, Callable] = {}
+        self.event_handlers = {}
+        self._shutdown = False
+        self._cleanup_task = None
         
+    async def start(self):
+        """Start the webhook queue processor"""
+        self._shutdown = False
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        await self.process_queue()
+        
+    async def stop(self):
+        """Stop the webhook queue processor"""
+        self._shutdown = True
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        
+    async def _cleanup_loop(self):
+        """Periodically clean up old events"""
+        while not self._shutdown:
+            try:
+                await self.clear_old_events()
+                await asyncio.sleep(60)  # Run cleanup every minute
+            except Exception as e:
+                logger.error(f"Error in cleanup loop: {e}")
+                await asyncio.sleep(5)  # Short delay on error
+                
+    async def add_event(self, event_id: str, event_type: str,
+                       payload: Dict[str, Any], headers: Dict[str, str]) -> bool:
+        """Add new event to queue with validation"""
+        try:
+            # Validate event size
+            event_size = len(json.dumps(payload))
+            if event_size > MAX_WEBHOOK_SIZE:
+                self._add_error('oversized_payload', 
+                              f'Payload size {event_size} exceeds limit {MAX_WEBHOOK_SIZE}',
+                              event_id)
+                self.stats['total_oversized'] += 1
+                return False
+            
+            # Validate event type and payload
+            if not self._validate_event(event_type, payload):
+                self._add_error('invalid_payload', 
+                              'Invalid event payload',
+                              event_id)
+                self.stats['total_invalid'] += 1
+                return False
+            
+            # Check queue capacity
+            async with self.queue_lock:
+                if len(self.queue) >= MAX_QUEUE_SIZE:
+                    self._add_error('queue_full',
+                                  f'Queue full ({MAX_QUEUE_SIZE} events)',
+                                  event_id)
+                    return False
+                
+                # Add event to queue
+                event = WebhookEvent(
+                    id=event_id,
+                    event_type=event_type,
+                    payload=payload,
+                    headers=headers,
+                    created_at=datetime.now()
+                )
+                self.queue.append(event)
+                self.stats['total_received'] += 1
+                self.stats['current_queue_size'] = len(self.queue)
+                
+                # Start processing if not already running
+                if not self.processing:
+                    asyncio.create_task(self.process_queue())
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error adding event {event_id}: {e}")
+            self._add_error('add_event_error',
+                          f'Error adding event: {str(e)}',
+                          event_id)
+            return False
+            
+    async def process_queue(self):
+        """Process events in queue with batching and error handling"""
+        if self.processing:
+            return
+            
+        async with self.process_lock:
+            try:
+                self.processing = True
+                while self.queue and not self._shutdown:
+                    # Process events in batches
+                    batch = []
+                    async with self.queue_lock:
+                        while len(batch) < BATCH_SIZE and self.queue:
+                            event = self.queue.popleft()
+                            if event.age_seconds > MAX_EVENT_AGE:
+                                self._add_error('event_expired',
+                                              f'Event expired after {event.age_seconds}s',
+                                              event.id)
+                                continue
+                            batch.append(event)
+                            
+                    # Process batch
+                    for event in batch:
+                        try:
+                            # Check rate limit
+                            if not await self.rate_limiter.is_allowed(event.headers.get('X-Forwarded-For', 'unknown')):
+                                self.queue.append(event)  # Re-queue for later
+                                self.stats['total_rate_limited'] += 1
+                                continue
+                                
+                            # Process event
+                            handler = self.event_handlers.get(event.event_type)
+                            if handler:
+                                start_time = time.time()
+                                await handler(event.payload)
+                                process_time = time.time() - start_time
+                                
+                                # Update stats
+                                self.stats['total_processed'] += 1
+                                self.stats['last_process_time'] = process_time
+                                self.stats['processing_time_avg'] = (
+                                    (self.stats['processing_time_avg'] * 
+                                     (self.stats['total_processed'] - 1) +
+                                     process_time) / self.stats['total_processed']
+                                )
+                            else:
+                                self._add_error('no_handler',
+                                              f'No handler for event type: {event.event_type}',
+                                              event.id)
+                                
+                        except Exception as e:
+                            logger.error(f"Error processing event {event.id}: {e}")
+                            if event.retries < MAX_RETRIES:
+                                event.retries += 1
+                                event.last_retry = datetime.now()
+                                event.error = str(e)
+                                self.queue.append(event)  # Retry later
+                                self.stats['total_retried'] += 1
+                            else:
+                                self._add_error('max_retries',
+                                              f'Max retries ({MAX_RETRIES}) exceeded',
+                                              event.id,
+                                              {'error': str(e)})
+                                self.stats['total_failed'] += 1
+                                
+                    # Update queue size
+                    self.stats['current_queue_size'] = len(self.queue)
+                    
+                    # Small delay between batches
+                    await asyncio.sleep(0.1)
+                    
+            finally:
+                self.processing = False
+
     def register_handler(self, event_type: str, handler: Callable):
         """Register handler for event type"""
         self.event_handlers[event_type] = handler
@@ -253,123 +410,6 @@ class WebhookQueue:
         self.errors.append(error)
         logger.error(f"Queue error: {error_type} - {message}")
         
-    async def add_event(self, event_id: str, event_type: str,
-                       payload: Dict[str, Any], headers: Dict[str, str]) -> bool:
-        """Add new event to queue with validation"""
-        try:
-            async with self.queue_lock:
-                if len(self.queue) >= MAX_QUEUE_SIZE:
-                    self._add_error('queue_full', f'Queue full ({MAX_QUEUE_SIZE} events)')
-                    self.stats['total_failed'] += 1
-                    return False
-                    
-                # Validate event
-                if not await self._validate_event(event_type, payload):
-                    self.stats['total_invalid'] += 1
-                    return False
-                    
-                # Create and add event
-                event = WebhookEvent(
-                    id=event_id,
-                    event_type=event_type,
-                    payload=payload,
-                    headers=headers,
-                    created_at=datetime.now()
-                )
-                
-                self.queue.append(event)
-                self.stats['total_received'] += 1
-                self.stats['current_queue_size'] = len(self.queue)
-                
-                logger.info(f"Added event {event_id} to queue (size: {len(self.queue)})")
-                return True
-                
-        except Exception as e:
-            self._add_error('add_event_error', str(e), event_id)
-            return False
-            
-    async def process_queue(self, handler: Optional[Callable] = None):
-        """Process events in queue with batching and error handling"""
-        if self.processing:
-            return
-            
-        try:
-            async with self.process_lock:
-                self.processing = True
-                start_time = time.time()
-                
-                while self.queue:
-                    # Process events in batches
-                    batch = []
-                    async with self.queue_lock:
-                        while len(batch) < BATCH_SIZE and self.queue:
-                            event = self.queue.popleft()
-                            if event.should_retry or event.retries == 0:
-                                batch.append(event)
-                            else:
-                                self._add_error('max_retries', 
-                                              f'Event {event.id} exceeded max retries',
-                                              event.id)
-                                self.stats['total_failed'] += 1
-                                
-                    if not batch:
-                        continue
-                        
-                    # Process batch
-                    for event in batch:
-                        try:
-                            # Use registered handler or fallback
-                            event_handler = self.event_handlers.get(
-                                event.event_type,
-                                handler
-                            )
-                            
-                            if not event_handler:
-                                raise ValueError(f"No handler for event type: {event.event_type}")
-                                
-                            await event_handler(event.payload)
-                            
-                            self.stats['total_processed'] += 1
-                            if event.retries > 0:
-                                self.stats['retry_success_rate'] = (
-                                    self.stats['total_processed'] /
-                                    (self.stats['total_processed'] + self.stats['total_failed'])
-                                )
-                                
-                        except Exception as e:
-                            event.retries += 1
-                            event.last_retry = datetime.now()
-                            event.error = str(e)
-                            
-                            if event.should_retry:
-                                async with self.queue_lock:
-                                    self.queue.append(event)
-                                self.stats['total_retried'] += 1
-                            else:
-                                self._add_error('processing_failed',
-                                              f'Failed to process event: {str(e)}',
-                                              event.id)
-                                self.stats['total_failed'] += 1
-                                
-                    # Update stats
-                    self.stats['current_queue_size'] = len(self.queue)
-                    self.stats['last_process_time'] = datetime.now().isoformat()
-                    
-                    # Calculate average processing time
-                    process_time = time.time() - start_time
-                    self.stats['processing_time_avg'] = (
-                        self.stats['processing_time_avg'] * 0.9 +
-                        process_time * 0.1
-                    )
-                    
-                    # Avoid blocking event loop
-                    await asyncio.sleep(0)
-                    
-        except Exception as e:
-            self._add_error('queue_processing_error', str(e))
-        finally:
-            self.processing = False
-            
     async def clear_old_events(self) -> int:
         """Clear events older than MAX_EVENT_AGE"""
         cleared = 0
