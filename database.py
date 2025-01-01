@@ -10,7 +10,16 @@ from dotenv import load_dotenv
 import re
 import ssl
 import certifi
-from config import DB_CONFIG
+from config import (
+    DB_CONFIG,
+    MAX_RETRIES,
+    RATE_LIMIT_COOLDOWN,
+    RATE_LIMIT_WINDOW,
+    RATE_LIMIT_MAX_REQUESTS,
+    BATCH_SIZE,
+    ARCHIVE_AFTER_DAYS,
+    DELETE_AFTER_DAYS
+)
 
 # Load environment variables
 load_dotenv()

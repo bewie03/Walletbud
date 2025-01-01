@@ -524,8 +524,8 @@ ENV_VARS = {
     ),
     'COMMAND_COOLDOWN': EnvVar(
         name='COMMAND_COOLDOWN',
-        description="Command cooldown in seconds",
-        default="60",
+        description="Cooldown between command uses (seconds)",
+        default="5",
         validator=validate_positive_int,
         required=False
     ),
@@ -583,7 +583,49 @@ ENV_VARS = {
         default="3",
         validator=validate_positive_int,
         required=False
-    )
+    ),
+    'ARCHIVE_AFTER_DAYS': EnvVar(
+        name='ARCHIVE_AFTER_DAYS',
+        description="Days after which to archive transactions",
+        default="30",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'DELETE_AFTER_DAYS': EnvVar(
+        name='DELETE_AFTER_DAYS',
+        description="Days after which to delete archived transactions",
+        default="90",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'MAINTENANCE_BATCH_SIZE': EnvVar(
+        name='MAINTENANCE_BATCH_SIZE',
+        description="Number of records to process in each maintenance batch",
+        default="1000",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'MAINTENANCE_MAX_RETRIES': EnvVar(
+        name='MAINTENANCE_MAX_RETRIES',
+        description="Maximum number of retries for maintenance tasks",
+        default="3",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'MAINTENANCE_HOUR': EnvVar(
+        name='MAINTENANCE_HOUR',
+        description="Hour of the day to run maintenance (0-23)",
+        default="3",
+        validator=validate_hour,
+        required=False
+    ),
+    'MAINTENANCE_MINUTE': EnvVar(
+        name='MAINTENANCE_MINUTE',
+        description="Minute of the hour to run maintenance (0-59)",
+        default="0",
+        validator=validate_minute,
+        required=False
+    ),
 }
 
 # Export configuration variables
@@ -593,53 +635,23 @@ ADMIN_CHANNEL_ID = ENV_VARS['ADMIN_CHANNEL_ID'].get_value()
 BLOCKFROST_PROJECT_ID = ENV_VARS['BLOCKFROST_PROJECT_ID'].get_value()
 BLOCKFROST_BASE_URL = ENV_VARS['BLOCKFROST_BASE_URL'].get_value()
 WEBHOOK_SECRET = ENV_VARS['WEBHOOK_SECRET'].get_value()
-
-# Rate limiting configuration
 MAX_REQUESTS_PER_SECOND = ENV_VARS['MAX_REQUESTS_PER_SECOND'].get_value()
 BURST_LIMIT = ENV_VARS['BURST_LIMIT'].get_value()
 RATE_LIMIT_COOLDOWN = ENV_VARS['RATE_LIMIT_COOLDOWN'].get_value()
-
-# Rate limiting and queue configuration
 RATE_LIMIT_WINDOW = ENV_VARS['RATE_LIMIT_WINDOW'].get_value()
 RATE_LIMIT_MAX_REQUESTS = ENV_VARS['RATE_LIMIT_MAX_REQUESTS'].get_value()
 MAX_QUEUE_SIZE = ENV_VARS['MAX_QUEUE_SIZE'].get_value()
 MAX_RETRIES = ENV_VARS['MAX_RETRIES'].get_value()
 MAX_EVENT_AGE = ENV_VARS['MAX_EVENT_AGE'].get_value()
 BATCH_SIZE = ENV_VARS['BATCH_SIZE'].get_value()
-MAX_WEBHOOK_SIZE = ENV_VARS['MAX_WEBHOOK_SIZE'].get_value()
-WEBHOOK_RATE_LIMIT = ENV_VARS['WEBHOOK_RATE_LIMIT'].get_value()
-PROCESS_INTERVAL = ENV_VARS['PROCESS_INTERVAL'].get_value()
-MAX_ERROR_HISTORY = ENV_VARS['MAX_ERROR_HISTORY'].get_value()
-
-# Wallet monitoring configuration
-WALLET_CHECK_INTERVAL = ENV_VARS['WALLET_CHECK_INTERVAL'].get_value()
-MIN_ADA_BALANCE = ENV_VARS['MIN_ADA_BALANCE'].get_value()
-MAX_TX_PER_HOUR = ENV_VARS['MAX_TX_PER_HOUR'].get_value()
-
-# YUMMI token configuration
+COMMAND_COOLDOWN = ENV_VARS['COMMAND_COOLDOWN'].get_value()
 MINIMUM_YUMMI = ENV_VARS['MINIMUM_YUMMI'].get_value()
-YUMMI_POLICY_ID = ENV_VARS['YUMMI_POLICY_ID'].get_value()
-YUMMI_TOKEN_NAME = ENV_VARS['YUMMI_TOKEN_NAME'].get_value()
-ASSET_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}" if YUMMI_POLICY_ID and YUMMI_TOKEN_NAME else None
-WEBHOOK_IDENTIFIER = ENV_VARS['WEBHOOK_IDENTIFIER'].get_value()
-
-# Error configuration
-ERROR_MESSAGES = {
-    'rate_limit': 'Rate limit exceeded. Please try again later.',
-    'invalid_address': 'Invalid Cardano address provided.',
-    'network_error': 'Network error occurred. Please try again.',
-    'database_error': 'Database error occurred. Please try again.',
-    'invalid_token': 'Invalid token provided.',
-    'insufficient_balance': 'Insufficient balance for operation.',
-    'webhook_error': 'Error processing webhook.',
-    'invalid_signature': 'Invalid webhook signature.',
-    'maintenance': 'System is currently under maintenance.',
-    'timeout': 'Operation timed out.',
-    'unknown': 'An unknown error occurred.'
-}
-
-# Webhook configuration
-WEBHOOK_RETRY_ATTEMPTS = ENV_VARS['WEBHOOK_RETRY_ATTEMPTS'].get_value()
+ARCHIVE_AFTER_DAYS = ENV_VARS['ARCHIVE_AFTER_DAYS'].get_value()
+DELETE_AFTER_DAYS = ENV_VARS['DELETE_AFTER_DAYS'].get_value()
+MAINTENANCE_BATCH_SIZE = ENV_VARS['MAINTENANCE_BATCH_SIZE'].get_value()
+MAINTENANCE_MAX_RETRIES = ENV_VARS['MAINTENANCE_MAX_RETRIES'].get_value()
+MAINTENANCE_HOUR = ENV_VARS['MAINTENANCE_HOUR'].get_value()
+MAINTENANCE_MINUTE = ENV_VARS['MAINTENANCE_MINUTE'].get_value()
 
 # SSL configuration
 SSL_CERT_FILE = certifi.where()
@@ -655,6 +667,24 @@ DB_CONFIG = {
     'port': int(os.getenv('DB_PORT', '5432')),
     'ssl': SSL_CONFIG if os.getenv('DB_SSL', 'true').lower() == 'true' else None
 }
+
+DATABASE_POOL_MIN_SIZE = 10
+DATABASE_POOL_MAX_SIZE = 100
+DATABASE_MAX_QUERIES = 50000
+DATABASE_CONNECTION_TIMEOUT = 30
+DATABASE_COMMAND_TIMEOUT = 60
+
+# Database maintenance configuration
+ARCHIVE_AFTER_DAYS = ENV_VARS['ARCHIVE_AFTER_DAYS'].get_value()
+DELETE_AFTER_DAYS = ENV_VARS['DELETE_AFTER_DAYS'].get_value()
+MAINTENANCE_BATCH_SIZE = ENV_VARS['MAINTENANCE_BATCH_SIZE'].get_value()
+MAINTENANCE_MAX_RETRIES = ENV_VARS['MAINTENANCE_MAX_RETRIES'].get_value()
+MAINTENANCE_HOUR = ENV_VARS['MAINTENANCE_HOUR'].get_value()
+MAINTENANCE_MINUTE = ENV_VARS['MAINTENANCE_MINUTE'].get_value()
+
+# Discord embed limits
+EMBED_CHAR_LIMIT = 4096
+EMBED_FIELD_LIMIT = 25
 
 def validate_config():
     """Validate entire configuration"""
@@ -717,13 +747,3 @@ DB_CONFIG = {
     'MAX_RETRIES': int(os.getenv('DB_MAX_RETRIES', '3')),  # Maximum number of retries
     'RETRY_DELAY_BASE': int(os.getenv('DB_RETRY_DELAY_BASE', '2')),  # Base for exponential backoff
 }
-
-DATABASE_POOL_MIN_SIZE = 10
-DATABASE_POOL_MAX_SIZE = 100
-DATABASE_MAX_QUERIES = 50000
-DATABASE_CONNECTION_TIMEOUT = 30
-DATABASE_COMMAND_TIMEOUT = 60
-
-# Discord embed limits
-EMBED_CHAR_LIMIT = 4096
-EMBED_FIELD_LIMIT = 25

@@ -23,7 +23,6 @@ from config import (
     MAX_RETRIES,
     MAX_EVENT_AGE,
     BATCH_SIZE,
-    MAX_WEBHOOK_SIZE,
     WEBHOOK_SECRET
 )
 
@@ -119,7 +118,7 @@ class WebhookEvent:
 
 class RateLimiter:
     """Rate limiter for webhook requests with burst support"""
-    def __init__(self, window: int = RATE_LIMIT_WINDOW, max_requests: int = RATE_LIMIT_MAX_REQUESTS):
+    def __init__(self, window: int = 60, max_requests: int = 100):
         self.window = window
         self.max_requests = max_requests
         self.requests: Dict[str, List[datetime]] = {}
@@ -180,7 +179,7 @@ class WebhookQueue:
             secret: Optional webhook secret for validation
         """
         self.secret = secret
-        self.queue = deque(maxlen=MAX_QUEUE_SIZE)
+        self.queue = deque(maxlen=1000)
         self.processing = False
         self.process_lock = asyncio.Lock()
         self.queue_lock = asyncio.Lock()
@@ -235,9 +234,9 @@ class WebhookQueue:
         try:
             # Validate event size
             event_size = len(json.dumps(payload))
-            if event_size > MAX_WEBHOOK_SIZE:
+            if event_size > 100000:
                 self._add_error('oversized_payload', 
-                              f'Payload size {event_size} exceeds limit {MAX_WEBHOOK_SIZE}',
+                              f'Payload size {event_size} exceeds limit 100000',
                               event_id)
                 self.stats['total_oversized'] += 1
                 return False
@@ -252,9 +251,9 @@ class WebhookQueue:
             
             # Check queue capacity
             async with self.queue_lock:
-                if len(self.queue) >= MAX_QUEUE_SIZE:
+                if len(self.queue) >= 1000:
                     self._add_error('queue_full',
-                                  f'Queue full ({MAX_QUEUE_SIZE} events)',
+                                  f'Queue full ({1000} events)',
                                   event_id)
                     return False
                 
@@ -295,9 +294,9 @@ class WebhookQueue:
                     # Process events in batches
                     batch = []
                     async with self.queue_lock:
-                        while len(batch) < BATCH_SIZE and self.queue:
+                        while len(batch) < 100 and self.queue:
                             event = self.queue.popleft()
-                            if event.age_seconds > MAX_EVENT_AGE:
+                            if event.age_seconds > 3600:
                                 self._add_error('event_expired',
                                               f'Event expired after {event.age_seconds}s',
                                               event.id)
@@ -335,7 +334,7 @@ class WebhookQueue:
                                 
                         except Exception as e:
                             logger.error(f"Error processing event {event.id}: {e}")
-                            if event.retries < MAX_RETRIES:
+                            if event.retries < 5:
                                 event.retries += 1
                                 event.last_retry = datetime.now()
                                 event.error = str(e)
@@ -343,7 +342,7 @@ class WebhookQueue:
                                 self.stats['total_retried'] += 1
                             else:
                                 self._add_error('max_retries',
-                                              f'Max retries ({MAX_RETRIES}) exceeded',
+                                              f'Max retries ({5}) exceeded',
                                               event.id,
                                               {'error': str(e)})
                                 self.stats['total_failed'] += 1
@@ -395,7 +394,7 @@ class WebhookQueue:
         try:
             # Check payload size
             payload_size = len(json.dumps(payload))
-            if payload_size > MAX_WEBHOOK_SIZE:
+            if payload_size > 100000:
                 self._add_error('oversized_payload', f'Payload size {payload_size} exceeds limit')
                 return False
                 
@@ -408,7 +407,7 @@ class WebhookQueue:
             # Validate timestamp
             try:
                 event_time = datetime.fromisoformat(payload['timestamp'])
-                if abs((datetime.now() - event_time).total_seconds()) > MAX_EVENT_AGE:
+                if abs((datetime.now() - event_time).total_seconds()) > 3600:
                     self._add_error('invalid_timestamp', 'Event timestamp too old or future')
                     return False
             except ValueError:
@@ -450,7 +449,7 @@ class WebhookQueue:
         logger.error(f"Queue error: {error_type} - {message}")
         
     async def clear_old_events(self) -> int:
-        """Clear events older than MAX_EVENT_AGE"""
+        """Clear events older than 3600 seconds"""
         cleared = 0
         async with self.queue_lock:
             current_time = datetime.now()
@@ -458,7 +457,7 @@ class WebhookQueue:
             
             while self.queue:
                 event = self.queue.popleft()
-                if event.age_seconds <= MAX_EVENT_AGE:
+                if event.age_seconds <= 3600:
                     remaining_events.append(event)
                 else:
                     cleared += 1

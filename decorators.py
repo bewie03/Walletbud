@@ -6,7 +6,12 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Callable
 import traceback
-from config import MINIMUM_YUMMI
+from config import (
+    MINIMUM_YUMMI,
+    COMMAND_COOLDOWN as DEFAULT_COOLDOWN,
+    RATE_LIMIT_COOLDOWN,
+    MAX_RETRIES
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +118,7 @@ def has_blockfrost(func=None):
         return app_commands.check(predicate)
     return app_commands.check(predicate)(func)
 
-def command_cooldown(seconds: int = 60):
+def command_cooldown(seconds: int = DEFAULT_COOLDOWN):
     """Decorator to add cooldown to commands with proper cleanup"""
     def decorator(func: Callable):
         cooldowns: Dict[int, datetime] = {}
