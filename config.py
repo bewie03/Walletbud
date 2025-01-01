@@ -744,6 +744,19 @@ MAINTENANCE_MINUTE = ENV_VARS['MAINTENANCE_MINUTE'].get_value()
 EMBED_CHAR_LIMIT = 4096
 EMBED_FIELD_LIMIT = 25
 
+# Health check configuration
+HEALTH_CHECK_INTERVAL = 60  # seconds
+HEALTH_METRICS_TTL = 30     # seconds
+EMBED_CHAR_LIMIT = 1024     # Discord embed character limit
+
+# Command cooldowns (in seconds)
+COMMAND_COOLDOWN = 3
+
+# Balance check configuration
+BALANCE_CHECK_INTERVAL = 300  # 5 minutes
+YUMMI_WARNING_THRESHOLD = 3   # Number of warnings before reset
+MINIMUM_YUMMI = 1000         # Minimum YUMMI tokens required
+
 def validate_config():
     """Validate entire configuration"""
     errors = []
