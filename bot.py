@@ -1829,6 +1829,31 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Failed to initialize SSL context: {e}")
             raise RuntimeError(f"SSL context initialization failed: {e}")
 
+    async def monitor_health(self):
+        """Background task to monitor bot health and log issues"""
+        try:
+            # Check connections
+            await self.check_connections()
+            
+            # Check Blockfrost API
+            if self.blockfrost is None:
+                logger.warning("Blockfrost client not initialized")
+                await self.init_blockfrost()
+            
+            # Update health metrics
+            self.update_health_metrics('health_check')
+            
+            # Log any issues
+            if len(self.health_metrics['errors']) > 0:
+                logger.warning(f"Health check found {len(self.health_metrics['errors'])} issues")
+                
+                # Clear old errors after logging
+                self.health_metrics['errors'] = []
+                
+        except Exception as e:
+            logger.error(f"Error in health monitoring: {e}")
+            self.health_metrics['errors'].append(str(e))
+
 if __name__ == "__main__":
     try:
         # Configure logging for production
