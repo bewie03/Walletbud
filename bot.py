@@ -1079,10 +1079,10 @@ class WalletBudBot(commands.Bot):
             raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
             
         try:
-            # Initialize Blockfrost client with configured base URL
+            # Initialize Blockfrost client with configured base URL from environment
             self.blockfrost = BlockFrostApi(
                 project_id=BLOCKFROST_PROJECT_ID,
-                base_url='https://cardano-mainnet.blockfrost.io/api/v0'
+                base_url=BLOCKFROST_BASE_URL  # Use environment variable instead of hardcoded value
             )
             
             # Test connection by checking root endpoint first
