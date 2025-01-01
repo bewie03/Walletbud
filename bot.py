@@ -831,25 +831,24 @@ class WalletBudBot(commands.Bot):
     async def on_ready(self):
         """Called when the bot is ready and connected to Discord"""
         try:
-            logger.info(f"Logged in as {self.user.name} ({self.user.id})")
-            
-            # Update status with custom activity
+            # Set bot status
             activity = discord.Activity(
                 type=discord.ActivityType.watching,
                 name="Cardano wallets | /help"
             )
-            await self.change_presence(status=discord.Status.online, activity=activity)
+            await self.change_presence(activity=activity, status=discord.Status.online)
             logger.info("Bot status updated")
             
             # Update health metrics
-            self.update_health_metrics('start_time', datetime.now().isoformat())
+            await self.update_health_metrics('start_time', datetime.now().isoformat())
+            
+            # Log successful initialization
+            logger.info(f"Logged in as {self.user} ({self.user.id})")
             logger.info("Bot initialization complete")
             
         except Exception as e:
-            logger.error(f"Error in on_ready: {str(e)}", exc_info=True)
-            if self.admin_channel:
-                await self.admin_channel.send(f" Error during bot initialization: {str(e)}")
-
+            logger.error(f"Error in on_ready: {e}")
+            
     async def on_connect(self):
         """Called when the bot connects to Discord"""
         logger.info("Bot connected to Discord Gateway")
