@@ -1088,6 +1088,93 @@ EMBED_CHAR_LIMIT = 1024
 # Health check interval in seconds
 HEALTH_CHECK_INTERVAL = 60
 
+def validate_environment_variables():
+    """Validate all required environment variables
+    
+    Raises:
+        ValueError: If any required variable is missing or invalid
+    """
+    required_vars = {
+        'DISCORD_TOKEN': 'Discord bot token',
+        'APPLICATION_ID': 'Discord application ID',
+        'DATABASE_URL': 'Database URL',
+        'BLOCKFROST_PROJECT_ID': 'Blockfrost project ID',
+        'ADMIN_CHANNEL_ID': 'Admin channel ID',
+        'WEBHOOK_AUTH_TOKEN': 'Webhook authentication token',
+        'WEBHOOK_IDENTIFIER': 'Webhook identifier'
+    }
+    
+    optional_vars = {
+        'PORT': ('8080', int),
+        'MAX_REQUESTS_PER_SECOND': ('10', int),
+        'BURST_LIMIT': ('50', int),
+        'RATE_LIMIT_COOLDOWN': ('30', int),
+        'MAX_RETRIES': ('3', int),
+        'BATCH_SIZE': ('1000', int),
+        'MAINTENANCE_HOUR': ('2', int),
+        'MAINTENANCE_MINUTE': ('0', int),
+        'LOG_LEVEL': ('INFO', str),
+        'WEBHOOK_TIMEOUT': ('30', int),
+        'MINIMUM_YUMMI': ('1000', int),
+        'ARCHIVE_AFTER_DAYS': ('30', int),
+        'DELETE_AFTER_DAYS': ('90', int),
+        'MAINTENANCE_BATCH_SIZE': ('1000', int)
+    }
+    
+    missing_vars = []
+    invalid_vars = []
+    
+    # Check required variables
+    for var, description in required_vars.items():
+        value = os.getenv(var)
+        if not value:
+            missing_vars.append(f"{var} ({description})")
+            continue
+            
+        # Validate specific variables
+        try:
+            if var == 'DISCORD_TOKEN':
+                if not re.match(r'^[A-Za-z0-9_-]{24,}$', value):
+                    invalid_vars.append(f"{var}: Invalid token format")
+            elif var == 'APPLICATION_ID':
+                if not value.isdigit():
+                    invalid_vars.append(f"{var}: Must be a numeric ID")
+            elif var == 'DATABASE_URL':
+                if not value.startswith(('postgresql://', 'postgres://')):
+                    invalid_vars.append(f"{var}: Must be a PostgreSQL URL")
+            elif var == 'ADMIN_CHANNEL_ID':
+                if not value.isdigit():
+                    invalid_vars.append(f"{var}: Must be a numeric ID")
+        except Exception as e:
+            invalid_vars.append(f"{var}: {str(e)}")
+    
+    # Set defaults for optional variables
+    for var, (default, type_func) in optional_vars.items():
+        try:
+            value = os.getenv(var, default)
+            if type_func == int:
+                value = int(value)
+                if value < 0:
+                    raise ValueError("Must be non-negative")
+            os.environ[var] = str(value)
+        except ValueError as e:
+            invalid_vars.append(f"{var}: {str(e)}")
+            os.environ[var] = default
+    
+    # Raise error if any variables are missing or invalid
+    if missing_vars or invalid_vars:
+        error_msg = []
+        if missing_vars:
+            error_msg.append("Missing required environment variables:\n- " + 
+                           "\n- ".join(missing_vars))
+        if invalid_vars:
+            error_msg.append("Invalid environment variables:\n- " + 
+                           "\n- ".join(invalid_vars))
+        raise ValueError("\n\n".join(error_msg))
+
+# Validate environment variables on import
+validate_environment_variables()
+
 # Load configuration
 logger.info(
     "Loaded configuration:\n"

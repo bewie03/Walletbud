@@ -49,24 +49,25 @@ _max_errors = 3  # Max errors before forcing pool recreation
 
 async def get_pool():
     """Get database connection pool with Heroku PostgreSQL SSL configuration"""
-    global _pool, _pool_creation_time, _error_count, _last_error_time
-    
-    try:
-        async with _pool_lock:
+    global _pool, _pool_creation_time, _last_error_time, _error_count
+
+    async with _pool_lock:
+        try:
+            # Check if pool needs recreation
             current_time = datetime.now()
             
-            # Check if we need to recreate the pool
+            # Calculate pool age and error conditions
+            pool_age = (current_time - _pool_creation_time) if _pool_creation_time else timedelta.max
+            error_window = (current_time - _last_error_time) if _last_error_time else timedelta.max
+            
             should_recreate = (
-                not _pool or
-                not _pool_creation_time or
-                current_time - _pool_creation_time > _pool_max_age or
-                (_error_count >= _max_errors and 
-                 _last_error_time and 
-                 current_time - _last_error_time < _error_threshold)
+                not _pool or  # No pool exists
+                pool_age > _pool_max_age or  # Pool is too old
+                (_error_count >= _max_errors and error_window < _error_threshold)  # Too many recent errors
             )
             
             if should_recreate:
-                logger.info("Creating new database connection pool")
+                logger.info("Recreating database connection pool")
                 
                 # Clean up old pool if it exists
                 if _pool:
@@ -75,51 +76,43 @@ async def get_pool():
                     except Exception as e:
                         logger.warning(f"Error closing old pool: {e}")
                 
-                try:
-                    # Parse DATABASE_URL
-                    db_url = os.getenv('DATABASE_URL')
-                    if not db_url:
-                        raise ValueError("DATABASE_URL environment variable not set")
-                    
-                    # Convert postgres:// to postgresql:// if needed
-                    if db_url.startswith('postgres://'):
-                        db_url = 'postgresql://' + db_url[len('postgres://'):]
-                    
-                    # Set up SSL context
-                    ssl_context = ssl.create_default_context(cafile=certifi.where())
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_NONE
-                    
-                    # Create new pool with proper configuration
-                    _pool = await asyncpg.create_pool(
-                        db_url,
-                        min_size=DB_CONFIG['MIN_POOL_SIZE'],
-                        max_size=DB_CONFIG['MAX_POOL_SIZE'],
-                        max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
-                        command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
-                        ssl=ssl_context,
-                        server_settings={
-                            'application_name': 'walletbud',
-                            'statement_timeout': str(DB_CONFIG['TRANSACTION_TIMEOUT'] * 1000),
-                            'idle_in_transaction_session_timeout': '300000'  # 5 minutes
-                        }
-                    )
-                    
-                    if not _pool:
-                        raise ConnectionError("Failed to create connection pool")
-                    
-                    # Reset error tracking on successful pool creation
-                    _pool_creation_time = current_time
-                    _error_count = 0
-                    _last_error_time = None
-                    
-                    logger.info("Successfully created new database connection pool")
-                    
-                except Exception as e:
-                    logger.error(f"Failed to create connection pool: {str(e)}")
-                    if hasattr(e, '__dict__'):
-                        logger.error(f"Error details: {e.__dict__}")
-                    raise ConnectionError(f"Database connection failed: {str(e)}")
+                # Create new pool
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                db_url = os.getenv('DATABASE_URL')
+                if not db_url:
+                    raise ValueError("DATABASE_URL environment variable not set")
+                
+                # Convert postgres:// to postgresql:// if needed
+                if db_url.startswith('postgres://'):
+                    db_url = 'postgresql://' + db_url[len('postgres://'):]
+                
+                # Create new pool with proper configuration
+                _pool = await asyncpg.create_pool(
+                    db_url,
+                    min_size=DB_CONFIG['MIN_POOL_SIZE'],
+                    max_size=DB_CONFIG['MAX_POOL_SIZE'],
+                    max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
+                    command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
+                    ssl=ssl_context,
+                    server_settings={
+                        'application_name': 'walletbud',
+                        'statement_timeout': str(DB_CONFIG['TRANSACTION_TIMEOUT'] * 1000),
+                        'idle_in_transaction_session_timeout': '300000'  # 5 minutes
+                    }
+                )
+                
+                if not _pool:
+                    raise ConnectionError("Failed to create connection pool")
+                
+                # Reset error tracking
+                _pool_creation_time = current_time
+                _error_count = 0
+                _last_error_time = None
+                
+                logger.info("Successfully created new database connection pool")
             
             # Test pool with a simple query
             try:
@@ -134,11 +127,11 @@ async def get_pool():
             
             return _pool
             
-    except Exception as e:
-        logger.error(f"Error in get_pool: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        raise
+        except Exception as e:
+            logger.error(f"Error in get_pool: {str(e)}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
+            raise
 
 async def reset_pool():
     """Reset the connection pool with proper cleanup"""
@@ -257,12 +250,9 @@ class QueryError(DatabaseError):
     """Database query error"""
     pass
 
-async def init_db(conn) -> bool:
+async def init_db() -> bool:
     """Initialize database and run migrations
     
-    Args:
-        conn: Database connection to use
-        
     Returns:
         bool: True if successful
         
@@ -270,21 +260,23 @@ async def init_db(conn) -> bool:
         DatabaseError: If initialization fails
     """
     try:
-        # Create tables
-        await conn.execute(INIT_SQL)
-        
-        # Run migrations
-        await migrate_database(conn)
-        
-        # Initialize notification settings for existing users
-        users = await conn.fetch(
-            "SELECT DISTINCT user_id FROM wallets WHERE user_id IS NOT NULL"
-        )
-        for user in users:
-            await initialize_notification_settings(user['user_id'])
+        # Get connection from pool
+        async with _pool.acquire() as conn:
+            # Create tables
+            await conn.execute(INIT_SQL)
             
-        return True
-        
+            # Run migrations
+            await migrate_database(conn)
+            
+            # Initialize notification settings for existing users
+            users = await conn.fetch(
+                "SELECT DISTINCT user_id FROM wallets WHERE user_id IS NOT NULL"
+            )
+            for user in users:
+                await initialize_notification_settings(user['user_id'])
+                
+            return True
+            
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
         raise DatabaseError(f"Failed to initialize database: {e}")
@@ -2321,21 +2313,22 @@ async def main():
 def init_db_sync():
     """Initialize database synchronously"""
     try:
-        # Get database URL synchronously since we've made get_database_url sync
-        database_url = get_database_url()
-        
-        # Create event loop and run async init
+        # Create event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
         try:
+            # Get database URL
+            database_url = get_database_url()
+            
             # Create SSL context
             ssl_context = ssl.create_default_context(cafile=certifi.where())
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
             
-            # Create pool
-            pool = loop.run_until_complete(
+            # Create and set global pool
+            global _pool
+            _pool = loop.run_until_complete(
                 asyncpg.create_pool(
                     database_url,
                     min_size=5,
@@ -2345,21 +2338,12 @@ def init_db_sync():
                 )
             )
             
-            try:
-                # Get connection from pool
-                conn = loop.run_until_complete(pool.acquire())
-                try:
-                    # Initialize database with connection
-                    loop.run_until_complete(init_db(conn))
-                    logger.info("Database initialized successfully")
-                finally:
-                    # Always release the connection
-                    loop.run_until_complete(pool.release(conn))
-            finally:
-                # Always close the pool
-                loop.run_until_complete(pool.close())
-                
+            # Initialize database
+            loop.run_until_complete(init_db())
+            logger.info("Database initialized successfully")
+            
         finally:
+            # Close the loop
             loop.close()
             
     except Exception as e:
