@@ -676,13 +676,8 @@ class WalletBudBot(commands.Bot):
             
             # Set up admin channel
             if self.admin_channel_id:
-                if await self.setup_admin_channel():
-                    try:
-                        await self.admin_channel.send("🟢 Bot is now online and monitoring wallets!")
-                    except Exception as e:
-                        logger.error(f"Could not send message to admin channel: {e}")
-                else:
-                    logger.warning("Admin channel setup failed")
+                await self.setup_admin_channel()
+                logger.info("Admin channel setup complete")
             
             # Update status with custom activity
             activity = discord.Activity(
@@ -1133,57 +1128,75 @@ class WalletBudBot(commands.Bot):
         try:
             project_id = os.getenv('BLOCKFROST_PROJECT_ID')
             base_url = os.getenv('BLOCKFROST_BASE_URL')
+            network = os.getenv('CARDANO_NETWORK', 'mainnet')  # Default to mainnet
             
             if not project_id:
                 raise ValueError("BLOCKFROST_PROJECT_ID not set in environment variables")
             
+            # Set appropriate base URL based on network
             if not base_url:
-                raise ValueError("BLOCKFROST_BASE_URL not set in environment variables")
-            
-            # Check if we're in development or production
-            is_production = os.getenv('ENVIRONMENT', 'development') == 'production'
-            
-            if is_production:
-                # In production (Heroku), use default SSL settings
-                self.blockfrost = BlockFrostApi(
-                    project_id=project_id,
-                    base_url=base_url
-                )
-            else:
-                # In development, create a custom session with SSL verification disabled
-                # NOTE: This is only for local development testing
-                connector = aiohttp.TCPConnector(ssl=False)
-                session = aiohttp.ClientSession(connector=connector)
-                self.blockfrost = BlockFrostApi(
-                    project_id=project_id,
-                    base_url=base_url,
-                    session=session
+                base_url = (
+                    "https://cardano-mainnet.blockfrost.io/api/v0"
+                    if network == "mainnet"
+                    else "https://cardano-testnet.blockfrost.io/api/v0"
                 )
             
-            # Test connection with error handling
-            try:
-                health = await self.blockfrost.health()
-                logger.info(f"✅ Blockfrost API initialized successfully. Health: {health}")
-                await self.update_health_metrics('blockfrost_init', True)
-                return True
-            except Exception as e:
-                logger.error(f"❌ Failed to test Blockfrost connection: {str(e)}")
-                if hasattr(e, 'status_code'):
-                    logger.error(f"Status code: {e.status_code}")
-                if hasattr(e, 'response'):
-                    logger.error(f"Response: {e.response}")
-                raise
+            # Initialize Blockfrost client with proper configuration
+            self.blockfrost = BlockFrostApi(
+                project_id=project_id,
+                base_url=base_url
+            )
+            
+            # Test the connection and get network info
+            health = await self.blockfrost.health()
+            network_info = await self.blockfrost.network()
+            
+            logger.info(f"✅ Blockfrost API initialized successfully on {network}")
+            logger.info(f"Network info: Supply={network_info.supply}, Stake={network_info.stake}")
+            
+            self.update_health_metrics('blockfrost_init', True)
+            self.update_health_metrics('last_api_call', datetime.now())
+            return True
             
         except Exception as e:
             logger.error(f"❌ Failed to initialize Blockfrost API: {str(e)}")
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
-            self.blockfrost = None
-            await self.update_health_metrics('blockfrost_init', False)
-            if hasattr(self, 'admin_channel') and self.admin_channel:
-                await self.send_admin_alert("Failed to initialize Blockfrost API")
+            self.update_health_metrics('blockfrost_init', False)
             return False
 
+    async def blockfrost_request(self, method: Callable, *args, **kwargs) -> Any:
+        """Execute a rate-limited request to Blockfrost API with improved error handling"""
+        if not self.blockfrost:
+            raise ValueError("Blockfrost client not initialized")
+            
+        try:
+            # Apply rate limiting
+            async with self.rate_limiter.acquire('blockfrost'):
+                # Execute request
+                response = await method(*args, **kwargs)
+                
+                # Update metrics
+                self.update_health_metrics('last_api_call', datetime.now())
+                
+                return response
+                
+        except Exception as e:
+            error_msg = str(e)
+            
+            # Handle specific error cases
+            if "rate limit" in error_msg.lower():
+                logger.warning(f"Rate limit hit: {error_msg}")
+                raise ValueError("Rate limit exceeded. Please try again later.")
+            elif "not found" in error_msg.lower():
+                logger.info(f"Resource not found: {error_msg}")
+                return None
+            else:
+                logger.error(f"Blockfrost API error: {error_msg}")
+                if hasattr(e, '__dict__'):
+                    logger.error(f"Error details: {e.__dict__}")
+                raise
+                
     async def should_notify(self, user_id: int, notification_type: str) -> bool:
         """Check if we should send a notification to the user"""
         try:
@@ -1639,55 +1652,41 @@ class WalletBudBot(commands.Bot):
         try:
             project_id = os.getenv('BLOCKFROST_PROJECT_ID')
             base_url = os.getenv('BLOCKFROST_BASE_URL')
+            network = os.getenv('CARDANO_NETWORK', 'mainnet')  # Default to mainnet
             
             if not project_id:
                 raise ValueError("BLOCKFROST_PROJECT_ID not set in environment variables")
             
+            # Set appropriate base URL based on network
             if not base_url:
-                raise ValueError("BLOCKFROST_BASE_URL not set in environment variables")
-            
-            # Check if we're in development or production
-            is_production = os.getenv('ENVIRONMENT', 'development') == 'production'
-            
-            if is_production:
-                # In production (Heroku), use default SSL settings
-                self.blockfrost = BlockFrostApi(
-                    project_id=project_id,
-                    base_url=base_url
-                )
-            else:
-                # In development, create a custom session with SSL verification disabled
-                # NOTE: This is only for local development testing
-                connector = aiohttp.TCPConnector(ssl=False)
-                session = aiohttp.ClientSession(connector=connector)
-                self.blockfrost = BlockFrostApi(
-                    project_id=project_id,
-                    base_url=base_url,
-                    session=session
+                base_url = (
+                    "https://cardano-mainnet.blockfrost.io/api/v0"
+                    if network == "mainnet"
+                    else "https://cardano-testnet.blockfrost.io/api/v0"
                 )
             
-            # Test connection with error handling
-            try:
-                health = await self.blockfrost.health()
-                logger.info(f"✅ Blockfrost API initialized successfully. Health: {health}")
-                await self.update_health_metrics('blockfrost_init', True)
-                return True
-            except Exception as e:
-                logger.error(f"❌ Failed to test Blockfrost connection: {str(e)}")
-                if hasattr(e, 'status_code'):
-                    logger.error(f"Status code: {e.status_code}")
-                if hasattr(e, 'response'):
-                    logger.error(f"Response: {e.response}")
-                raise
+            # Initialize Blockfrost client with proper configuration
+            self.blockfrost = BlockFrostApi(
+                project_id=project_id,
+                base_url=base_url
+            )
+            
+            # Test the connection and get network info
+            health = await self.blockfrost.health()
+            network_info = await self.blockfrost.network()
+            
+            logger.info(f"✅ Blockfrost API initialized successfully on {network}")
+            logger.info(f"Network info: Supply={network_info.supply}, Stake={network_info.stake}")
+            
+            self.update_health_metrics('blockfrost_init', True)
+            self.update_health_metrics('last_api_call', datetime.now())
+            return True
             
         except Exception as e:
             logger.error(f"❌ Failed to initialize Blockfrost API: {str(e)}")
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
-            self.blockfrost = None
-            await self.update_health_metrics('blockfrost_init', False)
-            if hasattr(self, 'admin_channel') and self.admin_channel:
-                await self.send_admin_alert("Failed to initialize Blockfrost API")
+            self.update_health_metrics('blockfrost_init', False)
             return False
 
     async def should_notify(self, user_id: int, notification_type: str) -> bool:
@@ -1896,14 +1895,31 @@ class WalletBudBot(commands.Bot):
             raise ValueError("Blockfrost API client not initialized")
             
         try:
+            # Apply rate limiting
             async with self.rate_limiter.acquire('blockfrost'):
-                return await method(*args, **kwargs)
+                # Execute request
+                response = await method(*args, **kwargs)
+                
+                # Update metrics
+                self.update_health_metrics('last_api_call', datetime.now())
+                
+                return response
                 
         except Exception as e:
-            logger.error(f"Blockfrost API request failed: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            raise
+            error_msg = str(e)
+            
+            # Handle specific error cases
+            if "rate limit" in error_msg.lower():
+                logger.warning(f"Rate limit hit: {error_msg}")
+                raise ValueError("Rate limit exceeded. Please try again later.")
+            elif "not found" in error_msg.lower():
+                logger.info(f"Resource not found: {error_msg}")
+                return None
+            else:
+                logger.error(f"Blockfrost API error: {error_msg}")
+                if hasattr(e, '__dict__'):
+                    logger.error(f"Error details: {e.__dict__}")
+                raise
                 
 if __name__ == "__main__":
     try:
