@@ -798,7 +798,8 @@ class WalletBudBot(commands.Bot):
             # Check Blockfrost API
             try:
                 if self.blockfrost_session:
-                    async with self.blockfrost_session.get('/health') as response:
+                    base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
+                    async with self.blockfrost_session.get(f'{base_url}/health') as response:
                         if response.status == 200:
                             health = await response.json()
                             if health.get('is_healthy'):
@@ -990,7 +991,8 @@ class WalletBudBot(commands.Bot):
             
             # Check Blockfrost connection
             try:
-                async with self.blockfrost_session.get('/health') as response:
+                base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
+                async with self.blockfrost_session.get(f'{base_url}/health') as response:
                     if response.status == 200:
                         health = await response.json()
                         if health.get('is_healthy'):
@@ -1082,20 +1084,21 @@ class WalletBudBot(commands.Bot):
         try:
             # Create aiohttp session with proper headers
             self.blockfrost_session = aiohttp.ClientSession(
-                base_url='https://cardano-mainnet.blockfrost.io/api/v0',
                 headers={
                     'project_id': 'mainnet0vqb8DAEyXDyGuUR1pA7W8VkgPbnhWAc'
                 }
             )
             
+            base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
+            
             # Test connection by checking root endpoint first
-            async with self.blockfrost_session.get('/') as response:
+            async with self.blockfrost_session.get(f'{base_url}/') as response:
                 if response.status == 200:
                     root = await response.json()
                     logger.info("Blockfrost root endpoint accessible")
                     
                     # Now check health endpoint
-                    async with self.blockfrost_session.get('/health') as health_response:
+                    async with self.blockfrost_session.get(f'{base_url}/health') as health_response:
                         if health_response.status == 200:
                             health = await health_response.json()
                             if health.get('is_healthy'):
@@ -1116,9 +1119,9 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Failed to initialize Blockfrost client: {e}")
             if self.admin_channel:
                 await self.admin_channel.send(f"Error: Failed to initialize Blockfrost client: {e}")
-            if hasattr(self, 'blockfrost_session'):
+            if hasattr(self, 'blockfrost_session') and self.blockfrost_session:
                 await self.blockfrost_session.close()
-                self.blockfrost_session = None
+            self.blockfrost_session = None
             raise
 
     async def blockfrost_request(
@@ -1144,7 +1147,8 @@ class WalletBudBot(commands.Bot):
             raise Exception("Blockfrost session not initialized")
             
         try:
-            async with self.blockfrost_session.request(method, endpoint, **kwargs) as response:
+            base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
+            async with self.blockfrost_session.request(method, f'{base_url}{endpoint}', **kwargs) as response:
                 if response.status == 200:
                     result = await response.json()
                     
@@ -1543,7 +1547,8 @@ class WalletBudBot(commands.Bot):
         """Check balance for a single wallet with retries"""
         try:
             # Get current balance
-            async with self.blockfrost_session.get(f'/addresses/{address}/assets') as response:
+            base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
+            async with self.blockfrost_session.get(f'{base_url}/addresses/{address}/assets') as response:
                 if response.status == 200:
                     current_balance = await response.json()
                 else:
@@ -1604,7 +1609,8 @@ class WalletBudBot(commands.Bot):
 
     async def fetch_wallet_assets(self, address: str) -> List[Dict]:
         """Fetch assets for a single wallet address"""
-        async with self.blockfrost_session.get(f'/addresses/{address}/assets') as response:
+        base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
+        async with self.blockfrost_session.get(f'{base_url}/addresses/{address}/assets') as response:
             if response.status == 200:
                 return await response.json()
             else:
