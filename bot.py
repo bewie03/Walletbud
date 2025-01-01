@@ -51,7 +51,7 @@ from database import (
     get_database_url,
     get_wallet_info,
     get_wallet_balance,
-    update_wallet_balance,
+    update_ada_balance,
     should_notify,
     update_notification_settings,
     get_user_notification_settings,
