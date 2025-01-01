@@ -10,6 +10,17 @@ from ipaddress import ip_network
 import json
 from dotenv import load_dotenv
 
+# Load environment variables
+load_dotenv()
+
+# SSL Configuration
+SSL_CONFIG = {
+    'verify': True,
+    'cert_required': True,
+    'cert_path': certifi.where(),
+    'check_hostname': True
+}
+
 # Environment and logging configuration
 ENV = os.getenv('ENV', 'development')
 LOG_LEVEL = logging.DEBUG if ENV == 'development' else logging.INFO
@@ -439,9 +450,6 @@ except Exception as e:
     logging.error(f"Configuration validation failed: {e}")
     raise
 
-# Load environment variables
-load_dotenv()
-
 # Handle Heroku database URL conversion
 database_url = os.getenv('DATABASE_URL')
 if database_url and database_url.startswith('postgres://'):
@@ -462,10 +470,6 @@ DATABASE_POOL_MAX_SIZE = 100
 DATABASE_MAX_QUERIES = 50000
 DATABASE_CONNECTION_TIMEOUT = 30
 DATABASE_COMMAND_TIMEOUT = 60
-
-# SSL configuration
-SSL_VERIFY = True
-SSL_CERT_REQUIRED = True
 
 # Discord embed limits
 EMBED_CHAR_LIMIT = 4096
