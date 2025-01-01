@@ -2620,11 +2620,6 @@ MIGRATIONS = {
         """
         CREATE INDEX IF NOT EXISTS idx_stake_addresses_stake_address ON stake_addresses(stake_address);
         """,
-        
-        # Step 7: Create indices for asset_history
-        """
-        CREATE INDEX IF NOT EXISTS idx_asset_history_policy ON asset_history(policy_id);
-        """,
     ]
 }
 
