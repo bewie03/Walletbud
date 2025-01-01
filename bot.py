@@ -309,7 +309,7 @@ class WalletBudBot(commands.Bot):
         
         # Initialize health check task
         self.health_check_task = tasks.loop(minutes=5)(self.monitor_health)
-        self.health_check_task.start()
+        # Task will be started in setup_hook
         self.health_lock = asyncio.Lock()
         
     def register_cleanup_handlers(self):
@@ -441,32 +441,39 @@ class WalletBudBot(commands.Bot):
     async def setup_hook(self):
         """Set up the bot's background tasks and signal handlers"""
         try:
-            # Set up admin channel first
-            await self.setup_admin_channel()
-            if self.admin_channel:
-                await self.admin_channel.send("🚀 Bot is starting up...")
+            logger.info("Starting bot setup...")
             
-            # Initialize critical dependencies
+            # Validate environment and initialize dependencies
             await self.validate_and_init_dependencies()
             
-            # Set up webhook routing
-            self.app.router.add_post('/webhook', self.handle_webhook)
+            # Set up admin channel
+            await self.setup_admin_channel()
+            
+            # Initialize database
+            await self.init_database()
+            
+            # Initialize Blockfrost client
+            await self.init_blockfrost()
             
             # Start webhook server
-            self._webhook_task = asyncio.create_task(self.start_webhook())
+            await self.start_webhook()
             
             # Start webhook processor
             self._webhook_processor = asyncio.create_task(self._process_webhook_queue())
             
+            # Start health check task
+            self.health_check_task.start()
+            
+            # Start YUMMI balance check task
+            self.check_yummi_balances.start()
+            
             # Log successful setup
             logger.info("Bot setup completed successfully")
-            if self.admin_channel:
-                await self.admin_channel.send("✅ Bot setup completed successfully")
             
         except Exception as e:
-            logger.error(f"Failed to set up bot: {e}")
+            logger.error(f"Error during bot initialization: {e}")
             if self.admin_channel:
-                await self.admin_channel.send(f"🚨 ERROR: Failed to set up bot: {e}")
+                await self.admin_channel.send(f" Error during bot initialization: {e}")
             raise
             
     async def validate_and_init_dependencies(self):
@@ -883,10 +890,10 @@ class WalletBudBot(commands.Bot):
         try:
             logger.info(f"Logged in as {self.user.name} ({self.user.id})")
             
-            # Set up admin channel
-            if self.admin_channel_id:
-                await self.setup_admin_channel()
-                logger.info("Admin channel setup complete")
+            # Set up admin channel first
+            await self.setup_admin_channel()
+            if self.admin_channel:
+                await self.admin_channel.send("🚀 Bot is starting up...")
             
             # Update status with custom activity
             activity = discord.Activity(
@@ -1172,22 +1179,21 @@ class WalletBudBot(commands.Bot):
     async def start_webhook(self):
         """Start the webhook server"""
         try:
+            # Set up webhook routing
+            self.app.router.add_post('/webhook', self.handle_webhook)
+            
+            # Start the app runner
+            await self.runner.setup()
+            
+            # Create site and start it
             port = int(os.getenv('PORT', 8080))
-            
-            runner = web.AppRunner(self.app)
-            await runner.setup()
-            
-            site = web.TCPSite(runner, '0.0.0.0', port)
-            await site.start()
+            self.site = web.TCPSite(self.runner, '0.0.0.0', port)
+            await self.site.start()
             
             logger.info(f"Webhook server started on port {port}")
-            if self.admin_channel:
-                await self.admin_channel.send(f"✅ Webhook server started on port {port}")
-                
+            
         except Exception as e:
             logger.error(f"Failed to start webhook server: {e}")
-            if self.admin_channel:
-                await self.admin_channel.send(f"🚨 ERROR: Failed to start webhook server: {e}")
             raise
 
     async def handle_webhook(self, request: web.Request) -> web.Response:
