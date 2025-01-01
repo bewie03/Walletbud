@@ -4,9 +4,16 @@ import re
 from typing import Optional, Any
 from dataclasses import dataclass
 from dotenv import load_dotenv
+import json
 
 # Load environment variables
 load_dotenv()
+
+# Handle Heroku database URL conversion
+database_url = os.getenv('DATABASE_URL')
+if database_url and database_url.startswith('postgres://'):
+    database_url = database_url.replace('postgres://', 'postgresql://', 1)
+    os.environ['DATABASE_URL'] = database_url
 
 # Set up logging
 log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -68,6 +75,82 @@ def validate_blockfrost_webhook_id(value: str, name: str) -> str:
         raise ValueError(f"{name} must be a valid Blockfrost webhook ID, got: {value}")
     return value
 
+def validate_minute(value: str, name: str) -> int:
+    """Validate and convert to minute value (0-59)"""
+    try:
+        result = int(value)
+        if result < 0 or result > 59:
+            raise ValueError
+        return result
+    except (ValueError, TypeError):
+        raise ValueError(f"{name} must be an integer between 0 and 59, got: {value}")
+
+def validate_hour(value: str, name: str) -> int:
+    """Validate and convert to hour value (0-23)"""
+    try:
+        result = int(value)
+        if result < 0 or result > 23:
+            raise ValueError
+        return result
+    except (ValueError, TypeError):
+        raise ValueError(f"{name} must be an integer between 0 and 23, got: {value}")
+
+def validate_ip_ranges(value: str, name: str) -> list:
+    """Validate IP ranges in CIDR notation"""
+    try:
+        ranges = json.loads(value) if isinstance(value, str) else value
+        if not isinstance(ranges, list):
+            raise ValueError
+        
+        from ipaddress import ip_network
+        validated = []
+        for ip_range in ranges:
+            # Will raise ValueError if invalid
+            network = ip_network(ip_range.strip())
+            validated.append(str(network))
+        return validated
+    except Exception as e:
+        raise ValueError(f"{name} must be a list of valid IP ranges in CIDR notation, got: {value}")
+
+def validate_webhook_id(value: str, name: str) -> str:
+    """Validate Blockfrost webhook ID format (UUID)"""
+    try:
+        # Strip any whitespace
+        value = value.strip()
+        # Verify UUID format
+        if not value or not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', value.lower()):
+            raise ValueError
+        return value.lower()
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} must be a valid UUID format, got: {value}")
+
+def validate_webhook_secret(value: str, name: str) -> str:
+    """Validate webhook secret format"""
+    if not value or len(value) < 32:  # Require at least 32 characters for security
+        raise ValueError(f"{name} must be at least 32 characters long")
+    return value
+
+def validate_asset_id(value: str, name: str) -> str:
+    """Validate Cardano asset ID format"""
+    try:
+        value = value.strip()
+        if not re.match(r'^[0-9a-fA-F]{56,}$', value):
+            raise ValueError
+        return value.lower()
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} must be a valid Cardano asset ID (hex format), got: {value}")
+
+def validate_token_name(value: str, name: str) -> str:
+    """Validate token name format"""
+    try:
+        value = value.strip()
+        # Check if it's a valid hex string and not too long
+        if not re.match(r'^[0-9a-fA-F]{1,64}$', value):
+            raise ValueError
+        return value.lower()
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} must be a valid hex-encoded token name, got: {value}")
+
 # Define required environment variables
 ENV_VARS = {
     # Discord Configuration
@@ -93,6 +176,27 @@ ENV_VARS = {
         default="https://cardano-mainnet.blockfrost.io/api/v0",
         validator=validate_url,
         description="Blockfrost API base URL"
+    ),
+    'BLOCKFROST_IP_RANGES': EnvVar(
+        name='BLOCKFROST_IP_RANGES',
+        default='["0.0.0.0/0"]',  # Default to allow all IPs
+        validator=validate_ip_ranges,
+        description="List of allowed Blockfrost webhook IP ranges in CIDR notation"
+    ),
+    'BLOCKFROST_TX_WEBHOOK_ID': EnvVar(
+        name='BLOCKFROST_TX_WEBHOOK_ID',
+        validator=validate_webhook_id,
+        description="Blockfrost transaction webhook ID"
+    ),
+    'BLOCKFROST_DEL_WEBHOOK_ID': EnvVar(
+        name='BLOCKFROST_DEL_WEBHOOK_ID',
+        validator=validate_webhook_id,
+        description="Blockfrost delegation webhook ID"
+    ),
+    'BLOCKFROST_WEBHOOK_SECRET': EnvVar(
+        name='BLOCKFROST_WEBHOOK_SECRET',
+        validator=validate_webhook_secret,
+        description="Blockfrost webhook secret for verification"
     ),
 
     # Database Configuration
@@ -202,19 +306,62 @@ ENV_VARS = {
         validator=validate_positive_int,
         description="Maximum transactions per hour"
     ),
+    'MINIMUM_YUMMI': EnvVar(
+        name="Minimum YUMMI Balance",
+        default="1000",
+        validator=validate_positive_int,
+        required=False,
+        description="Minimum YUMMI token balance required"
+    ),
 
     # Maintenance Configuration
     'MAINTENANCE_HOUR': EnvVar(
         name='MAINTENANCE_HOUR',
         default="2",
-        validator=validate_positive_int,
+        validator=validate_hour,
         description="Hour to run maintenance (24-hour format)"
     ),
     'MAINTENANCE_MINUTE': EnvVar(
         name='MAINTENANCE_MINUTE',
         default="0",
-        validator=validate_positive_int,
+        validator=validate_minute,
         description="Minute to run maintenance"
+    ),
+
+    # Asset Configuration
+    'ASSET_ID': EnvVar(
+        name='ASSET_ID',
+        validator=validate_asset_id,
+        description="Cardano asset ID to monitor"
+    ),
+    'YUMMI_POLICY_ID': EnvVar(
+        name='YUMMI_POLICY_ID',
+        validator=validate_asset_id,
+        description="YUMMI token policy ID"
+    ),
+    'YUMMI_TOKEN_NAME': EnvVar(
+        name='YUMMI_TOKEN_NAME',
+        validator=validate_token_name,
+        description="YUMMI token name (hex encoded)"
+    ),
+    'WEBHOOK_IDENTIFIER': EnvVar(
+        name="Webhook Identifier",
+        default="walletbud_webhook",
+        required=False,
+        description="Identifier for the webhook"
+    ),
+    'WEBHOOK_AUTH_TOKEN': EnvVar(
+        name="Webhook Authentication Token",
+        default="your_webhook_auth_token",
+        required=False,
+        description="Authentication token for the webhook"
+    ),
+    'WEBHOOK_CONFIRMATIONS': EnvVar(
+        name="Webhook Confirmations",
+        default="3",
+        validator=validate_positive_int,
+        required=False,
+        description="Number of confirmations required for webhook events"
     ),
 }
 
@@ -262,6 +409,10 @@ try:
     # Blockfrost Configuration
     BLOCKFROST_PROJECT_ID = env['BLOCKFROST_PROJECT_ID']
     BLOCKFROST_BASE_URL = env['BLOCKFROST_BASE_URL']
+    BLOCKFROST_IP_RANGES = env['BLOCKFROST_IP_RANGES']
+    BLOCKFROST_TX_WEBHOOK_ID = env['BLOCKFROST_TX_WEBHOOK_ID']
+    BLOCKFROST_DEL_WEBHOOK_ID = env['BLOCKFROST_DEL_WEBHOOK_ID']
+    BLOCKFROST_WEBHOOK_SECRET = env['BLOCKFROST_WEBHOOK_SECRET']
 
     # Database Configuration
     DATABASE_URL = env['DATABASE_URL']
@@ -287,10 +438,19 @@ try:
     WALLET_CHECK_INTERVAL = int(env['WALLET_CHECK_INTERVAL'])
     MIN_ADA_BALANCE = int(env['MIN_ADA_BALANCE'])
     MAX_TX_PER_HOUR = int(env['MAX_TX_PER_HOUR'])
+    MINIMUM_YUMMI = int(env['MINIMUM_YUMMI'])
 
     # Maintenance Configuration
     MAINTENANCE_HOUR = int(env['MAINTENANCE_HOUR'])
     MAINTENANCE_MINUTE = int(env['MAINTENANCE_MINUTE'])
+
+    # Asset Configuration
+    ASSET_ID = env['ASSET_ID']
+    YUMMI_POLICY_ID = env['YUMMI_POLICY_ID']
+    YUMMI_TOKEN_NAME = env['YUMMI_TOKEN_NAME']
+    WEBHOOK_IDENTIFIER = env['WEBHOOK_IDENTIFIER']
+    WEBHOOK_AUTH_TOKEN = env['WEBHOOK_AUTH_TOKEN']
+    WEBHOOK_CONFIRMATIONS = int(env['WEBHOOK_CONFIRMATIONS'])
 
 except Exception as e:
     logger.error(f"Environment validation failed:\n{str(e)}")
@@ -302,13 +462,13 @@ TEST_ADDRESS = "addr1qxqs59lphg8g6qnplr8q6kw2hyzn8c8e3r5jlnwjqppn8k2vllp6xf5qvjg
 # Webhook Configuration
 WEBHOOKS = {
     "transaction": {
-        "id": BLOCKFROST_PROJECT_ID,
-        "auth_token": BLOCKFROST_PROJECT_ID,
+        "id": BLOCKFROST_TX_WEBHOOK_ID,
+        "auth_token": BLOCKFROST_WEBHOOK_SECRET,
         "confirmations": 2  # Wait for 2 confirmations to avoid rollbacks
     },
     "delegation": {
-        "id": BLOCKFROST_PROJECT_ID,
-        "auth_token": BLOCKFROST_PROJECT_ID,
+        "id": BLOCKFROST_DEL_WEBHOOK_ID,
+        "auth_token": BLOCKFROST_WEBHOOK_SECRET,
         "confirmations": 1  # Delegation changes need only 1 confirmation
     }
 }
@@ -347,6 +507,14 @@ logger.info(
     f"  WALLET_CHECK_INTERVAL: {WALLET_CHECK_INTERVAL}\n"
     f"  MIN_ADA_BALANCE: {MIN_ADA_BALANCE}\n"
     f"  MAX_TX_PER_HOUR: {MAX_TX_PER_HOUR}\n"
+    f"  MINIMUM_YUMMI: {MINIMUM_YUMMI}\n"
     f"  MAINTENANCE_HOUR: {MAINTENANCE_HOUR}\n"
     f"  MAINTENANCE_MINUTE: {MAINTENANCE_MINUTE}\n"
+    f"  BLOCKFROST_IP_RANGES: {BLOCKFROST_IP_RANGES}\n"
+    f"  ASSET_ID: {ASSET_ID}\n"
+    f"  YUMMI_POLICY_ID: {YUMMI_POLICY_ID}\n"
+    f"  YUMMI_TOKEN_NAME: {YUMMI_TOKEN_NAME}\n"
+    f"  WEBHOOK_IDENTIFIER: {WEBHOOK_IDENTIFIER}\n"
+    f"  WEBHOOK_AUTH_TOKEN: {'*' * 8}\n"
+    f"  WEBHOOK_CONFIRMATIONS: {WEBHOOK_CONFIRMATIONS}\n"
 )

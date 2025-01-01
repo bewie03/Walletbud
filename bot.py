@@ -3,16 +3,17 @@ import logging
 import sys
 from datetime import datetime
 import time
-import json
-import hmac
-import hashlib
 import asyncio
-from aiohttp import web
+import aiohttp
+import requests
 import discord
 from discord import app_commands
+from aiohttp import web
 from discord.ext import commands, tasks
+from typing import Dict, Any, Optional, List, Union
 
-from blockfrost import BlockFrostApi
+from blockfrost import BlockFrostApi, ApiUrls
+from blockfrost.api.cardano.network import network
 from database import (
     get_user_id_for_wallet,
     get_user_id_for_stake_address,
@@ -30,6 +31,10 @@ import functools
 from functools import wraps
 
 import config
+from urllib3.exceptions import InsecureRequestWarning
+
+# Suppress only the single InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
 # Configure logging
 logging.basicConfig(
@@ -240,13 +245,23 @@ class RateLimiter:
         await self.cleanup()
 
     async def __aenter__(self):
-        await self.start_cleanup_task()
-        return self
+        """Enter the async context manager"""
+        # We'll use a default endpoint for general rate limiting
+        if await self.acquire("default"):
+            return self
+        raise Exception("Rate limit exceeded")
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.stop()
+        """Exit the async context manager"""
+        await self.release("default")
 
-class WalletBud(commands.Bot):
+    async def __enter__(self):
+        raise TypeError("RateLimiter is an async context manager, use 'async with' instead of 'with'")
+
+    async def __exit__(self, exc_type, exc_val, exc_tb):
+        raise TypeError("RateLimiter is an async context manager, use 'async with' instead of 'with'")
+
+class WalletBudBot(commands.Bot):
     """WalletBud Discord bot"""
     NOTIFICATION_TYPES = {
         # Command value -> Database key
@@ -373,7 +388,7 @@ class WalletBud(commands.Bot):
         # Initialize webhook server
         self.app = web.Application()
         self.runner = web.AppRunner(self.app)
-        self.port = int(os.getenv('PORT', 49152))  # Use Heroku's PORT or fallback to 49152
+        self.port = int(os.getenv('PORT', '8080'))  # Use Heroku's PORT or fallback to 8080
         self.monitored_addresses = set()
         self.monitored_stake_addresses = set()
         
@@ -390,114 +405,63 @@ class WalletBud(commands.Bot):
         # Initialize YUMMI check task (every 6 hours)
         self.check_yummi_balances = tasks.loop(hours=6)(self._check_yummi_balances)
         
+        # Initialize SSL context with certificate verification disabled
+        import ssl
+        self.ssl_context = ssl.create_default_context()
+        self.ssl_context.check_hostname = False
+        self.ssl_context.verify_mode = ssl.CERT_NONE
+        
+        # Initialize aiohttp connector
+        self.connector = aiohttp.TCPConnector(ssl=self.ssl_context)
+        
     async def setup_hook(self):
         """Set up the bot's background tasks"""
         try:
-            # Start maintenance task
-            self.loop.create_task(self.db_maintenance.start_maintenance_task())
-            logger.info("Started database maintenance task")
-            
-            # Start YUMMI balance check task
-            self.loop.create_task(self._check_yummi_balances())
-            logger.info("Started YUMMI balance check task")
-            
-            # Start webhook queue processor
-            self.loop.create_task(self._process_webhook_queue())
-            logger.info("Started webhook queue processor")
-            
-            # Initialize database
-            logger.info("Initializing database...")
+            # Initialize database first
             await init_db()
-            logger.info("Database initialized")
             
             # Initialize Blockfrost client
-            logger.info("Initializing Blockfrost client...")
-            if not await self.init_blockfrost():
-                logger.error("Failed to initialize Blockfrost client")
-                return
-            logger.info("Blockfrost client initialized")
+            await self.init_blockfrost()
             
-            # Load monitored addresses
-            logger.info("Loading monitored addresses...")
-            addresses, stake_addresses = await get_all_monitored_addresses()
-            self.monitored_addresses = addresses
-            self.monitored_stake_addresses = stake_addresses
+            # Start rate limiter cleanup
+            self.rate_limiter.start_cleanup_task()
             
-            logger.info(f"Loaded {len(addresses)} monitored addresses")
-            logger.info(f"Loaded {len(stake_addresses)} stake addresses")
+            # Start database maintenance task
+            await self.db_maintenance.start_maintenance_task()
             
-            # Set up webhook routes with retry mechanism
-            self.app.router.add_post('/webhooks/blockfrost', self.handle_webhook_with_retry)
+            # Start webhook processing
+            self._webhook_processor = asyncio.create_task(self._process_webhook_queue())
             
-            # Start webhook server
+            # Start YUMMI balance check task
+            self.check_yummi_balances.start()
+            
+            # Initialize aiohttp session
+            self.session = aiohttp.ClientSession(connector=self.connector)
+            
+            # Set up webhook server
+            self.app = web.Application()
+            self.app.router.add_post('/webhook', self.handle_webhook)
+            self.runner = web.AppRunner(self.app)
             await self.runner.setup()
-            site = web.TCPSite(self.runner, '0.0.0.0', self.port)
-            await site.start()
-            logger.info(f"Webhook server started on port {self.port}")
             
-        except Exception as e:
-            logger.error(f"Error in setup_hook: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-
-    async def init_blockfrost(self):
-        """Initialize Blockfrost API client"""
-        try:
-            # Get project ID and base URL from environment and strip quotes
-            project_id = os.getenv('BLOCKFROST_PROJECT_ID', '').strip('"\'')
-            base_url = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0').strip('"\'')
+            # Use Heroku's PORT environment variable
+            port = int(os.getenv('PORT', '8080'))
+            self.site = web.TCPSite(self.runner, '0.0.0.0', port)
             
-            logger.info(f"Attempting to initialize Blockfrost with:")
-            logger.info(f"Project ID: {project_id[:8]}...")
-            logger.info(f"Base URL: {base_url}")
-            
-            if not project_id:
-                logger.error("BLOCKFROST_PROJECT_ID not set in environment variables")
-                return False
-
-            logger.info(f"Creating Blockfrost client with project ID: {project_id[:8]}...")
-            self.blockfrost_client = BlockFrostApi(
-                project_id=project_id,
-                base_url=base_url
-            )
-            logger.info("Blockfrost client created successfully")
-            
-            # Test connection with health endpoint
-            logger.info("Testing Blockfrost connection...")
             try:
-                # Test health endpoint
-                health = await self.rate_limited_request(self.blockfrost_client.health)
-                logger.info(f"Health check response: {health}")
-                
-                # Test network info
-                network = await self.rate_limited_request(self.blockfrost_client.network)
-                logger.info(f"Network info: {network}")
-                
-                # Test address lookup
-                test_address = os.getenv('TEST_ADDRESS', 'addr1qxqs59lphg8g6qnplr8q6kw2hyzn8c8e3r5jlnwjqppn8k2vllp6xf5qvjgclau0t2q5jz7c7vyvs3x4u2xqm7gaex0s6dd9ay')
-                logger.info(f"Testing address lookup with: {test_address[:20]}...")
-                
-                address_info = await self.rate_limited_request(
-                    self.blockfrost_client.address,
-                    address=test_address
-                )
-                logger.info("Address lookup successful")
-                logger.info("✅ Connection test passed")
-                return True
-                
+                await self.site.start()
+                logger.info(f"Webhook server started on port {port}")
             except Exception as e:
-                logger.error(f"Error type: {type(e).__name__}")
-                logger.error(f"Error message: {str(e)}")
-                if hasattr(e, '__dict__'):
-                    logger.error(f"Error details: {e.__dict__}")
-                logger.error("❌ Connection test failed: " + str(e))
-                return False
-                
+                logger.error(f"Failed to start webhook server: {str(e)}", exc_info=True)
+                # Continue bot operation even if webhook server fails
+                pass
+            
+            # Update health metrics
+            self.update_health_metrics('start_time', datetime.now().isoformat())
+            
         except Exception as e:
-            logger.error(f"Error initializing Blockfrost client: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            return False
+            logger.error(f"Error during setup hook: {e}", exc_info=True)
+            raise
 
     async def rate_limited_request(self, func, *args, **kwargs):
         """Make a rate-limited request to the Blockfrost API with retry logic"""
@@ -976,8 +940,29 @@ class WalletBud(commands.Bot):
                 api_details = "\n❌ Error: Blockfrost API key not configured"
             else:
                 try:
-                    await self.rate_limited_request(self.blockfrost_client.health)
-                    api_details = "\n✅ API connection test successful"
+                    # First check health without authentication
+                    health_url = f"{self.blockfrost_client.base_url}/health"
+                    health_response = requests.get(health_url, verify=False)
+                    if health_response.status_code != 200:
+                        raise Exception(f"Health check failed with status {health_response.status_code}")
+                        
+                    health_data = health_response.json()
+                    if not health_data.get('is_healthy', False):
+                        raise Exception("Blockfrost API is not healthy")
+                    logger.info("Blockfrost health check passed")
+                    
+                    # Then check network info to verify authentication
+                    network_info = await self.rate_limited_request(
+                        lambda: requests.get(
+                            f"{self.blockfrost_client.base_url}/network",
+                            headers=self.blockfrost_client.default_headers,
+                            verify=False
+                        )
+                    )
+                    network_data = network_info.json()
+                    logger.info(f"Connected to network: {network_data}")
+                    
+                    logger.info("Blockfrost client initialized successfully")
                 except Exception as e:
                     api_status = "❌ Error"
                     if "Invalid project token" in str(e):
@@ -1336,10 +1321,65 @@ class WalletBud(commands.Bot):
             raise e
 
     async def close(self):
-        """Cleanup and close the bot"""
-        logger.info("Shutting down bot...")
-        await database.cleanup_pool()  # Add database cleanup
-        await super().close()
+        """Clean up resources when the bot is shutting down."""
+        try:
+            # Stop YUMMI balance check task
+            self.check_yummi_balances.cancel()
+            
+            # Stop webhook server
+            if hasattr(self, 'site'):
+                await self.site.stop()
+            if hasattr(self, 'runner'):
+                await self.runner.cleanup()
+                
+            # Close aiohttp session
+            if hasattr(self, 'session'):
+                await self.session.close()
+                
+            # Stop rate limiter
+            if hasattr(self, 'rate_limiter'):
+                self.rate_limiter.stop()
+                
+            # Close database connections
+            await close_db()
+            
+            # Call parent's close method
+            await super().close()
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}", exc_info=True)
+            raise
+
+    async def init_blockfrost(self):
+        """Initialize Blockfrost API client"""
+        try:
+            project_id = os.getenv('BLOCKFROST_PROJECT_ID')
+            if not project_id:
+                raise ValueError("BLOCKFROST_PROJECT_ID not set")
+                
+            base_url = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0')
+            
+            # Initialize Blockfrost client with retry mechanism
+            self.blockfrost_client = BlockFrostApi(
+                project_id=project_id,
+                base_url=base_url,
+                session_kwargs={
+                    'timeout': aiohttp.ClientTimeout(total=30),
+                    'connector': self.connector
+                }
+            )
+            
+            # Test connection
+            try:
+                await self.blockfrost_client.health()
+                logger.info("Successfully connected to Blockfrost API")
+            except Exception as e:
+                logger.error(f"Failed to connect to Blockfrost API: {str(e)}", exc_info=True)
+                raise
+                
+        except Exception as e:
+            logger.error(f"Error initializing Blockfrost client: {str(e)}", exc_info=True)
+            raise
 
     async def _check_yummi_balances(self):
         """Check YUMMI token balances every 6 hours"""
@@ -1713,23 +1753,55 @@ class WalletBud(commands.Bot):
 
 if __name__ == "__main__":
     try:
-        logger.info("Starting WalletBud bot...")
+        # Configure logging for production
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
         
         # Create bot instance
-        bot = WalletBud()
+        logger.info("Starting WalletBud bot...")
+        bot = WalletBudBot()
         
-        # Get Discord token
+        # Add error handlers
+        @bot.event
+        async def on_error(event, *args, **kwargs):
+            error = sys.exc_info()[1]
+            logger.error(f"Error in {event}: {str(error)}", exc_info=True)
+            
+            # Send to admin channel if configured
+            if hasattr(bot, 'admin_channel_id') and bot.admin_channel_id:
+                try:
+                    channel = bot.get_channel(int(bot.admin_channel_id))
+                    if channel:
+                        await channel.send(f"❌ Error in {event}: {str(error)}")
+                except Exception as e:
+                    logger.error(f"Failed to send error to admin channel: {str(e)}")
+        
+        @bot.event
+        async def on_command_error(ctx, error):
+            if isinstance(error, commands.CommandNotFound):
+                return
+                
+            logger.error(f"Command error: {str(error)}", exc_info=True)
+            
+            # Send to admin channel if configured
+            if hasattr(bot, 'admin_channel_id') and bot.admin_channel_id:
+                try:
+                    channel = bot.get_channel(int(bot.admin_channel_id))
+                    if channel:
+                        await channel.send(f"❌ Command error: {str(error)}")
+                except Exception as e:
+                    logger.error(f"Failed to send error to admin channel: {str(e)}")
+        
+        # Start the bot
         token = os.getenv('DISCORD_TOKEN')
         if not token:
-            logger.error("DISCORD_TOKEN not found in environment variables")
-            sys.exit(1)
+            raise ValueError("DISCORD_TOKEN not set in environment variables")
             
-        # Run the bot
-        logger.info("Running bot...")
-        bot.run(token, reconnect=True, log_handler=None)  # Let discord.py handle setup_hook
+        logger.info("Starting bot with Discord token...")
+        bot.run(token, log_handler=None)
         
     except Exception as e:
-        logger.error(f"Failed to start bot: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.critical(f"Fatal error starting bot: {str(e)}", exc_info=True)
         sys.exit(1)

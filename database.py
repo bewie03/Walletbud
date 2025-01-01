@@ -28,19 +28,39 @@ async def init_db():
     async with _pool_lock:
         if _pool is None:
             try:
+                # Get DATABASE_URL from environment
+                database_url = os.getenv('DATABASE_URL')
+                
+                # Handle Heroku's database URL format
+                if database_url and database_url.startswith('postgres://'):
+                    database_url = database_url.replace('postgres://', 'postgresql://', 1)
+                
+                if not database_url:
+                    raise ValueError("DATABASE_URL environment variable not set")
+                
+                logger.info("Initializing database connection pool...")
                 _pool = await asyncpg.create_pool(
-                    dsn=DATABASE_URL,
-                    min_size=1,
-                    max_size=20,
-                    command_timeout=60,
+                    database_url,
+                    min_size=1,      # Minimum connections for Heroku's free tier
+                    max_size=5,      # Maximum connections for Heroku's free tier
+                    timeout=30,      # Connection timeout
+                    command_timeout=30,  # Command timeout
+                    max_queries=50000,   # Max queries per connection
+                    max_inactive_connection_lifetime=300.0,  # 5 minutes
+                    ssl=True,  # Required for Heroku Postgres
                     server_settings={
-                        'timezone': 'UTC',
-                        'application_name': 'WalletBud'
+                        'application_name': 'WalletBud',
+                        'statement_timeout': '30000',  # 30 seconds
+                        'idle_in_transaction_session_timeout': '300000'  # 5 minutes
                     }
                 )
-                logger.info("Database connection pool initialized")
+                logger.info("Database connection pool initialized successfully")
+                
+                # Run migrations if needed
+                await run_migrations()
+                
             except Exception as e:
-                logger.error(f"Failed to initialize database pool: {str(e)}")
+                logger.error(f"Failed to initialize database pool: {str(e)}", exc_info=True)
                 raise
 
 async def close_db():
@@ -56,31 +76,72 @@ async def cleanup_pool():
     """Clean up the database connection pool"""
     await close_db()
 
-async def get_pool() -> asyncpg.Pool:
-    """Get database connection pool
+async def get_pool():
+    """Get database connection pool, initializing if necessary"""
+    global _pool
     
-    Returns:
-        asyncpg.Pool: Database connection pool
-    
-    Raises:
-        RuntimeError: If pool is not initialized
-    """
     if _pool is None:
-        raise RuntimeError("Database pool not initialized")
+        async with _pool_lock:
+            # Double-check pattern
+            if _pool is None:
+                try:
+                    # Get DATABASE_URL from environment
+                    database_url = os.getenv('DATABASE_URL')
+                    
+                    # Handle Heroku's database URL format
+                    if database_url and database_url.startswith('postgres://'):
+                        database_url = database_url.replace('postgres://', 'postgresql://', 1)
+                    
+                    if not database_url:
+                        raise ValueError("DATABASE_URL environment variable not set")
+                    
+                    logger.info("Initializing database connection pool...")
+                    _pool = await asyncpg.create_pool(
+                        database_url,
+                        min_size=1,      # Minimum connections for Heroku's free tier
+                        max_size=5,      # Maximum connections for Heroku's free tier
+                        timeout=30,      # Connection timeout
+                        command_timeout=30,  # Command timeout
+                        max_queries=50000,   # Max queries per connection
+                        max_inactive_connection_lifetime=300.0,  # 5 minutes
+                        ssl=True,  # Required for Heroku Postgres
+                        server_settings={
+                            'application_name': 'WalletBud',
+                            'statement_timeout': '30000',  # 30 seconds
+                            'idle_in_transaction_session_timeout': '300000'  # 5 minutes
+                        }
+                    )
+                    logger.info("Database connection pool initialized successfully")
+                except Exception as e:
+                    logger.error(f"Failed to initialize database pool: {str(e)}", exc_info=True)
+                    raise
+    
     return _pool
 
-async def execute_query(query: str, *args) -> None:
-    """Execute a database query
+async def execute_query(query: str, *args):
+    """Execute a database query with retry logic"""
+    max_retries = 3
+    retry_delay = 1  # seconds
     
-    Args:
-        query (str): SQL query to execute
-        *args: Query parameters
-    """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(query, *args)
-            logger.debug(f"Executed query: {query}")
+    for attempt in range(max_retries):
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    return await conn.execute(query, *args)
+        except asyncpg.exceptions.ConnectionDoesNotExistError:
+            # Connection was closed, retry
+            global _pool
+            _pool = None  # Force pool recreation
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay * (attempt + 1))
+                continue
+            raise
+        except Exception as e:
+            logger.error(f"Database query failed: {str(e)}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
+            raise
 
 async def execute_many(query: str, args_list: list) -> None:
     """Execute a database query with multiple sets of parameters
@@ -136,6 +197,7 @@ DROP TABLE IF EXISTS dapp_interactions CASCADE;
 DROP TABLE IF EXISTS failed_transactions CASCADE;
 DROP TABLE IF EXISTS stake_addresses CASCADE;
 DROP TABLE IF EXISTS db_version CASCADE;
+DROP TABLE IF EXISTS transactions_by_month CASCADE;
 
 CREATE TABLE IF NOT EXISTS db_version (
     version INTEGER PRIMARY KEY
@@ -167,15 +229,30 @@ CREATE TABLE IF NOT EXISTS notification_settings (
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
-    id SERIAL PRIMARY KEY,
+    id SERIAL,
     wallet_id INTEGER REFERENCES wallets(id),
     tx_hash TEXT NOT NULL,
     metadata JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     archived BOOLEAN DEFAULT FALSE,
     archived_at TIMESTAMP WITH TIME ZONE,
-    UNIQUE(wallet_id, tx_hash)
-);
+    PRIMARY KEY(id, created_at),
+    UNIQUE(wallet_id, tx_hash, created_at)
+) PARTITION BY RANGE (created_at);
+
+DO $$
+BEGIN
+    FOR i IN 0..11 LOOP
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS transactions_%s_%s PARTITION OF transactions 
+            FOR VALUES FROM (%L) TO (%L)',
+            to_char(CURRENT_DATE + (interval '1 month' * i), 'YYYY'),
+            to_char(CURRENT_DATE + (interval '1 month' * i), 'MM'),
+            CURRENT_DATE + (interval '1 month' * i),
+            CURRENT_DATE + (interval '1 month' * (i + 1))
+        );
+    END LOOP;
+END $$;
 
 CREATE TABLE IF NOT EXISTS token_balances (
     id SERIAL PRIMARY KEY,
@@ -246,24 +323,6 @@ CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewa
 CREATE INDEX IF NOT EXISTS idx_policy_expiry_policy_id ON policy_expiry(policy_id);
 CREATE INDEX IF NOT EXISTS idx_dapp_interactions_address ON dapp_interactions(address);
 CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet_id ON failed_transactions(wallet_id);
-
-CREATE TABLE IF NOT EXISTS transactions_by_month (
-    LIKE transactions INCLUDING ALL
-) PARTITION BY RANGE (created_at);
-
-DO $$
-BEGIN
-    FOR i IN 0..11 LOOP
-        EXECUTE format(
-            'CREATE TABLE IF NOT EXISTS transactions_%s_%s PARTITION OF transactions_by_month
-            FOR VALUES FROM (%L) TO (%L)',
-            to_char(CURRENT_DATE + (interval '1 month' * i), 'YYYY'),
-            to_char(CURRENT_DATE + (interval '1 month' * i), 'MM'),
-            CURRENT_DATE + (interval '1 month' * i),
-            CURRENT_DATE + (interval '1 month' * (i + 1))
-        );
-    END LOOP;
-END $$;
 """
 
 # Database version tracking
@@ -364,55 +423,32 @@ async def run_migrations():
 async def init_db():
     """Initialize database and run migrations"""
     try:
-        # Get connection pool
-        pool = await get_pool()
+        # Initialize database pool
+        await get_pool()
         
-        # Create db_version table if it doesn't exist
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS db_version (
-                    version INTEGER PRIMARY KEY
-                );
-            """)
+        # Execute initialization SQL to create tables
+        async with _pool.acquire() as conn:
+            try:
+                await conn.execute(INIT_SQL)
+                logger.info("Database tables created successfully")
+            except Exception as e:
+                logger.error(f"Failed to create database tables: {str(e)}")
+                raise
         
         # Run migrations
-        if not await run_migrations():
-            raise Exception("Failed to run database migrations")
-        
-        # Verify all required tables exist
-        async with pool.acquire() as conn:
-            required_tables = [
-                'wallets', 'notification_settings', 'transactions', 'token_balances',
-                'delegation_status', 'processed_rewards', 'policy_expiry', 'dapp_interactions',
-                'failed_transactions', 'db_version', 'stake_addresses'
-            ]
-            
-            for table in required_tables:
-                exists = await conn.fetchval("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE table_schema = 'public' 
-                        AND table_name = $1
-                    )
-                """, table)
-                
-                if not exists:
-                    raise Exception(f"Missing required table: {table}")
-            
-            logger.info("All required tables verified")
-            
-            # Set up connection pool with safe settings
-            await conn.execute("""
-                SET SESSION work_mem = '50MB';  -- More memory for complex queries
-                SET SESSION maintenance_work_mem = '256MB';  -- More memory for maintenance
-                SET SESSION random_page_cost = 1.1;  -- Assume SSD storage
-                SET SESSION max_parallel_workers_per_gather = 4;  -- Use parallel queries
-                SET SESSION max_parallel_workers = 8;  -- Maximum parallel workers
-            """)
+        try:
+            await run_migrations()
+            logger.info("Database migrations completed successfully")
+        except Exception as e:
+            logger.error(f"Failed to run migrations: {str(e)}")
+            raise
             
         return True
+        
     except Exception as e:
         logger.error(f"Failed to initialize database: {str(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
         raise
 
 async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
@@ -2092,17 +2128,29 @@ async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
         return None
 
 async def execute_query(query: str, *args) -> None:
-    """Execute a database query
+    """Execute a database query with retry logic"""
+    max_retries = 3
+    retry_delay = 1  # seconds
     
-    Args:
-        query (str): SQL query to execute
-        *args: Query parameters
-    """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.execute(query, *args)
-            logger.debug(f"Executed query: {query}")
+    for attempt in range(max_retries):
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    return await conn.execute(query, *args)
+        except asyncpg.exceptions.ConnectionDoesNotExistError:
+            # Connection was closed, retry
+            global _pool
+            _pool = None  # Force pool recreation
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay * (attempt + 1))
+                continue
+            raise
+        except Exception as e:
+            logger.error(f"Database query failed: {str(e)}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
+            raise
 
 async def execute_many(query: str, args_list: list) -> None:
     """Execute a database query with multiple sets of parameters
