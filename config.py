@@ -644,7 +644,45 @@ WEBHOOK_RETRY_ATTEMPTS = ENV_VARS['WEBHOOK_RETRY_ATTEMPTS'].get_value()
 # SSL configuration
 SSL_CERT_FILE = certifi.where()
 
-# Initialize configuration
+# Database configuration
+DB_CONFIG = {
+    'min_size': int(os.getenv('DB_MIN_CONNECTIONS', '1')),
+    'max_size': int(os.getenv('DB_MAX_CONNECTIONS', '10')),
+    'max_queries': int(os.getenv('DB_MAX_QUERIES', '50000')),
+    'timeout': float(os.getenv('DB_TIMEOUT', '60')),
+    'command_timeout': float(os.getenv('DB_COMMAND_TIMEOUT', '60')),
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'port': int(os.getenv('DB_PORT', '5432')),
+    'ssl': SSL_CONFIG if os.getenv('DB_SSL', 'true').lower() == 'true' else None
+}
+
+def validate_config():
+    """Validate entire configuration"""
+    errors = []
+    
+    # Validate environment variables
+    for var_name, env_var in ENV_VARS.items():
+        try:
+            env_var.get_value()
+        except ValueError as e:
+            errors.append(str(e))
+    
+    # Validate log paths
+    for log_type, path in LOG_PATHS.items():
+        try:
+            with open(path, 'a') as f:
+                f.write('')
+        except Exception as e:
+            errors.append(f"Cannot write to {log_type} log at {path}: {str(e)}")
+    
+    # Validate SSL configuration
+    if SSL_CONFIG['verify']:
+        if not os.path.exists(SSL_CONFIG['cert_path']):
+            errors.append(f"SSL certificate not found at {SSL_CONFIG['cert_path']}")
+    
+    if errors:
+        raise ValueError("Configuration validation failed:\n" + "\n".join(errors))
+
 try:
     validate_config()
 except Exception as e:
@@ -689,30 +727,3 @@ DATABASE_COMMAND_TIMEOUT = 60
 # Discord embed limits
 EMBED_CHAR_LIMIT = 4096
 EMBED_FIELD_LIMIT = 25
-
-def validate_config():
-    """Validate entire configuration"""
-    errors = []
-    
-    # Validate environment variables
-    for var_name, env_var in ENV_VARS.items():
-        try:
-            env_var.get_value()
-        except ValueError as e:
-            errors.append(str(e))
-    
-    # Validate log paths
-    for log_type, path in LOG_PATHS.items():
-        try:
-            with open(path, 'a') as f:
-                f.write('')
-        except Exception as e:
-            errors.append(f"Cannot write to {log_type} log at {path}: {str(e)}")
-    
-    # Validate SSL configuration
-    if SSL_CONFIG['verify']:
-        if not os.path.exists(SSL_CONFIG['cert_path']):
-            errors.append(f"SSL certificate not found at {SSL_CONFIG['cert_path']}")
-    
-    if errors:
-        raise ValueError("Configuration validation failed:\n" + "\n".join(errors))
