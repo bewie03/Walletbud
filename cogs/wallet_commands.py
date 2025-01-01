@@ -6,13 +6,12 @@ from typing import Optional
 from database import (
     get_user_wallets,
     add_wallet,
-    remove_wallet,
+    remove_wallet_for_user,
     get_notification_settings,
     update_notification_setting,
     get_wallet_for_user,
     get_yummi_warning_count,
     reset_yummi_warning,
-    validate_address,
     get_stake_address,
     update_stake_address
 )
@@ -154,7 +153,7 @@ class WalletCommands(commands.Cog):
             
             # Remove wallet from database
             try:
-                await remove_wallet(str(interaction.user.id), address)
+                await remove_wallet_for_user(str(interaction.user.id), address)
                 await interaction.followup.send(
                     f"✅ Successfully removed wallet from monitoring: `{address}`",
                     ephemeral=True

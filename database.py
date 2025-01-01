@@ -33,17 +33,11 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable not set")
 
 # Add input validation for wallet addresses
-WALLET_ADDRESS_PATTERN = re.compile(r'^addr1[a-zA-Z0-9]{98}$')
-STAKE_ADDRESS_PATTERN = re.compile(r'^stake1[a-zA-Z0-9]{50}$')
+from cardano.address_validation import validate_cardano_address
 
 def validate_address(address: str, address_type: str = 'wallet') -> bool:
     """Validate Cardano address format"""
-    if address_type == 'wallet':
-        return bool(WALLET_ADDRESS_PATTERN.match(address))
-    elif address_type == 'stake':
-        return bool(STAKE_ADDRESS_PATTERN.match(address))
-    else:
-        raise ValueError(f"Invalid address type: {address_type}")
+    return validate_cardano_address(address)
 
 # Pool management with proper locking and recreation
 _pool_creation_time = None
@@ -732,33 +726,6 @@ async def get_notification_settings(user_id: str):
         if hasattr(e, '__dict__'):
             logger.error(f"Error details: {e.__dict__}")
         return None
-
-async def update_notification_setting(user_id: str, setting: str, enabled: bool):
-    """Update a specific notification setting
-    
-    Args:
-        user_id: Discord user ID
-        setting: Setting name
-        enabled: Whether to enable or disable
-        
-    Returns:
-        bool: Success status
-    """
-    if setting not in DB_CONFIG['ALLOWED_COLUMNS']['notification_settings']:
-        raise ValueError(f"Invalid notification setting: {setting}")
-        
-    query = f"""
-        UPDATE notification_settings 
-        SET {setting} = $1 
-        WHERE user_id = $2
-    """
-    
-    try:
-        await execute_transaction([(query, (enabled, user_id))])
-        return True
-    except Exception as e:
-        logger.error(f"Failed to update notification setting: {e}")
-        return False
 
 async def should_notify(user_id: str, notification_type: str) -> bool:
     """Check if a user should be notified about a specific event type"""
@@ -1989,34 +1956,6 @@ async def update_stake_pool(stake_address: str, pool_id: str) -> bool:
         logger.error(f"Error updating stake pool: {e}")
         return False
 
-async def add_wallet_for_user(user_id: str, address: str, stake_address: str = None):
-    """Add a wallet to monitor
-    
-    Args:
-        user_id: Discord user ID
-        address: Wallet address to monitor
-        stake_address: Stake address
-        
-    Returns:
-        bool: Success status
-    """
-    try:
-        async def _add_wallet_for_user(conn, user_id, address, stake_address):
-            await conn.execute(
-                """
-                INSERT INTO wallets (user_id, address, stake_address)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (user_id, address) DO NOTHING
-                """,
-                user_id, address, stake_address
-            )
-            return True
-        
-        return await execute_with_retry(_add_wallet_for_user, user_id, address, stake_address)
-    except Exception as e:
-        logger.error(f"Failed to add wallet: {e}")
-        return False
-
 async def remove_wallet_for_user(user_id: str, address: str):
     """Remove a wallet from monitoring
     
@@ -2042,58 +1981,6 @@ async def remove_wallet_for_user(user_id: str, address: str):
     except Exception as e:
         logger.error(f"Failed to remove wallet: {e}")
         return False
-
-async def update_notification_settings(user_id: str, setting: str, enabled: bool):
-    """Update a specific notification setting
-    
-    Args:
-        user_id: Discord user ID
-        setting: Setting name
-        enabled: Whether to enable or disable
-        
-    Returns:
-        bool: Success status
-    """
-    try:
-        async def _update_notification_settings(conn, user_id, setting, enabled):
-            await conn.execute(
-                f"""
-                UPDATE notification_settings
-                SET {setting} = $1
-                WHERE user_id = $2
-                """,
-                enabled, user_id
-            )
-            return True
-        
-        return await execute_with_retry(_update_notification_settings, user_id, setting, enabled)
-    except Exception as e:
-        logger.error(f"Failed to update notification setting: {e}")
-        return False
-
-async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
-    """Get user ID associated with a stake address
-    
-    Args:
-        stake_address: Stake address to look up
-        
-    Returns:
-        Optional[str]: Discord user ID or None if not found
-    """
-    try:
-        async def _get_user_id_for_stake_address(conn, stake_address):
-            query = """
-                SELECT DISTINCT user_id 
-                FROM wallets 
-                WHERE stake_address = $1
-            """
-            result = await conn.fetchval(query, stake_address)
-            return result
-        
-        return await execute_with_retry(_get_user_id_for_stake_address, stake_address)
-    except Exception as e:
-        logger.error(f"Error getting user ID for stake address {stake_address}: {e}")
-        return None
 
 async def execute_query(query: str, *args) -> None:
     """Execute a database query with retry logic"""

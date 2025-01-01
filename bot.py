@@ -64,7 +64,6 @@ from database import (
     get_addresses_for_stake,
     
     # Pool management
-    get_pool_info,
     update_pool_for_stake,
     update_stake_pool,
     get_delegation_status,
@@ -103,7 +102,6 @@ from database import (
     update_notification_setting,
     initialize_notification_settings,
     should_notify,
-    update_notification_settings,
     
     # Database errors
     DatabaseError,
