@@ -263,19 +263,25 @@ def validate_policy_id(value: str, name: str) -> str:
     """Validate policy ID format"""
     if not value:
         return value
-    if not re.match(r'^[0-9a-fA-F]{56}$', value):
-        raise ValueError(f"{name} must be a 56-character hexadecimal string")
-    return value
+    try:
+        value = value.strip()
+        if not re.match(r'^[0-9a-fA-F]{56}$', value):
+            raise ValueError(f"{name} must be a 56-character hexadecimal string")
+        return value.lower()
+    except (ValueError, AttributeError):
+        raise ValueError(f"{name} must be a valid 56-character hexadecimal string")
 
 def validate_token_name(value: str, name: str) -> str:
     """Validate token name format"""
     if not value:
         return value
     try:
-        # Token name should be valid hex
-        bytes.fromhex(value)
-        return value
-    except ValueError:
+        value = value.strip()
+        # Token name should be valid hex and not too long (max 32 bytes = 64 chars)
+        if not re.match(r'^[0-9a-fA-F]{1,64}$', value):
+            raise ValueError(f"{name} must be a valid hex string (1-64 characters)")
+        return value.lower()
+    except (ValueError, AttributeError):
         raise ValueError(f"{name} must be a valid hexadecimal string")
 
 def validate_hex(value: str, length: int, name: str) -> str:
@@ -468,15 +474,17 @@ ENV_VARS = {
     ),
     'YUMMI_POLICY_ID': EnvVar(
         name='YUMMI_POLICY_ID',
-        description="YUMMI Policy ID",
+        description="YUMMI Policy ID (56-character hex)",
         validator=validate_policy_id,
-        required=False
+        required=False,
+        default=None
     ),
     'YUMMI_TOKEN_NAME': EnvVar(
         name='YUMMI_TOKEN_NAME',
-        description="YUMMI Token Name",
+        description="YUMMI Token Name (hex)",
         validator=validate_token_name,
-        required=False
+        required=False,
+        default=None
     ),
 }
 
