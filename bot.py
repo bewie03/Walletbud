@@ -995,6 +995,28 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Failed to set up admin channel: {e}")
             # Don't raise here as bot can function without admin channel
 
+    async def init_database(self):
+        """Initialize database connection with proper error handling"""
+        try:
+            # Initialize the database pool
+            self.pool = await get_pool()
+            if not self.pool:
+                raise RuntimeError("Failed to create database pool")
+                
+            # Test the connection
+            async with self.pool.acquire() as conn:
+                await conn.fetchval('SELECT 1')
+                
+            logger.info("Database initialized successfully")
+            if self.admin_channel:
+                await self.admin_channel.send("✅ Database initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"🚨 ERROR: Database initialization failed: {e}")
+            raise
+
     async def _check_connection_loop(self):
         """Background task to periodically check connection status"""
         while True:
