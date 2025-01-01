@@ -397,6 +397,11 @@ CREATE TABLE IF NOT EXISTS migration_history (
     PRIMARY KEY (version)
 );
 
+CREATE TABLE IF NOT EXISTS db_version (
+    version INTEGER PRIMARY KEY,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Main tables
 CREATE TABLE IF NOT EXISTS wallets (
     id SERIAL PRIMARY KEY,
@@ -411,7 +416,8 @@ CREATE TABLE IF NOT EXISTS wallets (
     monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Add indices for frequently queried fields
+-- Create indices for wallets table
+CREATE INDEX IF NOT EXISTS idx_wallets_id ON wallets(id);
 CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
 CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
 CREATE INDEX IF NOT EXISTS idx_wallets_stake_address ON wallets(stake_address);
@@ -421,6 +427,14 @@ CREATE INDEX IF NOT EXISTS idx_wallets_last_checked ON wallets(last_checked);
 -- Add GiST index for JSONB fields for faster querying
 CREATE INDEX IF NOT EXISTS idx_wallets_token_balances ON wallets USING gin (token_balances);
 CREATE INDEX IF NOT EXISTS idx_wallets_utxo_state ON wallets USING gin (utxo_state);
+
+CREATE TABLE IF NOT EXISTS delegation_status (
+    stake_address TEXT PRIMARY KEY,
+    pool_id TEXT,
+    last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_delegation_status_stake_address ON delegation_status(stake_address);
 
 CREATE TABLE IF NOT EXISTS notification_settings (
     user_id TEXT PRIMARY KEY,
@@ -433,7 +447,6 @@ CREATE TABLE IF NOT EXISTS notification_settings (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Add index for notification settings user_id
 CREATE INDEX IF NOT EXISTS idx_notification_settings_user_id ON notification_settings(user_id);
 
 CREATE TABLE IF NOT EXISTS processed_rewards (
@@ -444,7 +457,6 @@ CREATE TABLE IF NOT EXISTS processed_rewards (
     PRIMARY KEY (stake_address, epoch)
 );
 
--- Add index for processed rewards lookup
 CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewards(stake_address);
 CREATE INDEX IF NOT EXISTS idx_processed_rewards_epoch ON processed_rewards(epoch);
 
@@ -455,7 +467,6 @@ CREATE TABLE IF NOT EXISTS processed_token_changes (
     PRIMARY KEY (wallet_id, tx_hash)
 );
 
--- Add index for token changes lookup
 CREATE INDEX IF NOT EXISTS idx_processed_token_changes_wallet ON processed_token_changes(wallet_id);
 CREATE INDEX IF NOT EXISTS idx_processed_token_changes_tx ON processed_token_changes(tx_hash);
 
@@ -468,7 +479,6 @@ CREATE TABLE IF NOT EXISTS failed_transactions (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Add indices for failed transactions
 CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet ON failed_transactions(wallet_id);
 CREATE INDEX IF NOT EXISTS idx_failed_transactions_tx ON failed_transactions(tx_hash);
 CREATE INDEX IF NOT EXISTS idx_failed_transactions_error ON failed_transactions(error_type);
@@ -484,7 +494,6 @@ CREATE TABLE IF NOT EXISTS asset_history (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Add indices for asset history
 CREATE INDEX IF NOT EXISTS idx_asset_history_wallet ON asset_history(wallet_id);
 CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id);
 CREATE INDEX IF NOT EXISTS idx_asset_history_tx ON asset_history(tx_hash);
@@ -496,7 +505,6 @@ CREATE TABLE IF NOT EXISTS policy_expiry (
     last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Add index for policy expiry lookup
 CREATE INDEX IF NOT EXISTS idx_policy_expiry_slot ON policy_expiry(expiry_slot);
 
 CREATE TABLE IF NOT EXISTS dapp_interactions (
@@ -506,13 +514,7 @@ CREATE TABLE IF NOT EXISTS dapp_interactions (
     PRIMARY KEY (wallet_id)
 );
 
--- Add index for dapp interactions
 CREATE INDEX IF NOT EXISTS idx_dapp_interactions_tx ON dapp_interactions(last_tx);
-
-CREATE TABLE IF NOT EXISTS db_version (
-    version INTEGER PRIMARY KEY,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
 """
 
 # Database version tracking
