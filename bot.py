@@ -256,7 +256,7 @@ class WalletBudBot(commands.Bot):
         
         # Initialize webhook components
         self.app = web.Application()
-        self.runner = web.AppRunner(self.app)
+        self.runner = None
         self.site = None
         self._webhook_queue = asyncio.Queue()
         self._webhook_processor = None
@@ -1110,14 +1110,10 @@ class WalletBudBot(commands.Bot):
     async def start_webhook(self):
         """Start the webhook server"""
         try:
-            # Set up webhook routing
-            self.app.router.add_post('/webhook', self.handle_webhook)
-            
-            # Start the app runner
-            await self.runner.setup()
+            # Get port from environment
+            port = int(os.getenv('PORT', 8080))
             
             # Create site and start it
-            port = int(os.getenv('PORT', 8080))
             self.site = web.TCPSite(self.runner, '0.0.0.0', port)
             await self.site.start()
             
@@ -1422,9 +1418,11 @@ class WalletBudBot(commands.Bot):
             await self.init_blockfrost()
             logger.info("Blockfrost client initialized")
             
-            # Initialize webhook server
-            await self.start_webhook()
-            logger.info("Webhook server initialized")
+            # Initialize webhook components
+            self.app.router.add_post('/webhook', self.handle_webhook)
+            self.runner = web.AppRunner(self.app)
+            await self.runner.setup()
+            logger.info("Webhook components initialized")
             
             # Start webhook processor
             self._webhook_processor = asyncio.create_task(self._process_webhook_queue())
@@ -1434,6 +1432,22 @@ class WalletBudBot(commands.Bot):
             
         except Exception as e:
             logger.error(f"Failed to initialize dependencies: {e}")
+            raise
+
+    async def start_webhook(self):
+        """Start the webhook server"""
+        try:
+            # Get port from environment
+            port = int(os.getenv('PORT', 8080))
+            
+            # Create site and start it
+            self.site = web.TCPSite(self.runner, '0.0.0.0', port)
+            await self.site.start()
+            
+            logger.info(f"Webhook server started on port {port}")
+            
+        except Exception as e:
+            logger.error(f"Failed to start webhook server: {e}")
             raise
 
     async def _check_yummi_balances(self):
@@ -1680,12 +1694,6 @@ if __name__ == "__main__":
 
         async def main():
             try:
-                # Check environment variables
-                await bot.check_environment()
-                
-                # Get port from environment for Heroku
-                port = int(os.getenv('PORT', 8080))
-                
                 # Create event loop
                 loop = asyncio.get_running_loop()
                 
@@ -1696,11 +1704,12 @@ if __name__ == "__main__":
                     ))
                 
                 try:
-                    # Start webhook server
+                    # Start the bot (this will call setup_hook)
+                    await bot.start(DISCORD_TOKEN)
+                    
+                    # Start webhook server after bot is ready
                     await bot.start_webhook()
                     
-                    # Run the bot
-                    await bot.start(DISCORD_TOKEN)
                 except Exception as e:
                     logger.error(f"Error during bot operation: {e}")
                     raise
