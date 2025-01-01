@@ -1132,8 +1132,8 @@ def validate_environment_variables():
         # Validate specific variables
         try:
             if var == 'DISCORD_TOKEN':
-                if not re.match(r'^[A-Za-z0-9_-]{24,}$', value):
-                    invalid_vars.append(f"{var}: Invalid token format")
+                if len(value) < 10:
+                    invalid_vars.append(f"{var}: Token too short")
             elif var == 'APPLICATION_ID':
                 if not value.isdigit():
                     invalid_vars.append(f"{var}: Must be a numeric ID")
@@ -1239,13 +1239,19 @@ def validate_config():
         else:
             try:
                 if var == 'DISCORD_TOKEN':
-                    validate_discord_token(value, var)
+                    if len(value) < 10:
+                        invalid_vars.append(f"{var}: Token too short")
+                elif var == 'APPLICATION_ID':
+                    if not value.isdigit():
+                        invalid_vars.append(f"{var}: Must be a numeric ID")
                 elif var == 'DATABASE_URL':
-                    validate_database_url(value, var)
-                elif var == 'BLOCKFROST_PROJECT_ID':
-                    validate_blockfrost_project_id(value, var)
-            except ValueError as e:
-                errors.append(f"Invalid {var}: {str(e)}")
+                    if not value.startswith(('postgresql://', 'postgres://')):
+                        invalid_vars.append(f"{var}: Must be a PostgreSQL URL")
+                elif var == 'ADMIN_CHANNEL_ID':
+                    if not value.isdigit():
+                        invalid_vars.append(f"{var}: Must be a numeric ID")
+            except Exception as e:
+                invalid_vars.append(f"{var}: {str(e)}")
     
     # Set defaults for optional variables
     for var, (default, type_func) in optional_vars.items():
