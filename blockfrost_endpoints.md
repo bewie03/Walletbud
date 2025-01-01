@@ -13,14 +13,8 @@ Blockfrost implements the following rate limiting rules:
 - Example: If a user makes a burst of requests, they can make 30 more requests after 3 seconds
 
 ## Network Endpoints
-| Network | Endpoint |
-|---------|----------|
-| Cardano mainnet | https://cardano-mainnet.blockfrost.io/api/v0 |
-| Cardano preprod | https://cardano-preprod.blockfrost.io/api/v0 |
-| Cardano preview | https://cardano-preview.blockfrost.io/api/v0 |
-| InterPlanetary File System | https://ipfs.blockfrost.io/api/v0 |
-| Milkomeda mainnet | https://milkomeda-mainnet.blockfrost.io/api/v0 |
-| Milkomeda testnet | https://milkomeda-testnet.blockfrost.io/api/v0 |
+Cardano mainnet:  https://cardano-mainnet.blockfrost.io/api/v0
+https://cardano-mainnet.blockfrost.io/api/v0/health 
 
 ## Account Methods
 - `account_addresses` - Get account associated addresses

@@ -3,9 +3,10 @@ import json
 import logging
 import asyncio
 import asyncpg
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any, Union, Tuple
 from dotenv import load_dotenv
+import re
 
 # Load environment variables
 load_dotenv()
@@ -33,10 +34,159 @@ DB_CONFIG = {
     }
 }
 
-# Global connection pool with proper locking
-_pool = None
+# Pool management with proper locking and recreation
+_pool_creation_time = None
+_pool_max_age = timedelta(hours=1)  # Recreate pool every hour
 _pool_lock = asyncio.Lock()
-_pool_init_error = None
+_pool = None
+
+def get_database_url() -> str:
+    """Get and validate database URL with proper Heroku postgres:// to postgresql:// conversion"""
+    url = os.getenv('DATABASE_URL')
+    if not url:
+        raise ConnectionError("DATABASE_URL environment variable not set")
+    
+    # Heroku provides postgres://, but asyncpg requires postgresql://
+    if url.startswith('postgres://'):
+        url = url.replace('postgres://', 'postgresql://', 1)
+    
+    return url
+
+async def get_pool():
+    """Get database connection pool with initialization check and proper locking"""
+    global _pool, _pool_creation_time
+    
+    async with _pool_lock:
+        # Check if pool needs recreation
+        if (_pool is None or 
+            _pool_creation_time is None or 
+            datetime.now() - _pool_creation_time > _pool_max_age):
+            
+            if _pool:
+                logger.info("Closing existing connection pool")
+                try:
+                    await _pool.close()
+                except Exception as e:
+                    logger.warning(f"Error closing pool: {e}")
+            
+            try:
+                db_url = get_database_url()
+                
+                # Configure SSL for Heroku
+                ssl_config = None
+                if 'amazonaws.com' in db_url or 'herokuapp.com' in db_url:
+                    ssl_config = {
+                        'sslmode': 'require',
+                        'ssl': True,
+                        'ssl_min_protocol_version': 'TLSv1.2'
+                    }
+                
+                # Create connection pool with configurable settings
+                _pool = await asyncpg.create_pool(
+                    db_url,
+                    min_size=DB_CONFIG['MIN_POOL_SIZE'],
+                    max_size=DB_CONFIG['MAX_POOL_SIZE'],
+                    command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
+                    ssl=ssl_config,
+                    max_cached_statement_lifetime=600,
+                    max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
+                    server_settings={
+                        'application_name': 'WalletBud',
+                        'statement_timeout': f"{DB_CONFIG['COMMAND_TIMEOUT']}000",
+                        'idle_in_transaction_session_timeout': f"{DB_CONFIG['TRANSACTION_TIMEOUT']}000",
+                        'lock_timeout': '10000',  # 10 second lock timeout
+                        'tcp_keepalives_idle': '60',
+                        'tcp_keepalives_interval': '10',
+                        'tcp_keepalives_count': '3'
+                    }
+                )
+                
+                # Verify connection works
+                async with _pool.acquire() as conn:
+                    await conn.fetchval('SELECT 1')
+                
+                _pool_creation_time = datetime.now()
+                logger.info(f"Database pool initialized (size: {DB_CONFIG['MIN_POOL_SIZE']}-{DB_CONFIG['MAX_POOL_SIZE']})")
+                
+            except Exception as e:
+                logger.error(f"Failed to create connection pool: {e}")
+                _pool = None
+                _pool_creation_time = None
+                raise ConnectionError(f"Could not create database pool: {str(e)}") from e
+    
+    return _pool
+
+async def reset_pool():
+    """Reset the connection pool with proper cleanup"""
+    global _pool, _pool_creation_time
+    async with _pool_lock:
+        if _pool:
+            await _pool.close()
+        _pool = None
+        _pool_creation_time = None
+
+# Enhanced retry logic with exponential backoff
+RETRY_DELAYS = [1, 2, 5, 10, 30]  # Exponential backoff delays
+
+async def execute_with_retry(func, *args, retries=None):
+    """Execute database operation with retry logic and proper error handling"""
+    retries = retries if retries is not None else len(RETRY_DELAYS)
+    last_error = None
+    
+    for attempt, delay in enumerate(RETRY_DELAYS[:retries]):
+        try:
+            return await func(*args)
+        except asyncpg.InterfaceError:
+            # Pool/connection is broken, force recreation
+            await reset_pool()
+            last_error = f"Interface error on attempt {attempt + 1}"
+        except asyncpg.PostgresError as e:
+            if e.sqlstate.startswith(('40', '53', '55', '57P01')):  # Include admin shutdown
+                last_error = f"Recoverable error on attempt {attempt + 1}: {str(e)}"
+                await asyncio.sleep(delay)
+                continue
+            raise QueryError(f"Database error: {str(e)}") from e
+        except asyncio.TimeoutError:
+            last_error = f"Timeout on attempt {attempt + 1}"
+            await asyncio.sleep(delay)
+            continue
+        except Exception as e:
+            raise DatabaseError(f"Unexpected error: {str(e)}") from e
+    
+    raise ConnectionError(f"Max retries exceeded. Last error: {last_error}")
+
+# Update fetch functions to use retry logic
+async def fetch_all(query: str, *args, retries=None) -> List[asyncpg.Record]:
+    """Fetch all rows with retry logic and proper error handling"""
+    async def _fetch():
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                return await conn.fetch(query, *args)
+    
+    return await execute_with_retry(_fetch, retries=retries)
+
+async def fetch_one(query: str, *args, retries=None) -> Optional[asyncpg.Record]:
+    """Fetch single row with retry logic and proper error handling"""
+    async def _fetch():
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                return await conn.fetchrow(query, *args)
+    
+    return await execute_with_retry(_fetch, retries=retries)
+
+# Add input validation for wallet addresses
+WALLET_ADDRESS_PATTERN = re.compile(r'^addr1[a-zA-Z0-9]{98}$')
+STAKE_ADDRESS_PATTERN = re.compile(r'^stake1[a-zA-Z0-9]{50}$')
+
+def validate_address(address: str, address_type: str = 'wallet') -> bool:
+    """Validate Cardano address format"""
+    if address_type == 'wallet':
+        return bool(WALLET_ADDRESS_PATTERN.match(address))
+    elif address_type == 'stake':
+        return bool(STAKE_ADDRESS_PATTERN.match(address))
+    raise ValueError(f"Invalid address type: {address_type}")
 
 class DatabaseError(Exception):
     """Base class for database exceptions"""
@@ -52,177 +202,49 @@ class QueryError(DatabaseError):
 
 async def init_db():
     """Initialize database connection pool with proper error handling"""
-    global _pool, _pool_init_error
-    
-    if _pool_init_error:
-        logger.warning("Previous pool initialization failed, resetting error state")
-        _pool_init_error = None
-    
-    async with _pool_lock:
-        if _pool is not None:
-            logger.warning("Database pool already initialized")
-            return _pool
-            
-        try:
-            # Determine SSL mode based on URL
-            ssl_required = 'amazonaws.com' in DATABASE_URL or 'herokuapp.com' in DATABASE_URL
-            ssl_mode = 'require' if ssl_required else None
-            
-            # Create connection pool with configurable settings
-            _pool = await asyncpg.create_pool(
-                DATABASE_URL,
-                min_size=DB_CONFIG['MIN_POOL_SIZE'],
-                max_size=DB_CONFIG['MAX_POOL_SIZE'],
-                command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
-                ssl=ssl_mode,
-                max_cached_statement_lifetime=600,
-                max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
-                server_settings={
-                    'application_name': 'WalletBud',
-                    'statement_timeout': f"{DB_CONFIG['COMMAND_TIMEOUT']}000",
-                    'idle_in_transaction_session_timeout': f"{DB_CONFIG['TRANSACTION_TIMEOUT']}000",
-                    'lock_timeout': '10000'  # 10 second lock timeout
-                }
-            )
-            
-            # Test connection
-            async with _pool.acquire() as conn:
-                await conn.execute('SELECT 1')
-                
-            logger.info(
-                f"Database pool initialized (size: {DB_CONFIG['MIN_POOL_SIZE']}-{DB_CONFIG['MAX_POOL_SIZE']})"
-            )
-            return _pool
-            
-        except Exception as e:
-            _pool_init_error = str(e)
-            logger.error(f"Failed to initialize database pool: {str(e)}")
-            raise ConnectionError(f"Database initialization failed: {str(e)}")
+    try:
+        await get_pool()
+    except Exception as e:
+        logger.error(f"Failed to initialize database pool: {str(e)}")
+        raise ConnectionError(f"Database initialization failed: {str(e)}")
 
-async def get_pool():
-    """Get database connection pool with initialization check"""
-    global _pool
-    if _pool is None:
-        # Create connection pool with configurable settings
-        try:
-            # Determine SSL mode based on URL
-            ssl_required = 'amazonaws.com' in DATABASE_URL or 'herokuapp.com' in DATABASE_URL
-            ssl_mode = 'require' if ssl_required else None
-            
-            # Create connection pool with configurable settings
-            _pool = await asyncpg.create_pool(
-                DATABASE_URL,
-                min_size=DB_CONFIG['MIN_POOL_SIZE'],
-                max_size=DB_CONFIG['MAX_POOL_SIZE'],
-                command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
-                ssl=ssl_mode,
-                max_cached_statement_lifetime=600,
-                max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
-                server_settings={
-                    'application_name': 'WalletBud',
-                    'statement_timeout': f"{DB_CONFIG['COMMAND_TIMEOUT']}000",
-                    'idle_in_transaction_session_timeout': f"{DB_CONFIG['TRANSACTION_TIMEOUT']}000",
-                    'lock_timeout': '10000'  # 10 second lock timeout
-                }
+async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
+    """Add a wallet with proper validation and error handling"""
+    if not validate_address(address, 'wallet'):
+        raise ValueError(f"Invalid wallet address format: {address}")
+    
+    if stake_address and not validate_address(stake_address, 'stake'):
+        raise ValueError(f"Invalid stake address format: {stake_address}")
+    
+    try:
+        queries = [
+            (
+                """
+                INSERT INTO wallets (user_id, address, stake_address)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (address) DO UPDATE
+                SET user_id = $1, stake_address = $3
+                RETURNING id
+                """,
+                (user_id, address, stake_address)
+            ),
+            (
+                """
+                INSERT INTO notification_settings (user_id)
+                VALUES ($1)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (user_id,)
             )
-            
-            # Test connection
-            async with _pool.acquire() as conn:
-                await conn.execute('SELECT 1')
-                
-            logger.info(
-                f"Database pool initialized (size: {DB_CONFIG['MIN_POOL_SIZE']}-{DB_CONFIG['MAX_POOL_SIZE']})"
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize database pool: {str(e)}")
-            _pool = None
-            raise ConnectionError(f"Database initialization failed: {str(e)}")
-            
-    return _pool
-
-async def fetch_all(query: str, *args, retries: int = None) -> List[asyncpg.Record]:
-    """Fetch all rows from a database query with retries
-    
-    Args:
-        query: SQL query to execute
-        *args: Query parameters
-        retries: Number of retry attempts
+        ]
         
-    Returns:
-        List[asyncpg.Record]: Query results
+        await execute_transaction(queries)
+        logger.info(f"Successfully added wallet {address} for user {user_id}")
+        return True
         
-    Raises:
-        QueryError: If query fails after all retries
-    """
-    retries = retries if retries is not None else DB_CONFIG['RETRY_ATTEMPTS']
-    last_error = None
-    
-    for attempt in range(retries):
-        try:
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    return await conn.fetch(query, *args)
-                    
-        except asyncpg.InterfaceError:
-            # Connection is broken, force pool reinitialization
-            global _pool
-            _pool = None
-            continue
-            
-        except asyncpg.PostgresError as e:
-            last_error = e
-            if attempt < retries - 1:
-                delay = DB_CONFIG['RETRY_DELAY'] * (2 ** attempt)
-                logger.warning(f"Query failed (attempt {attempt + 1}/{retries}), retrying in {delay}s: {str(e)}")
-                await asyncio.sleep(delay)
-            
-        except Exception as e:
-            raise QueryError(f"Unexpected error executing query: {str(e)}")
-            
-    raise QueryError(f"Query failed after {retries} attempts: {str(last_error)}")
-
-async def fetch_one(query: str, *args, retries: int = None) -> Optional[asyncpg.Record]:
-    """Fetch a single row with retries
-    
-    Args:
-        query: SQL query to execute
-        *args: Query parameters
-        retries: Number of retry attempts
-        
-    Returns:
-        Optional[asyncpg.Record]: Query result or None if not found
-        
-    Raises:
-        QueryError: If query fails after all retries
-    """
-    retries = retries if retries is not None else DB_CONFIG['RETRY_ATTEMPTS']
-    last_error = None
-    
-    for attempt in range(retries):
-        try:
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    return await conn.fetchrow(query, *args)
-                    
-        except asyncpg.InterfaceError:
-            # Connection is broken, force pool reinitialization
-            global _pool
-            _pool = None
-            continue
-            
-        except asyncpg.PostgresError as e:
-            last_error = e
-            if attempt < retries - 1:
-                delay = DB_CONFIG['RETRY_DELAY'] * (2 ** attempt)
-                logger.warning(f"Query failed (attempt {attempt + 1}/{retries}), retrying in {delay}s: {str(e)}")
-                await asyncio.sleep(delay)
-            
-        except Exception as e:
-            raise QueryError(f"Unexpected error executing query: {str(e)}")
-            
-    raise QueryError(f"Query failed after {retries} attempts: {str(last_error)}")
+    except QueryError as e:
+        logger.error(f"Failed to add wallet: {str(e)}")
+        return False
 
 async def execute_transaction(queries: List[tuple[str, tuple]], retries: int = None) -> None:
     """Execute multiple queries in a single transaction with retries
@@ -248,68 +270,6 @@ async def execute_transaction(queries: List[tuple[str, tuple]], retries: int = N
                         await asyncio.sleep(DB_CONFIG['RETRY_DELAY'])
                         return await execute_transaction(queries, retry_count - 1)
                     raise QueryError(f"Transaction failed after {DB_CONFIG['RETRY_ATTEMPTS']} retries: {e}")
-
-async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
-    """Add a wallet with proper validation and error handling
-    
-    Args:
-        user_id: Discord user ID
-        address: Wallet address
-        stake_address: Optional stake address
-        
-    Returns:
-        bool: Success status
-        
-    Raises:
-        ValueError: If input validation fails
-    """
-    # Validate inputs
-    if not user_id or not address:
-        raise ValueError("user_id and address are required")
-        
-    if not isinstance(user_id, str) or not isinstance(address, str):
-        raise ValueError("user_id and address must be strings")
-        
-    if stake_address and not isinstance(stake_address, str):
-        raise ValueError("stake_address must be a string if provided")
-        
-    try:
-        # Check if wallet already exists
-        existing = await fetch_one(
-            "SELECT id FROM wallets WHERE address = $1",
-            address
-        )
-        if existing:
-            logger.warning(f"Wallet {address} already exists")
-            return False
-            
-        # Add wallet and initialize notification settings in transaction
-        queries = [
-            (
-                """
-                INSERT INTO wallets (user_id, address, stake_address)
-                VALUES ($1, $2, $3)
-                RETURNING id
-                """,
-                (user_id, address, stake_address)
-            ),
-            (
-                """
-                INSERT INTO notification_settings (user_id)
-                VALUES ($1)
-                ON CONFLICT (user_id) DO NOTHING
-                """,
-                (user_id,)
-            )
-        ]
-        
-        await execute_transaction(queries)
-        logger.info(f"Successfully added wallet {address} for user {user_id}")
-        return True
-        
-    except QueryError as e:
-        logger.error(f"Failed to add wallet: {str(e)}")
-        return False
 
 async def update_notification_setting(user_id: str, setting: str, enabled: bool) -> bool:
     """Update a notification setting with proper validation
@@ -862,7 +822,7 @@ async def update_notification_setting(user_id: str, setting: str, enabled: bool)
     """
     
     try:
-        await execute_query(query, enabled, user_id)
+        await execute_transaction([(query, (enabled, user_id))])
         return True
     except Exception as e:
         logger.error(f"Failed to update notification setting: {e}")

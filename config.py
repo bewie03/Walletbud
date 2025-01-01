@@ -1,16 +1,249 @@
 import os
-import logging
 import re
-from typing import Optional, Any, List
-from dataclasses import dataclass
-from dotenv import load_dotenv
-import json
-import math
-import ipaddress
-import aiohttp
-import asyncio
-import asyncpg
+import ssl
+import logging
+import certifi
 from urllib.parse import urlparse
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+from ipaddress import ip_network
+
+# Environment and logging configuration
+ENV = os.getenv('ENV', 'development')
+LOG_LEVEL = logging.DEBUG if ENV == 'development' else logging.INFO
+LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+
+# Ensure log directory exists
+LOG_DIR = 'logs'
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Logging paths with validation
+LOG_PATHS = {
+    'bot': os.path.join(LOG_DIR, 'bot.log'),
+    'error': os.path.join(LOG_DIR, 'error.log'),
+    'webhook': os.path.join(LOG_DIR, 'webhook.log')
+}
+
+# Test addresses for different networks
+TEST_ADDRESSES = {
+    'mainnet': os.getenv('TEST_ADDRESS_MAINNET', 'addr1qxqs59lphg8g6qndelq8xwqn60ag3aeyfcp33c2kdp46a09re5df3pzwwmyq946axfcejy5n4x0y99wqpgtp2gd0k09qsgy6pz'),
+    'testnet': os.getenv('TEST_ADDRESS_TESTNET', 'addr_test1qp09cl0hpvz5rn9zeac0gkrf5hn25ven9m6u8qh4hi0v8g99vxwvze9nnkth7p3g2m5e7hv4f3p9kjkccy5mtc77q6wsd6qm3e'),
+    'preview': os.getenv('TEST_ADDRESS_PREVIEW', 'addr_test1qp09cl0hpvz5rn9zeac0gkrf5hn25ven9m6u8qh4hi0v8g99vxwvze9nnkth7p3g2m5e7hv4f3p9kjkccy5mtc77q6wsd6qm3e')
+}
+
+# Rate limits and timeouts with proper validation
+RATE_LIMITS = {
+    'blockfrost': {
+        'calls_per_second': int(os.getenv('BLOCKFROST_RATE_LIMIT', '10')),
+        'burst': int(os.getenv('BLOCKFROST_BURST_LIMIT', '50')),
+        'timeout': int(os.getenv('BLOCKFROST_TIMEOUT', '30'))
+    },
+    'discord': {
+        'global_rate_limit': int(os.getenv('DISCORD_GLOBAL_RATE_LIMIT', '50')),
+        'command_rate_limit': int(os.getenv('DISCORD_COMMAND_RATE_LIMIT', '5')),
+        'timeout': int(os.getenv('DISCORD_TIMEOUT', '30'))
+    },
+    'webhook': {
+        'requests_per_minute': int(os.getenv('WEBHOOK_RATE_LIMIT', '60')),
+        'burst': int(os.getenv('WEBHOOK_BURST_LIMIT', '10')),
+        'timeout': int(os.getenv('WEBHOOK_TIMEOUT', '30'))
+    }
+}
+
+# Database configuration with connection pooling
+DATABASE_CONFIG = {
+    'min_size': int(os.getenv('DATABASE_POOL_MIN_SIZE', '10')),
+    'max_size': int(os.getenv('DATABASE_POOL_MAX_SIZE', '100')),
+    'max_queries': int(os.getenv('DATABASE_MAX_QUERIES', '50000')),
+    'timeout': int(os.getenv('DATABASE_TIMEOUT', '30')),
+    'command_timeout': int(os.getenv('DATABASE_COMMAND_TIMEOUT', '60')),
+    'ssl': os.getenv('DATABASE_SSL', 'true').lower() == 'true'
+}
+
+# SSL Configuration with proper cert handling
+SSL_CONFIG = {
+    'verify': os.getenv('SSL_VERIFY', 'true').lower() == 'true',
+    'cert_required': os.getenv('SSL_CERT_REQUIRED', 'true').lower() == 'true',
+    'cert_path': os.getenv('SSL_CERT_PATH', certifi.where()),
+    'check_hostname': os.getenv('SSL_CHECK_HOSTNAME', 'true').lower() == 'true'
+}
+
+# Webhook configuration with proper validation
+WEBHOOK_CONFIG = {
+    'queue_size': int(os.getenv('WEBHOOK_QUEUE_SIZE', '1000')),
+    'retry_attempts': int(os.getenv('WEBHOOK_RETRY_ATTEMPTS', '3')),
+    'backoff_factor': float(os.getenv('WEBHOOK_BACKOFF_FACTOR', '1.5')),
+    'max_backoff': int(os.getenv('WEBHOOK_MAX_BACKOFF', '30')),
+    'timeout': int(os.getenv('WEBHOOK_TIMEOUT', '30')),
+    'confirmations': int(os.getenv('WEBHOOK_CONFIRMATIONS', '3'))
+}
+
+# Blockfrost network configuration
+BLOCKFROST_NETWORKS = {
+    'mainnet': 'https://cardano-mainnet.blockfrost.io/api/v0',
+    'testnet': 'https://cardano-testnet.blockfrost.io/api/v0',
+    'preview': 'https://cardano-preview.blockfrost.io/api/v0',
+    'preprod': 'https://cardano-preprod.blockfrost.io/api/v0'
+}
+
+@dataclass
+class EnvVar:
+    """Environment variable configuration with validation"""
+    name: str
+    description: str
+    required: bool = True
+    default: Any = None
+    validator: Optional[Callable] = None
+    sensitive: bool = False
+
+    def get_value(self) -> Any:
+        """Get validated environment variable value"""
+        value = os.getenv(self.name, self.default)
+        
+        if self.required and not value:
+            raise ValueError(f"Required environment variable {self.name} ({self.description}) is not set")
+            
+        if value and self.validator:
+            try:
+                return self.validator(value, self.name)
+            except Exception as e:
+                raise ValueError(f"Invalid {self.name}: {str(e)}")
+                
+        return value
+
+def validate_url(value: str, name: str) -> str:
+    """Validate URL format"""
+    try:
+        result = urlparse(value)
+        if not all([result.scheme, result.netloc]):
+            raise ValueError("Invalid URL format")
+        return value
+    except Exception as e:
+        raise ValueError(f"Invalid URL format: {str(e)}")
+
+def validate_database_url(value: str, name: str) -> str:
+    """Validate and normalize database URL"""
+    if value.startswith('postgres://'):
+        value = value.replace('postgres://', 'postgresql://', 1)
+    
+    try:
+        result = urlparse(value)
+        if not all([result.scheme, result.netloc, result.path]):
+            raise ValueError("Invalid database URL format")
+        if result.scheme not in ['postgresql', 'postgres']:
+            raise ValueError("Invalid database scheme")
+        return value
+    except Exception as e:
+        raise ValueError(f"Invalid database URL: {str(e)}")
+
+def validate_discord_token(value: str, name: str) -> str:
+    """Validate Discord bot token format"""
+    if not re.match(r'^[A-Za-z0-9\-_]{59}$', value):
+        raise ValueError("Invalid Discord token format")
+    return value
+
+def validate_blockfrost_project_id(value: str, name: str) -> str:
+    """Validate Blockfrost project ID format and network"""
+    networks = ['mainnet', 'testnet', 'preview', 'preprod']
+    if not any(value.startswith(network) for network in networks):
+        raise ValueError(f"Project ID must start with one of: {', '.join(networks)}")
+    if not re.match(r'^[a-z]+[A-Za-z0-9]{32}$', value):
+        raise ValueError("Invalid project ID format")
+    return value
+
+def validate_blockfrost_url(value: str, name: str) -> str:
+    """Validate Blockfrost API URL"""
+    valid_urls = list(BLOCKFROST_NETWORKS.values())
+    if value not in valid_urls:
+        raise ValueError(f"Must be one of: {', '.join(valid_urls)}")
+    return value
+
+# Required environment variables with validation
+ENV_VARS = {
+    'DISCORD_TOKEN': EnvVar(
+        'DISCORD_TOKEN',
+        'Discord bot token',
+        validator=validate_discord_token,
+        sensitive=True
+    ),
+    'DATABASE_URL': EnvVar(
+        'DATABASE_URL',
+        'PostgreSQL connection URL',
+        validator=validate_database_url,
+        sensitive=True
+    ),
+    'BLOCKFROST_PROJECT_ID': EnvVar(
+        'BLOCKFROST_PROJECT_ID',
+        'Blockfrost project ID',
+        validator=validate_blockfrost_project_id,
+        sensitive=True
+    ),
+    'BLOCKFROST_BASE_URL': EnvVar(
+        'BLOCKFROST_BASE_URL',
+        'Blockfrost API base URL',
+        validator=validate_blockfrost_url
+    ),
+    'WEBHOOK_SECRET': EnvVar(
+        'WEBHOOK_SECRET',
+        'Webhook verification secret',
+        required=True,
+        sensitive=True
+    ),
+    'ADMIN_CHANNEL_ID': EnvVar(
+        'ADMIN_CHANNEL_ID',
+        'Discord admin channel ID',
+        validator=lambda x, _: str(int(x))  # Ensure it's a valid integer
+    )
+}
+
+# Error messages with detailed descriptions
+ERROR_MESSAGES = {
+    'env_validation': "Environment validation failed. Please check your configuration.",
+    'blockfrost_init': "Failed to initialize Blockfrost API. Please check your credentials.",
+    'database_init': "Failed to connect to database. Please check your connection settings.",
+    'rate_limit': "Rate limit exceeded. Please try again later.",
+    'webhook_error': "Failed to process webhook. Please check your configuration.",
+    'invalid_signature': "Invalid webhook signature.",
+    'invalid_ip': "Request from unauthorized IP address.",
+    'queue_full': "Webhook queue is full. Please try again later.",
+    'ssl_error': "SSL/TLS connection failed. Please check your certificates.",
+    'log_error': "Failed to initialize logging. Please check file permissions.",
+    'network_mismatch': "Blockfrost network mismatch between project ID and base URL."
+}
+
+def validate_config():
+    """Validate entire configuration"""
+    errors = []
+    
+    # Validate environment variables
+    for var_name, env_var in ENV_VARS.items():
+        try:
+            env_var.get_value()
+        except ValueError as e:
+            errors.append(str(e))
+    
+    # Validate log paths
+    for log_type, path in LOG_PATHS.items():
+        try:
+            with open(path, 'a') as f:
+                f.write('')
+        except Exception as e:
+            errors.append(f"Cannot write to {log_type} log at {path}: {str(e)}")
+    
+    # Validate SSL configuration
+    if SSL_CONFIG['verify']:
+        if not os.path.exists(SSL_CONFIG['cert_path']):
+            errors.append(f"SSL certificate not found at {SSL_CONFIG['cert_path']}")
+    
+    if errors:
+        raise ValueError("Configuration validation failed:\n" + "\n".join(errors))
+
+# Initialize configuration
+try:
+    validate_config()
+except Exception as e:
+    logging.error(f"Configuration validation failed: {e}")
+    raise
 
 # Load environment variables
 load_dotenv()
@@ -28,6 +261,152 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Logging configuration
+LOGGING_CONFIG = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'standard': {
+            'format': '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
+        },
+        'detailed': {
+            'format': '%(asctime)s - %(levelname)s - %(name)s - [%(filename)s:%(lineno)d] - %(message)s'
+        }
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'standard',
+            'level': 'INFO',
+        },
+        'file': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': 'bot.log',
+            'formatter': 'detailed',
+            'level': 'DEBUG',
+            'maxBytes': 10485760,  # 10MB
+            'backupCount': 5,
+        },
+        'error_file': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': 'error.log',
+            'formatter': 'detailed',
+            'level': 'ERROR',
+            'maxBytes': 10485760,  # 10MB
+            'backupCount': 5,
+        }
+    },
+    'loggers': {
+        '': {  # Root logger
+            'handlers': ['console', 'file', 'error_file'],
+            'level': 'INFO',
+            'propagate': True
+        },
+        'discord': {
+            'handlers': ['console', 'file'],
+            'level': 'INFO',
+            'propagate': False
+        },
+        'blockfrost': {
+            'handlers': ['console', 'file', 'error_file'],
+            'level': 'DEBUG',
+            'propagate': False
+        }
+    }
+}
+
+# Environment-specific settings
+ENV = os.getenv('ENV', 'development')
+LOG_LEVEL = logging.DEBUG if ENV == 'development' else logging.INFO
+
+# Rate limits and timeouts
+RATE_LIMITS = {
+    'blockfrost': {
+        'calls_per_second': 10,
+        'burst': 50,
+        'timeout': 30
+    },
+    'discord': {
+        'global_rate_limit': 50,  # commands per minute
+        'command_rate_limit': 5    # commands per user per minute
+    }
+}
+
+# Retry configuration
+WEBHOOK_RETRY_ATTEMPTS = 3
+WEBHOOK_QUEUE_SIZE = 1000
+WEBHOOK_TIMEOUT = 30
+
+# Health check configuration
+HEALTH_CHECK_INTERVAL = 300  # 5 minutes
+HEALTH_CHECK_TIMEOUT = 30
+HEALTH_CACHE_TTL = 60  # 1 minute
+
+# Error messages
+ERROR_MESSAGES = {
+    'blockfrost_init': "Failed to initialize Blockfrost API. Please check your credentials and try again.",
+    'database_init': "Failed to connect to database. Please check your connection settings.",
+    'rate_limit': "Rate limit exceeded. Please try again later.",
+    'webhook_error': "Failed to process webhook. Please check your configuration.",
+    'invalid_signature': "Invalid webhook signature.",
+    'invalid_ip': "Request from unauthorized IP address.",
+    'queue_full': "Webhook queue is full. Please try again later.",
+    'dm_only': "This command can only be used in DMs for security.",
+    'api_unavailable': "Bot API connection is not available. Please try again later.",
+    'invalid_address': "Invalid Cardano wallet address. Please check the address and try again.",
+    'wallet_not_found': "Wallet not found on the blockchain. Please check the address and try again.",
+    'invalid_project_id': "Invalid Blockfrost project ID format. Must start with mainnet/testnet/preview/preprod followed by 32 alphanumeric characters.",
+    'invalid_base_url': lambda valid_urls: f"Invalid Blockfrost base URL. Must be one of: {', '.join(valid_urls)}",
+    'network_prefix_mismatch': lambda prefix, expected, url: f"Project ID network prefix '{prefix}' does not match base URL network '{expected}' ({url})",
+}
+
+# Database configuration
+DATABASE_POOL_MIN_SIZE = 10
+DATABASE_POOL_MAX_SIZE = 100
+DATABASE_MAX_QUERIES = 50000
+DATABASE_CONNECTION_TIMEOUT = 30
+DATABASE_COMMAND_TIMEOUT = 60
+
+# SSL configuration
+SSL_VERIFY = True
+SSL_CERT_REQUIRED = True
+
+# Webhook configuration
+WEBHOOK_CONFIRMATIONS = 3
+WEBHOOK_AUTH_TOKEN = os.getenv('WEBHOOK_AUTH_TOKEN')
+WEBHOOK_IDENTIFIER = 'walletbud-bot'
+
+# Command cooldowns (in seconds)
+COMMAND_COOLDOWN = {
+    'default': 3,
+    'balance': 5,
+    'add': 10,
+    'remove': 10,
+    'list': 5,
+    'help': 3,
+    'health': 30,
+}
+
+# Cache settings
+CACHE_TTL = {
+    'balance': 300,  # 5 minutes
+    'address': 3600,  # 1 hour
+    'network': 600,  # 10 minutes
+    'health': 60,  # 1 minute
+}
+
+# Notification settings
+NOTIFICATION_SETTINGS = {
+    'balance_change': True,
+    'transaction': True,
+    'stake_reward': True,
+    'error': True,
+}
+
+# Discord embed limits
+EMBED_CHAR_LIMIT = 4096
+EMBED_FIELD_LIMIT = 25
 
 @dataclass
 class EnvVar:
@@ -148,7 +527,7 @@ def validate_blockfrost_webhook_secret(value: str, name: str) -> str:
         
     return value
 
-def validate_ip_ranges(value: str, name: str) -> List[str]:
+def validate_ip_ranges(value: str, name: str) -> list:
     """Validate IP ranges in CIDR notation"""
     if not value:
         logger.warning("No IP ranges specified - all IPs will be allowed")
@@ -558,74 +937,6 @@ ENV_VARS = {
         description="Address used for health checks (configurable)"
     )
 }
-
-# Error messages
-ERROR_MESSAGES = {
-    'dm_only': "This command can only be used in DMs for security.",
-    'api_unavailable': "Bot API connection is not available. Please try again later.",
-    'invalid_address': "Invalid Cardano wallet address. Please check the address and try again.",
-    'wallet_not_found': "Wallet not found on the blockchain. Please check the address and try again.",
-    'invalid_project_id': "Invalid Blockfrost project ID format. Must start with mainnet/testnet/preview/preprod followed by 32 alphanumeric characters.",
-    'invalid_base_url': lambda valid_urls: f"Invalid Blockfrost base URL. Must be one of: {', '.join(valid_urls)}",
-    'network_prefix_mismatch': lambda prefix, expected, url: f"Project ID network prefix '{prefix}' does not match base URL network '{expected}' ({url})",
-}
-
-def init_blockfrost(self) -> None:
-    """Initialize Blockfrost API client with proper error handling"""
-    try:
-        project_id = os.getenv('BLOCKFROST_PROJECT_ID')
-        if not project_id:
-            logger.warning("No Blockfrost project ID found, skipping initialization")
-            return None
-            
-        base_url = os.getenv('BLOCKFROST_BASE_URL', '').rstrip('/')
-        if not base_url:
-            base_url = "https://cardano-mainnet.blockfrost.io/api/v0"
-            
-        # Initialize Blockfrost API client
-        self.blockfrost = BlockFrostApi(
-            project_id=project_id,
-            base_url=base_url
-        )
-        logger.info("Blockfrost API client initialized")
-        return self.blockfrost
-        
-    except Exception as e:
-        logger.error(f"Failed to initialize Blockfrost API: {str(e)}")
-        return None
-
-def validate_env_vars() -> dict:
-    """Validate all environment variables and return validated values"""
-    validated = {}
-    errors = []
-    
-    for key, env_var in ENV_VARS.items():
-        value = os.getenv(key, env_var.default)
-        
-        # Check if required variable is missing
-        if env_var.required and not value:
-            errors.append(f"Missing required environment variable: {key} ({env_var.description})")
-            continue
-            
-        # Skip validation for optional empty values
-        if not env_var.required and not value:
-            validated[key] = None
-            continue
-            
-        # Validate value if validator exists
-        try:
-            if env_var.validator:
-                validated[key] = env_var.validator(value, env_var.name)
-            else:
-                validated[key] = value
-        except ValueError as e:
-            errors.append(f"Invalid environment variable {key}: {str(e)}")
-            
-    # If any errors, raise with all error messages
-    if errors:
-        raise ValueError("Environment validation failed:\n" + "\n".join(errors))
-        
-    return validated
 
 # Validate environment variables
 try:

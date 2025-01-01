@@ -17,8 +17,11 @@ from config import (
     COMMAND_COOLDOWN,
     LOG_LEVELS,
     EMBED_CHAR_LIMIT,
-    HEALTH_CHECK_INTERVAL
+    HEALTH_CHECK_INTERVAL,
+    HEALTH_METRICS_TTL
 )
+import asyncio
+import aiofiles
 
 # Initialize logger with proper levels
 logger = logging.getLogger(__name__)
@@ -29,6 +32,7 @@ class SystemCommands(commands.Cog):
     
     def __init__(self, bot):
         self.bot = bot
+        self._health_lock = asyncio.Lock()
         self._last_health_check = None
         self._health_cache = {}
         self.health_monitor.start()
@@ -232,110 +236,175 @@ class SystemCommands(commands.Cog):
     @app_commands.command(name="health", description="Check bot and API status")
     @command_cooldown(COMMAND_COOLDOWN)
     async def health(self, interaction: discord.Interaction):
-        """Check bot and API status"""
+        """Show detailed system health status"""
+        await interaction.response.defer(ephemeral=True)
+        
         try:
-            await interaction.response.defer(ephemeral=True)
-            
-            # Get health metrics
-            health_data = await self._check_health_metrics()
-            
-            embed = discord.Embed(
-                title="🏥 System Health Check",
-                color=discord.Color.blue()
-            )
-            
-            # Discord status
-            embed.add_field(
-                name="Discord Connection",
-                value=(
-                    f"{'✅' if health_data['discord']['connected'] else '❌'} Connected\n"
-                    f"Latency: {health_data['discord']['latency']}ms"
-                ),
-                inline=False
-            )
-            
-            # Database status
-            status = "✅ Connected" if health_data['database']['connected'] else f"❌ Error: {health_data['database']['error']}"
-            embed.add_field(
-                name="Database",
-                value=status,
-                inline=False
-            )
-            
-            # Blockfrost status with rate limits
-            blockfrost_status = []
-            if health_data['blockfrost']['healthy']:
-                blockfrost_status.append("✅ Healthy")
-            else:
-                blockfrost_status.append(f"❌ Error: {health_data['blockfrost']['error']}")
-            
-            rate_limits = health_data['rate_limits']['blockfrost']
-            if rate_limits['total'] > 0:
-                blockfrost_status.append(
-                    f"Rate Limits: {rate_limits['remaining']}/{rate_limits['total']} remaining\n"
-                    f"Reset at: {rate_limits['reset_at']}"
-                )
-            
-            embed.add_field(
-                name="Blockfrost API",
-                value="\n".join(blockfrost_status),
-                inline=False
-            )
-            
-            # System metrics with more detail
-            system = health_data['system']
-            embed.add_field(
-                name="System Metrics",
-                value=(
-                    f"Memory Usage: {system['memory_used']:.1f} MB ({system['memory_percent']:.1f}%)\n"
-                    f"System Memory: {system['system_memory']['available']:.1f}GB free of {system['system_memory']['total']:.1f}GB\n"
-                    f"CPU Usage: {system['cpu_percent']}% across {system['cpu_count']} cores\n"
-                    f"Disk Space: {system['disk_usage']['free']:.1f}GB free of {system['disk_usage']['total']:.1f}GB\n"
-                    f"Threads: {system['thread_count']}\n"
-                    f"Open Files: {system['open_files']}\n"
-                    f"Uptime: {system['uptime']}"
-                ),
-                inline=False
-            )
-            
-            # Add warnings for concerning metrics
-            warnings = []
-            if system['memory_percent'] > 80:
-                warnings.append("⚠️ High memory usage")
-            if system['cpu_percent'] > 70:
-                warnings.append("⚠️ High CPU usage")
-            if system['disk_usage']['percent'] > 90:
-                warnings.append("⚠️ Low disk space")
-            if rate_limits['remaining'] < rate_limits['total'] * 0.2:
-                warnings.append("⚠️ API rate limit running low")
-            
-            if warnings:
-                embed.add_field(
-                    name="⚠️ Warnings",
-                    value="\n".join(warnings),
-                    inline=False
-                )
-            
-            # Add troubleshooting tips if there are issues
-            if warnings or not health_data['blockfrost']['healthy'] or not health_data['database']['connected']:
-                embed.add_field(
-                    name="🔧 Troubleshooting Steps",
-                    value=(
-                        "1. Check your internet connection\n"
-                        "2. Verify API credentials are correct\n"
-                        "3. Check service status pages\n"
-                        "4. Consider upgrading resources if system metrics are high\n"
-                        "5. Contact support if issues persist"
+            async with self._health_lock:
+                # Check if we have a recent health check
+                current_time = datetime.now()
+                if (
+                    self._last_health_check and
+                    (current_time - self._last_health_check).total_seconds() < HEALTH_METRICS_TTL
+                ):
+                    health_data = self._health_cache
+                else:
+                    health_data = await self.bot.health_check()
+                    self._health_cache = health_data
+                    self._last_health_check = current_time
+                
+                # Create health status embed
+                status = health_data['status']
+                color = {
+                    'healthy': discord.Color.green(),
+                    'degraded': discord.Color.orange(),
+                    'unhealthy': discord.Color.red()
+                }.get(status, discord.Color.greyple())
+                
+                embed = discord.Embed(
+                    title="🏥 System Health Status",
+                    description=(
+                        f"Overall Status: {status.title()}\n"
+                        f"{'✅' if status == 'healthy' else '⚠️' if status == 'degraded' else '❌'}"
                     ),
-                    inline=False
+                    color=color
                 )
+                
+                # Add component status fields
+                for component, data in health_data['components'].items():
+                    healthy = data.get('healthy', False)
+                    field_value = [f"Status: {'✅' if healthy else '❌'}"]
+                    
+                    # Add component-specific metrics
+                    if component == 'discord':
+                        field_value.extend([
+                            f"Latency: {data['latency']}ms",
+                            f"Guilds: {data['guilds']}",
+                            f"Shards: {data['shards']}"
+                        ])
+                    elif component == 'blockfrost' and healthy:
+                        field_value.extend([
+                            f"Network: {data['network']}",
+                            f"Sync: {data['sync_progress']}%"
+                        ])
+                        if 'rate_limits' in data:
+                            field_value.append(
+                                f"Rate Limits: {data['rate_limits']['remaining']}/{data['rate_limits']['total']}"
+                            )
+                    elif component == 'database' and healthy:
+                        field_value.extend([
+                            f"Pool: {data['used_connections']}/{data['max_size']}",
+                            f"Min Size: {data['min_size']}"
+                        ])
+                    elif component == 'system':
+                        field_value.extend([
+                            f"CPU: {data['cpu_percent']}%",
+                            f"Memory: {data['memory_used_mb']:.1f}MB ({data['memory_percent']:.1f}%)",
+                            f"Threads: {data['threads']}"
+                        ])
+                    elif component == 'webhooks':
+                        field_value.extend([
+                            f"Queue: {data['queue_size']}/{data['queue_capacity']}",
+                            f"Processing: {'Yes' if data['processing'] else 'No'}"
+                        ])
+                    
+                    if not healthy and 'error' in data:
+                        field_value.append(f"Error: {data['error']}")
+                    
+                    embed.add_field(
+                        name=component.title(),
+                        value="\n".join(field_value),
+                        inline=True
+                    )
+                
+                # Add warnings if any component is unhealthy
+                if 'unhealthy_components' in health_data:
+                    embed.add_field(
+                        name="⚠️ Warnings",
+                        value="\n".join([
+                            f"• {comp} is not healthy"
+                            for comp in health_data['unhealthy_components']
+                        ]),
+                        inline=False
+                    )
+                
+                # Add timestamp
+                embed.set_footer(text=f"Last updated: {health_data['timestamp']}")
+                
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                
+        except Exception as e:
+            logger.error(f"Health command failed: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ Failed to get health status. Please try again later.",
+                ephemeral=True
+            )
+
+    @app_commands.command(name="fallback")
+    @app_commands.default_permissions(administrator=True)
+    async def toggle_fallback(self, interaction: discord.Interaction):
+        """Toggle fallback mode for basic functionality when Blockfrost is down"""
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            self.bot.fallback_mode = not getattr(self.bot, 'fallback_mode', False)
+            mode = "enabled" if self.bot.fallback_mode else "disabled"
             
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            # Update command availability
+            await self.bot.tree.sync()
+            
+            await interaction.followup.send(
+                f"✅ Fallback mode {mode}. Basic commands will {'work without' if self.bot.fallback_mode else 'require'} Blockfrost.",
+                ephemeral=True
+            )
             
         except Exception as e:
-            logger.error(f"Error in health command: {e}", exc_info=True)
+            logger.error(f"Failed to toggle fallback mode: {e}", exc_info=True)
             await interaction.followup.send(
-                "❌ An error occurred while checking system health. Please try again later.",
+                "❌ Failed to toggle fallback mode. Please try again later.",
+                ephemeral=True
+            )
+
+    @app_commands.command(name="logs")
+    @app_commands.default_permissions(administrator=True)
+    async def get_logs(self, interaction: discord.Interaction, lines: int = 50):
+        """Get recent log entries"""
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Read last N lines from log file
+            async with aiofiles.open('bot.log', 'r') as f:
+                content = await f.read()
+                log_lines = content.splitlines()[-lines:]
+            
+            # Format logs into chunks (Discord has a 2000 char limit)
+            chunks = []
+            current_chunk = []
+            current_length = 0
+            
+            for line in log_lines:
+                if current_length + len(line) + 2 > 1900:  # Leave some margin
+                    chunks.append('\n'.join(current_chunk))
+                    current_chunk = []
+                    current_length = 0
+                
+                current_chunk.append(line)
+                current_length += len(line) + 2  # +2 for newline
+            
+            if current_chunk:
+                chunks.append('\n'.join(current_chunk))
+            
+            # Send logs in multiple messages if needed
+            for i, chunk in enumerate(chunks):
+                await interaction.followup.send(
+                    f"```\n{chunk}\n```",
+                    ephemeral=True
+                )
+            
+        except Exception as e:
+            logger.error(f"Failed to get logs: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ Failed to retrieve logs. Please check the server.",
                 ephemeral=True
             )
 

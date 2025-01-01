@@ -11,29 +11,18 @@ import discord
 import aiohttp
 import asyncpg
 import traceback
-
-from typing import Dict, List, Any, Optional, Union, Callable
+import hmac
+import hashlib
+import psutil
 from datetime import datetime, timedelta
 from ipaddress import ip_network
 from aiohttp import web
 from discord.ext import commands, tasks
-from blockfrost import BlockFrostApi
+from typing import Dict, List, Any, Optional, Union, Callable
+from collections import defaultdict
 
-import os
-import logging
-import sys
-from datetime import datetime
-import time
-import asyncio
-import aiohttp
-import requests
 import discord
 from discord import app_commands
-from aiohttp import web
-from discord.ext import commands, tasks
-from typing import Dict, Any, Optional, List, Union
-import asyncpg
-import threading
 from blockfrost import BlockFrostApi, ApiUrls
 from blockfrost.api.cardano.network import network
 from database import (
@@ -84,18 +73,16 @@ from config import (
     WEBHOOK_IDENTIFIER,
     WEBHOOK_AUTH_TOKEN,
     WEBHOOK_CONFIRMATIONS,
-    ERROR_MESSAGES
+    ERROR_MESSAGES,
+    WEBHOOK_RETRY_ATTEMPTS
 )
 
 import uuid
 import random
-import psutil
 import functools
 from functools import wraps
-from collections import defaultdict
-
-import config
-from urllib3.exceptions import InsecureRequestWarning
+from cachetools import TTLCache
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Suppress only the single InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
@@ -1123,571 +1110,119 @@ class WalletBudBot(commands.Bot):
         log_method = getattr(logger, level.lower(), logger.info)
         log_method(message, **safe_kwargs)
 
-    async def init_blockfrost(self):
-        """Initialize Blockfrost API client with proper error handling"""
-        try:
-            project_id = os.getenv('BLOCKFROST_PROJECT_ID')
-            base_url = os.getenv('BLOCKFROST_BASE_URL')
-            network = os.getenv('CARDANO_NETWORK', 'mainnet')  # Default to mainnet
-            
-            if not project_id:
-                raise ValueError("BLOCKFROST_PROJECT_ID not set in environment variables")
-            
-            # Set appropriate base URL based on network
-            if not base_url:
-                base_url = (
-                    "https://cardano-mainnet.blockfrost.io/api/v0"
-                    if network == "mainnet"
-                    else "https://cardano-testnet.blockfrost.io/api/v0"
-                )
-            
-            # Initialize Blockfrost client with proper configuration
-            self.blockfrost = BlockFrostApi(
-                project_id=project_id,
-                base_url=base_url
-            )
-            
-            # Test the connection and get network info
-            health = await self.blockfrost.health()
-            network_info = await self.blockfrost.network()
-            
-            logger.info(f"✅ Blockfrost API initialized successfully on {network}")
-            logger.info(f"Network info: Supply={network_info.supply}, Stake={network_info.stake}")
-            
-            self.update_health_metrics('blockfrost_init', True)
-            self.update_health_metrics('last_api_call', datetime.now())
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize Blockfrost API: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            self.update_health_metrics('blockfrost_init', False)
-            return False
-
-    async def blockfrost_request(self, method: Callable, *args, **kwargs) -> Any:
-        """Execute a rate-limited request to Blockfrost API with improved error handling"""
+    async def blockfrost_request(self, method: Callable, endpoint: str = None, *args, **kwargs) -> Any:
+        """Execute a rate-limited request to Blockfrost API with retries and error handling"""
         if not self.blockfrost:
             raise ValueError("Blockfrost client not initialized")
-            
-        try:
-            # Apply rate limiting
-            async with self.rate_limiter.acquire('blockfrost'):
-                # Execute request
-                response = await method(*args, **kwargs)
+
+        if self.fallback_mode:
+            logger.warning(f"Blockfrost request attempted in fallback mode: {method.__name__}")
+            raise RuntimeError("Blockfrost is in fallback mode")
+
+        # Get rate limiters
+        global_limiter = self.rate_limiters['blockfrost']['global']
+        endpoint_limiter = self.rate_limiters['blockfrost']['endpoints'][endpoint or method.__name__]
+
+        for attempt in range(WEBHOOK_RETRY_ATTEMPTS):
+            try:
+                # Apply both global and endpoint-specific rate limiting
+                async with global_limiter:
+                    async with endpoint_limiter:
+                        response = await method(*args, **kwargs)
+                        
+                        # Update metrics
+                        self.update_health_metrics('last_api_call', datetime.now())
+                        return response
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                wait_time = min(2 ** attempt * 1.5, 30)  # Max 30 second delay
+
+                if "rate limit" in error_msg:
+                    logger.warning(f"Rate limit hit: {error_msg}")
+                    if attempt < WEBHOOK_RETRY_ATTEMPTS - 1:
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise ValueError("Rate limit exceeded. Please try again later.")
+
+                elif "not found" in error_msg:
+                    logger.info(f"Resource not found: {error_msg}")
+                    return None
+
+                elif any(msg in error_msg for msg in ["timeout", "connection", "network"]):
+                    if attempt < WEBHOOK_RETRY_ATTEMPTS - 1:
+                        logger.warning(f"Connection error, retrying in {wait_time}s: {error_msg}")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    logger.error(f"Connection failed after {WEBHOOK_RETRY_ATTEMPTS} retries")
+                    raise
+
+                else:
+                    logger.error(f"Blockfrost API error: {error_msg}")
+                    if hasattr(e, '__dict__'):
+                        logger.error(f"Error details: {e.__dict__}")
+                    raise
+
+    async def init_blockfrost(self) -> bool:
+        """Initialize Blockfrost API client with proper error handling and retries"""
+        MAX_RETRIES = 3
+        RETRY_DELAY = 5  # seconds
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Get and validate environment variables
+                project_id = os.getenv('BLOCKFROST_PROJECT_ID')
+                base_url = os.getenv('BLOCKFROST_BASE_URL')
+                network = os.getenv('CARDANO_NETWORK', 'mainnet')
+
+                if not project_id or not project_id.startswith(('mainnet', 'preprod', 'preview')):
+                    raise ValueError(f"Invalid BLOCKFROST_PROJECT_ID format: {project_id}")
+
+                # Determine network and base URL
+                if not base_url:
+                    base_url = (
+                        "https://cardano-mainnet.blockfrost.io/api/v0"
+                        if network == "mainnet"
+                        else "https://cardano-testnet.blockfrost.io/api/v0"
+                    )
+
+                # Initialize Blockfrost with proper configuration
+                self.blockfrost = BlockFrostApi(
+                    project_id=project_id,
+                    base_url=base_url,
+                    session_args={
+                        'timeout': aiohttp.ClientTimeout(total=30),
+                        'connector': self.connector
+                    }
+                )
+
+                # Test connection and get network info
+                health = await self.blockfrost.health()
+                if not health.is_healthy:
+                    raise RuntimeError("Blockfrost API reported unhealthy status")
+
+                network_info = await self.blockfrost.network()
                 
-                # Update metrics
+                logger.info(f"✅ Blockfrost API initialized successfully on {network}")
+                logger.info(f"Network info: Supply={network_info.supply}, Stake={network_info.stake}")
+
+                self.update_health_metrics('blockfrost_init', True)
                 self.update_health_metrics('last_api_call', datetime.now())
-                
-                return response
-                
-        except Exception as e:
-            error_msg = str(e)
-            
-            # Handle specific error cases
-            if "rate limit" in error_msg.lower():
-                logger.warning(f"Rate limit hit: {error_msg}")
-                raise ValueError("Rate limit exceeded. Please try again later.")
-            elif "not found" in error_msg.lower():
-                logger.info(f"Resource not found: {error_msg}")
-                return None
-            else:
-                logger.error(f"Blockfrost API error: {error_msg}")
+                return True
+
+            except Exception as e:
+                logger.error(f"❌ Blockfrost initialization failed (attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}")
                 if hasattr(e, '__dict__'):
                     logger.error(f"Error details: {e.__dict__}")
-                raise
-                
-    async def should_notify(self, user_id: int, notification_type: str) -> bool:
-        """Check if we should send a notification to the user"""
-        try:
-            # Get database connection
-            pool = await get_pool()
-            if not pool:
-                logger.error("Failed to get database pool")
-                return False
-                
-            # Use database should_notify function
-            return await should_notify(str(user_id), notification_type)
-            
-        except Exception as e:
-            logger.error(f"Error checking notification settings: {str(e)}")
-            return False  # Default to not notifying on error
 
-    async def process_interaction(self, interaction: discord.Interaction, ephemeral: bool = True):
-        """Process interaction with proper error handling"""
-        try:
-            # Defer response immediately
-            await interaction.response.defer(ephemeral=ephemeral)
-            return True
-        except discord.errors.NotFound:
-            logger.error("Interaction not found")
-            return False
-        except Exception as e:
-            logger.error(f"Error deferring interaction: {str(e)}")
-            return False
-
-    async def safe_send(self, interaction: discord.Interaction, content: str, *, ephemeral: bool = True) -> bool:
-        """Safely send a message through interaction, handling rate limits and errors"""
-        interaction_id = str(interaction.id)
-        
-        # Check if we've already responded to this interaction
-        if interaction_id in self.active_interactions:
-            logger.debug(f"Already responded to interaction {interaction_id}")
-            return False
-        
-        # Mark interaction as active
-        self.active_interactions[interaction_id] = True
-        
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(content, ephemeral=ephemeral)
-            else:
-                await interaction.followup.send(content, ephemeral=ephemeral)
-            return True
-        except discord.errors.InteractionResponded:
-            logger.debug(f"Interaction {interaction_id} already responded to")
-            return False
-        except discord.errors.HTTPException as e:
-            if e.code == 429:  # Rate limited
-                logger.warning(f"Rate limited on interaction {interaction_id}")
-                # Clear interaction from active list so we can retry
-                self.active_interactions.pop(interaction_id, None)
-                return False
-            logger.error(f"HTTP error sending message: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Error sending message: {str(e)}")
-            return False
-        finally:
-            # Clean up interaction tracking after a delay
-            asyncio.create_task(self.cleanup_interaction(interaction_id))
-
-    async def cleanup_interaction(self, interaction_id: str):
-        """Clean up completed interaction"""
-        await asyncio.sleep(5)  # Wait 5 seconds before cleanup
-        self.active_interactions.pop(interaction_id, None)
-        self.webhook_retries.pop(interaction_id, None)
-
-    async def send_response(self, interaction: discord.Interaction, content=None, embed=None, ephemeral: bool = True):
-        """Send response with proper error handling"""
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
-            else:
-                await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
-            return True
-        except Exception as e:
-            logger.error(f"Error sending response: {str(e)}")
-            return False
-
-    async def send_dm(self, user_id: int, content: str):
-        """Send a direct message to a user"""
-        try:
-            user = await self.fetch_user(user_id)
-            if user:
-                await user.send(content)
-            else:
-                logger.error(f"Failed to find user {user_id} for DM")
-        except Exception as e:
-            logger.error(f"Error sending DM: {str(e)}")
-
-    async def setup_admin_channel(self):
-        """Set up admin channel for bot notifications"""
-        try:
-            if not self.admin_channel_id:
-                logger.warning("No admin channel ID configured")
-                return False
-            
-            # Wait for bot to be ready
-            if not self.is_ready():
-                logger.info("Waiting for bot to be ready...")
-                await self.wait_until_ready()
-            
-            # Get the channel
-            channel = self.get_channel(self.admin_channel_id)
-            if not channel:
-                logger.error(f"Could not find channel with ID {self.admin_channel_id}")
-                return False
-            
-            # Test permissions by sending a message
-            try:
-                await channel.send("🔄 Testing admin channel permissions...")
-                self.admin_channel = channel
-                logger.info(f"Admin channel set up successfully: {channel.name}")
-                return True
-            except Exception as e:
-                logger.error(f"Could not send message to admin channel: {e}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error setting up admin channel: {e}")
-            return False
-    
-    async def check_connection(self):
-        """Check if the bot is still connected to Discord"""
-        try:
-            if not self.is_ready():
-                logger.error("Bot is not ready!")
-                return False
-            
-            # Check Discord connection
-            if not self.latency:
-                logger.error("No connection to Discord!")
-                return False
-            
-            # Check Blockfrost connection if available
-            if self.blockfrost:
-                try:
-                    await self.rate_limited_request(self.blockfrost.health)
-                    logger.debug("Blockfrost connection OK")
-                except Exception as e:
-                    logger.error(f"Blockfrost connection failed: {e}")
-                    return False
-            else:
-                logger.warning("Blockfrost client not initialized")
-            
-            # Check database connection if available
-            if hasattr(self, 'pool') and self.pool:
-                try:
-                    async with self.pool.acquire() as conn:
-                        await conn.execute('SELECT 1')
-                    logger.debug("Database connection OK")
-                except Exception as e:
-                    logger.error(f"Database connection failed: {e}")
-                    return False
-            
-            logger.debug("All connections OK")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Connection check failed: {e}")
-            return False
-    
-    async def _check_connection_loop(self):
-        """Background task to periodically check connection status"""
-        try:
-            while not self.is_closed():
-                try:
-                    # Wait for bot to be ready
-                    if not self.is_ready():
-                        await asyncio.sleep(5)
-                        continue
-                    
-                    # Check connections
-                    if not await self.check_connections():
-                        logger.warning("Connection check failed!")
-                        if self.admin_channel:
-                            await self.admin_channel.send("⚠️ Connection check failed! Check logs for details.")
-                    
-                    # Update health metrics
-                    await self.update_health_metrics('last_connection_check', datetime.now().isoformat())
-                    
-                except Exception as e:
-                    logger.error(f"Error in connection check loop: {e}")
-                
-                # Wait before next check
-                await asyncio.sleep(300)  # Check every 5 minutes
-                
-        except asyncio.CancelledError:
-            logger.info("Connection check task cancelled")
-        except Exception as e:
-            logger.error(f"Connection check task failed: {e}")
-
-    async def on_resumed(self):
-        """Called when the bot resumes a session"""
-        logger.info("Session resumed")
-        try:
-            # Update presence
-            activity = discord.Activity(
-                type=discord.ActivityType.watching,
-                name="Cardano wallets | /help"
-            )
-            await self.change_presence(status=discord.Status.online, activity=activity)
-            
-            # Notify admin channel
-            if self.admin_channel:
-                await self.admin_channel.send("🟢 Bot connection resumed!")
-                
-        except Exception as e:
-            logger.error(f"Error in on_resumed: {str(e)}", exc_info=True)
-
-    async def check_webhook_rate_limit(self, ip: str) -> bool:
-        """Check if webhook request exceeds rate limit
-        
-        Args:
-            ip (str): IP address of the request
-            
-        Returns:
-            bool: True if allowed, False if rate limited
-        """
-        async with self.webhook_lock:
-            now = time.time()
-            minute_ago = now - 60
-            
-            # Clean old entries
-            self.webhook_counts = {
-                k: (count, ts) for k, (count, ts) in self.webhook_counts.items()
-                if ts > minute_ago
-            }
-            
-            # Check current IP
-            if ip in self.webhook_counts:
-                count, _ = self.webhook_counts[ip]
-                if count >= WEBHOOK_RATE_LIMIT:
-                    logger.warning(f"Rate limit exceeded for IP {ip}")
-                    return False
-                self.webhook_counts[ip] = (count + 1, now)
-            else:
-                self.webhook_counts[ip] = (1, now)
-            
-            return True
-
-    async def handle_webhook_with_retry(self, request: web.Request):
-        """Handle webhook with exponential backoff retry"""
-        max_retries = 5
-        base_delay = 1  # Start with 1 second delay
-        
-        for attempt in range(max_retries):
-            try:
-                return await self.handle_webhook(request)
-            except discord.errors.HTTPException as e:
-                if e.status == 429:  # Rate limit error
-                    retry_after = e.retry_after if hasattr(e, 'retry_after') else base_delay * (2 ** attempt)
-                    logger.warning(f"Rate limited, waiting {retry_after}s before retry (attempt {attempt + 1}/{max_retries})")
-                    await asyncio.sleep(retry_after)
+                if attempt < MAX_RETRIES - 1:
+                    logger.info(f"Retrying in {RETRY_DELAY} seconds...")
+                    await asyncio.sleep(RETRY_DELAY)
                 else:
-                    raise
-            except Exception as e:
-                logger.error(f"Error processing webhook (attempt {attempt + 1}/{max_retries}): {str(e)}")
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(base_delay * (2 ** attempt))
-        
-        raise Exception("Max retries exceeded")
-
-    async def handle_webhook(self, request: web.Request) -> web.Response:
-        """Handle incoming webhooks from Blockfrost with comprehensive validation"""
-        request_id = get_request_id()
-        client_ip = request.remote
-        
-        try:
-            # 1. IP Whitelist Check
-            if BLOCKFROST_IP_RANGES and not any(
-                ip_network(range).supernet_of(ip_network(client_ip))
-                for range in BLOCKFROST_IP_RANGES
-            ):
-                logger.warning(f"[{request_id}] Rejected webhook from unauthorized IP: {client_ip}")
-                return web.Response(status=403, text="Unauthorized IP")
-            
-            # 2. Rate Limit Check
-            if not self.check_webhook_rate_limit(client_ip):
-                logger.warning(f"[{request_id}] Rate limit exceeded for IP: {client_ip}")
-                return web.Response(status=429, text="Rate limit exceeded")
-            
-            # 3. Size Check
-            if request.content_length and request.content_length > MAX_WEBHOOK_SIZE:
-                logger.warning(f"[{request_id}] Webhook payload too large: {request.content_length} bytes")
-                return web.Response(status=413, text="Payload too large")
-            
-            # 4. Required Headers Check
-            webhook_id = request.headers.get('Webhook-Id')
-            signature = request.headers.get('Signature')
-            if not all([webhook_id, signature]):
-                logger.warning(f"[{request_id}] Missing required headers")
-                return web.Response(status=400, text="Missing required headers")
-            
-            # 5. Payload Validation
-            try:
-                payload = await request.json()
-            except Exception as e:
-                logger.warning(f"[{request_id}] Invalid JSON payload: {str(e)}")
-                return web.Response(status=400, text="Invalid JSON payload")
-            
-            # 6. Signature Verification
-            if not self.verify_webhook_signature(payload, signature):
-                logger.warning(f"[{request_id}] Invalid webhook signature")
-                return web.Response(status=401, text="Invalid signature")
-            
-            # 7. Queue the webhook for processing
-            try:
-                await self._webhook_queue.put({
-                    'id': request_id,
-                    'payload': payload,
-                    'headers': dict(request.headers),
-                    'timestamp': datetime.now().isoformat()
-                })
-                logger.info(f"[{request_id}] Webhook queued successfully")
-                return web.Response(status=202, text="Accepted")
-                
-            except asyncio.QueueFull:
-                logger.error(f"[{request_id}] Webhook queue is full")
-                return web.Response(status=503, text="Queue is full")
-                
-        except Exception as e:
-            logger.error(f"[{request_id}] Error processing webhook: {str(e)}")
-            return web.Response(status=500, text="Internal server error")
-
-    async def _process_webhook_queue(self):
-        """Process webhooks from queue"""
-        while True:
-            try:
-                event_type, payload, headers = await self._webhook_queue.get()
-                
-                try:
-                    await self._process_webhook_event(event_type, payload, headers)
-                except discord.errors.HTTPException as e:
-                    if e.status == 429:  # Rate limit error
-                        # Put the item back in queue with exponential backoff
-                        retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
-                        logger.warning(f"Rate limited in webhook queue, retrying in {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        await self._webhook_queue.put((event_type, payload, headers))
-                    else:
-                        logger.error(f"Discord API error processing webhook: {str(e)}")
-                except Exception as e:
-                    logger.error(f"Error processing webhook from queue: {str(e)}")
-                finally:
-                    self._webhook_queue.task_done()
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error in webhook queue processor: {str(e)}")
-                await asyncio.sleep(5)  # Brief pause before continuing
-
-    async def _process_webhook_event(self, event_type: str, payload: Dict[str, Any], headers: Dict[str, str]):
-        """Process a single webhook event with sanitized logging"""
-        try:
-            # Sanitize headers for logging
-            safe_headers = {
-                k: "[REDACTED]" if k.lower() in ['authorization', 'signature', 'auth-token'] 
-                else v for k, v in headers.items()
-            }
-            
-            self.log_sanitized('info', 
-                f"Processing {event_type} webhook",
-                headers=safe_headers,
-                payload_size=len(str(payload))
-            )
-            
-            # Process based on event type
-            if event_type == 'transaction':
-                await self._handle_transaction_webhook(payload)
-            elif event_type == 'delegation':
-                await self._handle_delegation_webhook(payload)
-            else:
-                logger.warning(f"Unknown webhook event type: {event_type}")
-            
-            # Update success metrics
-            self.update_health_metrics('webhook_success', 
-                self.health_metrics.get('webhook_success', 0) + 1
-            )
-            
-        except Exception as e:
-            # Update failure metrics
-            self.update_health_metrics('webhook_failure',
-                self.health_metrics.get('webhook_failure', 0) + 1
-            )
-            
-            # Add error to history (limit to last 100 errors)
-            errors = self.health_metrics.get('errors', [])
-            errors.append({
-                'timestamp': datetime.now().isoformat(),
-                'type': type(e).__name__,
-                'message': str(e)
-            })
-            self.health_metrics['errors'] = errors[-100:]
-            
-            # Log the error
-            logger.error(f"Error processing webhook: {str(e)}")
-            await self.send_admin_alert(f"Webhook processing error: {str(e)}")
-
-    async def update_health_metrics(self, metric: str, value: Any = None):
-        """Update bot health metrics with sanitized logging"""
-        try:
-            if metric not in self.health_metrics:
-                logger.warning(f"Attempted to update unknown metric: {metric}")
-                return
-                
-            if value is None:
-                value = datetime.now()
-                
-            self.health_metrics[metric] = value
-            
-            # Don't log sensitive values
-            safe_value = "[REDACTED]" if "token" in metric.lower() else str(value)
-            logger.debug(f"Updated health metric {metric}: {safe_value}")
-            
-        except Exception as e:
-            logger.error(f"Error updating health metrics: {str(e)}")
-
-    def log_sanitized(self, level: str, message: str, **kwargs):
-        """Log messages with sensitive data removed"""
-        # Fields that might contain sensitive data
-        sensitive_fields = [
-            'auth_token', 'project_id', 'api_key', 'password',
-            'secret', 'token', 'signature', 'private_key'
-        ]
-        
-        # Sanitize kwargs
-        safe_kwargs = {}
-        for key, value in kwargs.items():
-            if any(field in key.lower() for field in sensitive_fields):
-                safe_kwargs[key] = "[REDACTED]"
-            else:
-                safe_kwargs[key] = value
-        
-        # Sanitize message
-        for field in sensitive_fields:
-            if field in message.lower():
-                pattern = rf'{field}["\']?\s*[:=]\s*["\']?[\w\-\.]+["\']?'
-                message = re.sub(pattern, f'{field}=[REDACTED]', message, flags=re.IGNORECASE)
-        
-        # Get logger method
-        log_method = getattr(logger, level.lower(), logger.info)
-        log_method(message, **safe_kwargs)
-
-    async def init_blockfrost(self):
-        """Initialize Blockfrost API client with proper error handling"""
-        try:
-            project_id = os.getenv('BLOCKFROST_PROJECT_ID')
-            base_url = os.getenv('BLOCKFROST_BASE_URL')
-            network = os.getenv('CARDANO_NETWORK', 'mainnet')  # Default to mainnet
-            
-            if not project_id:
-                raise ValueError("BLOCKFROST_PROJECT_ID not set in environment variables")
-            
-            # Set appropriate base URL based on network
-            if not base_url:
-                base_url = (
-                    "https://cardano-mainnet.blockfrost.io/api/v0"
-                    if network == "mainnet"
-                    else "https://cardano-testnet.blockfrost.io/api/v0"
-                )
-            
-            # Initialize Blockfrost client with proper configuration
-            self.blockfrost = BlockFrostApi(
-                project_id=project_id,
-                base_url=base_url
-            )
-            
-            # Test the connection and get network info
-            health = await self.blockfrost.health()
-            network_info = await self.blockfrost.network()
-            
-            logger.info(f"✅ Blockfrost API initialized successfully on {network}")
-            logger.info(f"Network info: Supply={network_info.supply}, Stake={network_info.stake}")
-            
-            self.update_health_metrics('blockfrost_init', True)
-            self.update_health_metrics('last_api_call', datetime.now())
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize Blockfrost API: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            self.update_health_metrics('blockfrost_init', False)
-            return False
+                    self.update_health_metrics('blockfrost_init', False)
+                    await self.send_admin_alert("⚠️ Blockfrost initialization failed after all retries")
+                    return False
 
     async def should_notify(self, user_id: int, notification_type: str) -> bool:
         """Check if we should send a notification to the user"""
@@ -1784,143 +1319,538 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error sending DM: {str(e)}")
 
     async def _check_yummi_balances(self):
-        """Check YUMMI token balances for all monitored wallets"""
-        if self.processing_yummi:
-            logger.warning("YUMMI balance check already in progress")
-            return
+        """Check YUMMI token balances with proper concurrency control"""
+        # Use a task name based lock to prevent duplicate runs
+        lock_key = 'yummi_balance_check'
+        
+        if self._locks.get(lock_key) and not self._locks[lock_key].locked():
+            self._locks[lock_key] = asyncio.Lock()
             
-        async with self.yummi_check_lock:
+        async with self._locks[lock_key]:
             try:
-                self.processing_yummi = True
-                logger.info("Starting YUMMI balance check...")
-                
-                # Get all monitored wallets
-                query = """
-                    SELECT DISTINCT user_id, address 
-                    FROM monitored_wallets
-                    WHERE active = true
-                """
-                
+                if self.fallback_mode:
+                    logger.warning("Skipping YUMMI balance check - in fallback mode")
+                    return
+                    
+                # Get registered wallets
                 async with self.pool.acquire() as conn:
-                    wallets = await conn.fetch(query)
+                    wallets = await conn.fetch(
+                        "SELECT address FROM wallets WHERE notify_balance_changes = true"
+                    )
+                
+                # Process in batches to avoid rate limits
+                batch_size = 50
+                for i in range(0, len(wallets), batch_size):
+                    batch = wallets[i:i + batch_size]
                     
-                for wallet in wallets:
-                    user_id = wallet['user_id']
-                    address = wallet['address']
+                    # Process batch concurrently with rate limiting
+                    tasks = []
+                    for wallet in batch:
+                        task = asyncio.create_task(
+                            self.check_single_wallet_balance(wallet['address'])
+                        )
+                        tasks.append(task)
                     
-                    # Check YUMMI requirement
-                    if not await self.check_yummi_requirement(address, user_id):
-                        logger.warning(f"Wallet {address} no longer meets YUMMI requirement")
+                    # Wait for batch to complete
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Handle any errors
+                    for addr, result in zip([w['address'] for w in batch], results):
+                        if isinstance(result, Exception):
+                            logger.error(f"Error checking balance for {addr}: {result}")
+                            
+                    # Rate limit between batches
+                    if i + batch_size < len(wallets):
+                        await asyncio.sleep(1)
                         
-                        # Send DM to user
-                        try:
-                            user = await self.fetch_user(user_id)
-                            if user:
-                                await user.send(
-                                    f"⚠️ Your wallet `{address}` no longer meets the minimum YUMMI token requirement. "
-                                    f"Monitoring has been disabled. Please ensure you have at least {MINIMUM_YUMMI} YUMMI tokens "
-                                    f"and use `/monitor` to re-enable monitoring."
-                                )
-                        except Exception as e:
-                            logger.error(f"Failed to notify user {user_id} about YUMMI requirement: {e}")
-                            
-                        # Update database
-                        update_query = """
-                            UPDATE monitored_wallets 
-                            SET active = false, updated_at = NOW()
-                            WHERE user_id = $1 AND address = $2
-                        """
-                        async with self.pool.acquire() as conn:
-                            await conn.execute(update_query, user_id, address)
-                            
-                logger.info("YUMMI balance check completed")
-                
+            except asyncio.CancelledError:
+                logger.info("YUMMI balance check cancelled")
+                raise
             except Exception as e:
-                logger.error(f"Error checking YUMMI balances: {e}")
-                await self.send_admin_alert(f"Error checking YUMMI balances: {e}")
-                
+                logger.error(f"Error in YUMMI balance check: {e}", exc_info=True)
+                raise
             finally:
-                self.processing_yummi = False
+                # Update health metrics
+                self.update_health_metrics('last_balance_check', datetime.now())
 
-    def check_environment(self):
+    async def check_single_wallet_balance(self, address: str) -> None:
+        """Check balance for a single wallet with retries"""
+        try:
+            # Get current balance
+            current_balance = await self.blockfrost_request(
+                self.blockfrost.address_assets,
+                address
+            )
+            
+            # Get previous balance from database
+            async with self.pool.acquire() as conn:
+                prev_balance = await conn.fetchval(
+                    "SELECT yummi_balance FROM wallets WHERE address = $1",
+                    address
+                )
+            
+            # Find YUMMI token in current balance
+            yummi_balance = 0
+            for asset in current_balance:
+                if asset.unit == YUMMI_POLICY_ID:
+                    yummi_balance = int(asset.quantity)
+                    break
+            
+            # Compare and notify if changed
+            if prev_balance != yummi_balance:
+                await self.notify_balance_change(
+                    address, 
+                    prev_balance or 0, 
+                    yummi_balance
+                )
+                
+                # Update database
+                async with self.pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE wallets 
+                        SET yummi_balance = $1, 
+                            last_balance_check = NOW() 
+                        WHERE address = $2
+                        """,
+                        yummi_balance, 
+                        address
+                    )
+                    
+        except Exception as e:
+            logger.error(f"Error checking balance for {address}: {e}")
+            raise
+
+    async def check_environment(self) -> bool:
         """Check if all required environment variables are set"""
         required_vars = {
-            'DISCORD_TOKEN': os.getenv('DISCORD_TOKEN'),
-            'APPLICATION_ID': os.getenv('APPLICATION_ID'),
-            'ADMIN_CHANNEL_ID': os.getenv('ADMIN_CHANNEL_ID'),
-            'BLOCKFROST_PROJECT_ID': os.getenv('BLOCKFROST_PROJECT_ID'),
-            'BLOCKFROST_BASE_URL': os.getenv('BLOCKFROST_BASE_URL'),
+            "DISCORD_TOKEN": "Discord bot token",
+            "APPLICATION_ID": "Discord application ID",
+            "ADMIN_CHANNEL_ID": "Admin channel ID",
+            "BLOCKFROST_PROJECT_ID": "Blockfrost project ID",
+            "BLOCKFROST_BASE_URL": "Blockfrost base URL",
+            "DATABASE_URL": "Database connection URL"
         }
         
-        missing_vars = [var for var, value in required_vars.items() if not value]
+        missing_vars = []
+        invalid_vars = []
         
-        if missing_vars:
-            error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+        for var, description in required_vars.items():
+            value = os.getenv(var)
+            if not value:
+                missing_vars.append(f"{var} ({description})")
+                continue
+                
+            # Validate specific variables
+            try:
+                if var == "APPLICATION_ID":
+                    int(value)  # Should be a valid integer
+                elif var == "ADMIN_CHANNEL_ID":
+                    int(value)  # Should be a valid integer
+                elif var == "BLOCKFROST_PROJECT_ID":
+                    if not value.startswith(("mainnet", "preprod", "preview")):
+                        invalid_vars.append(f"{var} (Should start with mainnet, preprod, or preview)")
+                elif var == "DATABASE_URL":
+                    if not value.startswith(("postgresql://", "postgres://")):
+                        invalid_vars.append(f"{var} (Invalid PostgreSQL URL format)")
+            except ValueError:
+                invalid_vars.append(f"{var} (Invalid format)")
+        
+        if missing_vars or invalid_vars:
+            if missing_vars:
+                logger.error("Missing required environment variables:\n" + 
+                           "\n".join(f"• {var}" for var in missing_vars))
+            if invalid_vars:
+                logger.error("Invalid environment variables:\n" + 
+                           "\n".join(f"• {var}" for var in invalid_vars))
+            return False
             
         return True
 
-    async def check_blockfrost(self):
-        """Check if Blockfrost API is working"""
+    async def validate_and_init_dependencies(self):
+        """Validate and initialize all critical dependencies"""
         try:
-            if not self.blockfrost:
-                raise ValueError("Blockfrost API client not initialized")
-                
-            async with self.rate_limiter.acquire('blockfrost'):
-                await self.blockfrost.health()
-            logger.info("✅ Blockfrost API check successful")
+            # 1. Validate environment variables
+            if not await self.validate_environment():
+                raise RuntimeError("Environment validation failed")
+
+            # 2. Initialize SSL context
+            if not await self.init_ssl_context():
+                raise RuntimeError("SSL context initialization failed")
+
+            # 3. Initialize database
+            if not await self.init_database():
+                raise RuntimeError("Database initialization failed")
+
+            # 4. Initialize Blockfrost
+            if not await self.init_blockfrost():
+                logger.error("⚠️ Blockfrost initialization failed. Starting in fallback mode.")
+                self.fallback_mode = True
+            else:
+                self.fallback_mode = False
+
+            # 5. Initialize rate limiters
+            self.init_rate_limiters()
+
+            # 6. Initialize webhook handler if secret is present
+            if os.getenv('WEBHOOK_SECRET'):
+                await self.setup_webhook_handler()
+            else:
+                logger.warning("WEBHOOK_SECRET not set. Webhook functionality disabled.")
+
             return True
-            
+
         except Exception as e:
-            logger.error(f"❌ Blockfrost API check failed: {str(e)}")
+            logger.error(f"Failed to initialize dependencies: {e}", exc_info=True)
             return False
 
-    async def blockfrost_request(self, method: Callable, *args, **kwargs) -> Any:
-        """Execute a Blockfrost API request with rate limiting and error handling
-        
-        Args:
-            method (Callable): Blockfrost API method to call
-            *args: Arguments to pass to the method
-            **kwargs: Keyword arguments to pass to the method
-            
-        Returns:
-            Any: Response from the Blockfrost API
-            
-        Raises:
-            ValueError: If Blockfrost client is not initialized
-            Exception: If API call fails
-        """
-        if not self.blockfrost:
-            raise ValueError("Blockfrost API client not initialized")
-            
+    async def validate_environment(self) -> bool:
+        """Validate all required environment variables"""
+        required_vars = {
+            'DISCORD_TOKEN': {
+                'description': 'Discord bot token',
+                'validator': lambda x: len(x) > 50  # Basic token length check
+            },
+            'DATABASE_URL': {
+                'description': 'PostgreSQL connection URL',
+                'validator': lambda x: x.startswith(('postgresql://', 'postgres://'))
+            },
+            'BLOCKFROST_PROJECT_ID': {
+                'description': 'Blockfrost project ID',
+                'validator': lambda x: x.startswith(('mainnet', 'preprod', 'preview'))
+            },
+            'BLOCKFROST_BASE_URL': {
+                'description': 'Blockfrost API base URL',
+                'validator': lambda x: x.startswith('https://')
+            },
+            'ADMIN_CHANNEL_ID': {
+                'description': 'Admin channel ID for notifications',
+                'validator': lambda x: x.isdigit()
+            }
+        }
+
+        missing_vars = []
+        invalid_vars = []
+
+        for var_name, config in required_vars.items():
+            value = os.getenv(var_name)
+            if not value:
+                missing_vars.append(f"{var_name} ({config['description']})")
+                continue
+                
+            try:
+                if not config['validator'](value):
+                    invalid_vars.append(f"{var_name} (invalid format)")
+            except Exception:
+                invalid_vars.append(f"{var_name} (validation error)")
+
+        if missing_vars or invalid_vars:
+            if missing_vars:
+                logger.error("Missing required environment variables:\n" + 
+                           "\n".join(f"• {var}" for var in missing_vars))
+            if invalid_vars:
+                logger.error("Invalid environment variables:\n" + 
+                           "\n".join(f"• {var}" for var in invalid_vars))
+            return False
+
+        return True
+
+    async def init_ssl_context(self) -> bool:
+        """Initialize SSL context with proper error handling"""
         try:
-            # Apply rate limiting
-            async with self.rate_limiter.acquire('blockfrost'):
-                # Execute request
-                response = await method(*args, **kwargs)
-                
-                # Update metrics
-                self.update_health_metrics('last_api_call', datetime.now())
-                
-                return response
-                
+            self.ssl_context = ssl.create_default_context(cafile=certifi.where())
+            self.connector = aiohttp.TCPConnector(
+                ssl=self.ssl_context,
+                enable_cleanup_closed=True,
+                force_close=True,
+                limit=100  # Connection pool limit
+            )
+            return True
         except Exception as e:
-            error_msg = str(e)
+            logger.error(f"Failed to initialize SSL context: {e}", exc_info=True)
+            return False
+
+    def init_rate_limiters(self):
+        """Initialize rate limiters for different services"""
+        self.rate_limiters = {
+            'blockfrost': {
+                'global': RateLimiter(
+                    rate=RATE_LIMITS['blockfrost']['calls_per_second'],
+                    burst=RATE_LIMITS['blockfrost']['burst']
+                ),
+                'endpoints': defaultdict(lambda: RateLimiter(
+                    rate=RATE_LIMITS['blockfrost']['calls_per_second'] / 2,
+                    burst=RATE_LIMITS['blockfrost']['burst'] / 2
+                ))
+            },
+            'discord': RateLimiter(
+                rate=RATE_LIMITS['discord']['global_rate_limit'],
+                burst=RATE_LIMITS['discord']['command_rate_limit']
+            )
+        }
+
+    async def blockfrost_request(self, method: Callable, *args, **kwargs) -> Any:
+        """Execute a rate-limited request to Blockfrost API with retries and error handling"""
+        if not self.blockfrost:
+            raise ValueError("Blockfrost client not initialized")
+
+        if self.fallback_mode:
+            logger.warning(f"Blockfrost request attempted in fallback mode: {method.__name__}")
+            raise RuntimeError("Blockfrost is in fallback mode")
+
+        # Get rate limiters
+        global_limiter = self.rate_limiters['blockfrost']['global']
+        endpoint_limiter = self.rate_limiters['blockfrost']['endpoints'][method.__name__]
+
+        for attempt in range(WEBHOOK_RETRY_ATTEMPTS):
+            try:
+                # Apply both global and endpoint-specific rate limiting
+                async with global_limiter:
+                    async with endpoint_limiter:
+                        response = await method(*args, **kwargs)
+                        
+                        # Update metrics
+                        self.update_health_metrics('last_api_call', datetime.now())
+                        return response
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                wait_time = min(2 ** attempt * 1.5, 30)  # Max 30 second delay
+
+                if "rate limit" in error_msg:
+                    logger.warning(f"Rate limit hit: {error_msg}")
+                    if attempt < WEBHOOK_RETRY_ATTEMPTS - 1:
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise ValueError("Rate limit exceeded. Please try again later.")
+
+                elif "not found" in error_msg:
+                    logger.info(f"Resource not found: {error_msg}")
+                    return None
+
+                elif any(msg in error_msg for msg in ["timeout", "connection", "network"]):
+                    if attempt < WEBHOOK_RETRY_ATTEMPTS - 1:
+                        logger.warning(f"Connection error, retrying in {wait_time}s: {error_msg}")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    logger.error(f"Connection failed after {WEBHOOK_RETRY_ATTEMPTS} retries")
+                    raise
+
+                else:
+                    logger.error(f"Blockfrost API error: {error_msg}")
+                    if hasattr(e, '__dict__'):
+                        logger.error(f"Error details: {e.__dict__}")
+                    raise
+
+    async def process_webhook(self, request: web.Request) -> web.Response:
+        """Process incoming webhook with validation and retries"""
+        try:
+            # Verify request IP
+            client_ip = request.remote
+            if not self.is_valid_ip(client_ip):
+                logger.warning(f"Rejected webhook from unauthorized IP: {client_ip}")
+                return web.Response(status=403, text="Unauthorized IP")
             
-            # Handle specific error cases
-            if "rate limit" in error_msg.lower():
-                logger.warning(f"Rate limit hit: {error_msg}")
-                raise ValueError("Rate limit exceeded. Please try again later.")
-            elif "not found" in error_msg.lower():
-                logger.info(f"Resource not found: {error_msg}")
-                return None
-            else:
-                logger.error(f"Blockfrost API error: {error_msg}")
-                if hasattr(e, '__dict__'):
-                    logger.error(f"Error details: {e.__dict__}")
-                raise
+            # Get request body
+            try:
+                event = await request.json()
+            except Exception as e:
+                logger.error(f"Failed to parse webhook JSON: {e}")
+                return web.Response(status=400, text="Invalid JSON")
+            
+            # Add timestamp if not present
+            if 'timestamp' not in event:
+                event['timestamp'] = datetime.now().isoformat()
+            
+            # Process with retries
+            success = await self.process_webhook_with_retries(event)
+            if not success:
+                return web.Response(status=500, text="Processing failed")
+            
+            return web.Response(status=200, text="OK")
+            
+        except Exception as e:
+            logger.error(f"Webhook handler error: {e}", exc_info=True)
+            return web.Response(status=500, text="Internal error")
+
+    def is_valid_ip(self, ip: str) -> bool:
+        """Check if IP is in allowed ranges"""
+        try:
+            client = ip_network(ip)
+            allowed_ranges = [
+                ip_network("127.0.0.0/8"),  # localhost
+                ip_network("10.0.0.0/8"),   # private network
+                ip_network("172.16.0.0/12"), # private network
+                ip_network("192.168.0.0/16"), # private network
+            ]
+            
+            return any(client.subnet_of(allowed) for allowed in allowed_ranges)
+            
+        except Exception as e:
+            logger.error(f"IP validation error: {e}")
+            return False
+
+    async def setup_webhook_handler(self):
+        """Set up webhook endpoint"""
+        app = web.Application()
+        app.router.add_post("/webhook", self.process_webhook)
+        
+        self.webhook_queue = asyncio.Queue(maxsize=WEBHOOK_QUEUE_SIZE)
+        self.webhook_semaphore = asyncio.Semaphore(10)  # Limit concurrent processing
+        
+        # Start webhook processor
+        self.webhook_processor.start()
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "localhost", 8080)
+        await site.start()
+        
+        logger.info("Webhook handler started on http://localhost:8080/webhook")
+
+    @tasks.loop()
+    async def webhook_processor(self):
+        """Process webhooks from queue"""
+        try:
+            while True:
+                event = await self.webhook_queue.get()
+                try:
+                    await self.handle_webhook_event(event)
+                except Exception as e:
+                    logger.error(f"Failed to process webhook event: {e}", exc_info=True)
+                finally:
+                    self.webhook_queue.task_done()
+                    
+        except asyncio.CancelledError:
+            logger.info("Webhook processor shutting down")
+            raise
+        except Exception as e:
+            logger.error(f"Webhook processor error: {e}", exc_info=True)
+            raise
+
+    async def handle_webhook_event(self, event: dict):
+        """Handle different types of webhook events"""
+        try:
+            event_type = event.get('type')
+            if not event_type:
+                logger.error("Event type missing from webhook")
+                return
                 
+            handler = getattr(self, f"handle_{event_type}_event", None)
+            if not handler:
+                logger.warning(f"No handler for event type: {event_type}")
+                return
+                
+            await handler(event['data'])
+            
+        except Exception as e:
+            logger.error(f"Event handler error: {e}", exc_info=True)
+            raise
+
+    async def health_check(self) -> dict:
+        """Comprehensive health check of all system components"""
+        health_data = {
+            'status': 'healthy',
+            'timestamp': datetime.now().isoformat(),
+            'components': {
+                'discord': self._check_discord_health(),
+                'blockfrost': await self._check_blockfrost_health(),
+                'database': await self._check_database_health(),
+                'system': self._check_system_health(),
+                'webhooks': self._check_webhook_health()
+            }
+        }
+        
+        # Determine overall health
+        unhealthy_components = [
+            name for name, data in health_data['components'].items()
+            if not data['healthy']
+        ]
+        
+        if unhealthy_components:
+            health_data['status'] = 'degraded'
+            health_data['unhealthy_components'] = unhealthy_components
+            
+            # Send alert if critical components are down
+            critical_components = {'discord', 'database'}
+            if any(comp in critical_components for comp in unhealthy_components):
+                await self.send_admin_alert(
+                    f"⚠️ Critical components unhealthy: {', '.join(unhealthy_components)}"
+                )
+        
+        return health_data
+
+    def _check_discord_health(self) -> dict:
+        """Check Discord connection health"""
+        return {
+            'healthy': self.is_ready() and not self.is_closed(),
+            'latency': round(self.latency * 1000, 2),
+            'shards': self.shard_count,
+            'guilds': len(self.guilds)
+        }
+
+    async def _check_blockfrost_health(self) -> dict:
+        """Check Blockfrost API health"""
+        try:
+            if not self.blockfrost:
+                return {'healthy': False, 'error': 'Not initialized'}
+                
+            async with self.rate_limiter.acquire('blockfrost'):
+                health = await self.blockfrost.health()
+                network = await self.blockfrost.network()
+                
+            return {
+                'healthy': True,
+                'network': network.network,
+                'sync_progress': network.sync_progress,
+                'rate_limits': self.rate_limiter.get_limits('blockfrost')
+            }
+        except Exception as e:
+            return {'healthy': False, 'error': str(e)}
+
+    async def _check_database_health(self) -> dict:
+        """Check database connection health"""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('SELECT 1')
+                
+            return {
+                'healthy': True,
+                'pool_size': self.pool.size,
+                'min_size': self.pool.min_size,
+                'max_size': self.pool.max_size,
+                'used_connections': len(self.pool._holders)
+            }
+        except Exception as e:
+            return {'healthy': False, 'error': str(e)}
+
+    def _check_system_health(self) -> dict:
+        """Check system resource usage"""
+        try:
+            process = psutil.Process()
+            memory = process.memory_info()
+            
+            return {
+                'healthy': True,
+                'cpu_percent': process.cpu_percent(),
+                'memory_used_mb': memory.rss / 1024 / 1024,
+                'memory_percent': process.memory_percent(),
+                'threads': len(process.threads()),
+                'open_files': len(process.open_files())
+            }
+        except Exception as e:
+            return {'healthy': False, 'error': str(e)}
+
+    def _check_webhook_health(self) -> dict:
+        """Check webhook processing health"""
+        return {
+            'healthy': True,
+            'queue_size': self.webhook_queue.qsize(),
+            'queue_capacity': WEBHOOK_QUEUE_SIZE,
+            'processing': not self.webhook_queue.empty()
+        }
+
 if __name__ == "__main__":
     try:
         # Configure logging for production
