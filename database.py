@@ -211,6 +211,63 @@ CREATE TABLE IF NOT EXISTS asset_history (
     amount BIGINT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Create processed_rewards table
+CREATE TABLE IF NOT EXISTS processed_rewards (
+    id SERIAL PRIMARY KEY,
+    stake_address TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    amount BIGINT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(stake_address, epoch)
+);
+
+-- Create delegation_status table
+CREATE TABLE IF NOT EXISTS delegation_status (
+    id SERIAL PRIMARY KEY,
+    stake_address TEXT NOT NULL,
+    pool_id TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(stake_address)
+);
+
+-- Create policy_expiry table
+CREATE TABLE IF NOT EXISTS policy_expiry (
+    id SERIAL PRIMARY KEY,
+    policy_id TEXT NOT NULL,
+    expiry_slot INTEGER NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(policy_id)
+);
+
+-- Create dapp_interactions table
+CREATE TABLE IF NOT EXISTS dapp_interactions (
+    id SERIAL PRIMARY KEY,
+    address TEXT NOT NULL,
+    tx_hash TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(address)
+);
+
+-- Create yummi_warnings table
+CREATE TABLE IF NOT EXISTS yummi_warnings (
+    id SERIAL PRIMARY KEY,
+    wallet_id INTEGER NOT NULL,
+    warning_count INTEGER NOT NULL DEFAULT 0,
+    last_warning_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(wallet_id)
+);
+
+-- Create stake_addresses table
+CREATE TABLE IF NOT EXISTS stake_addresses (
+    id SERIAL PRIMARY KEY,
+    stake_address TEXT NOT NULL,
+    last_pool_id TEXT,
+    last_checked TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(stake_address)
+);
 """
 
 # Migration tables creation SQL
@@ -330,7 +387,26 @@ async def create_indices(conn):
         "CREATE INDEX IF NOT EXISTS idx_asset_history_wallet ON asset_history(wallet_id)",
         "CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id)",
         "CREATE INDEX IF NOT EXISTS idx_asset_history_policy ON asset_history(policy_id)",
-        "CREATE INDEX IF NOT EXISTS idx_asset_history_created ON asset_history(created_at DESC)"
+        "CREATE INDEX IF NOT EXISTS idx_asset_history_created ON asset_history(created_at DESC)",
+        
+        # Processed rewards indices
+        "CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewards(stake_address)",
+        "CREATE INDEX IF NOT EXISTS idx_processed_rewards_epoch ON processed_rewards(epoch)",
+        
+        # Delegation status indices
+        "CREATE INDEX IF NOT EXISTS idx_delegation_status_stake_address ON delegation_status(stake_address)",
+        
+        # Policy expiry indices
+        "CREATE INDEX IF NOT EXISTS idx_policy_expiry_policy_id ON policy_expiry(policy_id)",
+        
+        # DApp interactions indices
+        "CREATE INDEX IF NOT EXISTS idx_dapp_interactions_address ON dapp_interactions(address)",
+        
+        # YUMMI warnings indices
+        "CREATE INDEX IF NOT EXISTS idx_yummi_warnings_wallet_id ON yummi_warnings(wallet_id)",
+        
+        # Stake addresses indices
+        "CREATE INDEX IF NOT EXISTS idx_stake_addresses_stake_address ON stake_addresses(stake_address)",
     ]
     
     for index_sql in indices:
