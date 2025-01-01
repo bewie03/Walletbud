@@ -1732,38 +1732,36 @@ if __name__ == "__main__":
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler('bot.log')
-            ]
+            datefmt='%Y-%m-%d %H:%M:%S'
         )
-        
+
         # Configure event loop policy for Windows
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-            
-        # Create and set event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
+
         # Create bot instance
         bot = WalletBudBot()
-        
-        # Create async startup function
-        async def init_bot():
-            # Check environment variables
-            await bot.check_environment()
-            
-            # Get port from environment for Heroku
-            port = int(os.getenv('PORT', 8080))
-            
-            # Start webhook server
-            await bot.start_webhook()
-        
-        # Run the bot with async initialization
-        loop.create_task(init_bot())
-        bot.run(DISCORD_TOKEN)
+
+        async def main():
+            try:
+                # Check environment variables
+                await bot.check_environment()
+                
+                # Get port from environment for Heroku
+                port = int(os.getenv('PORT', 8080))
+                
+                # Start webhook server
+                await bot.start_webhook()
+                
+                # Run the bot
+                await bot.start(DISCORD_TOKEN)
+            except Exception as e:
+                logger.error(f"Error during bot initialization: {e}")
+                raise
+
+        # Run everything in the event loop
+        asyncio.run(main())
         
     except Exception as e:
-        logger.error(f"Failed to start bot: {str(e)}", exc_info=True)
+        logger.error(f"Fatal error: {e}")
         sys.exit(1)
