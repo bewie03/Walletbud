@@ -2349,7 +2349,7 @@ async def execute_query(query: str, *args) -> None:
             global _pool
             _pool = None  # Force pool recreation
             if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay * (attempt + 1))
+                await asyncio.sleep(retry_delay)
                 continue
             raise
         except Exception as e:
@@ -2397,9 +2397,40 @@ def init_db_sync():
         asyncio.set_event_loop(loop)
         
         try:
-            loop.run_until_complete(init_db())
-            logger.info("Database initialized successfully")
-            return
+            # Create SSL context
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # Get database URL
+            database_url = get_database_url()
+            
+            # Create pool and get connection
+            pool = loop.run_until_complete(
+                asyncpg.create_pool(
+                    database_url,
+                    min_size=5,
+                    max_size=20,
+                    command_timeout=60,
+                    ssl=ssl_context
+                )
+            )
+            
+            try:
+                # Get connection from pool
+                conn = loop.run_until_complete(pool.acquire())
+                try:
+                    # Initialize database with connection
+                    loop.run_until_complete(init_db(conn))
+                    logger.info("Database initialized successfully")
+                    return
+                finally:
+                    # Always release the connection
+                    loop.run_until_complete(pool.release(conn))
+            finally:
+                # Always close the pool
+                loop.run_until_complete(pool.close())
+                
         except Exception as e:
             if "already exists" in str(e):
                 logger.info("Database tables already exist, continuing...")
@@ -2418,7 +2449,7 @@ def init_db_sync():
                 loop.close()
             except Exception as e:
                 logger.error(f"Error closing event loop: {e}")
-
+                
 if __name__ == "__main__":
     # For direct script execution (e.g., in Heroku release phase)
     init_db_sync()
