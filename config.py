@@ -98,6 +98,10 @@ BLOCKFROST_NETWORKS = {
     'preprod': 'https://cardano-preprod.blockfrost.io/api/v0'
 }
 
+# Blockfrost configuration
+BLOCKFROST_PROJECT_ID = os.getenv('BLOCKFROST_PROJECT_ID')
+BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0/')
+
 def validate_positive_int(value: str, name: str) -> int:
     """Validate and convert to positive integer"""
     try:

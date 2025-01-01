@@ -394,21 +394,46 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error cancelling background tasks: {e}")
             
     async def close(self):
-        """Override close to include graceful shutdown"""
+        """Clean up resources and perform graceful shutdown"""
         try:
-            # Execute graceful shutdown
-            await self.shutdown_manager.cleanup()
+            logger.debug("Starting graceful shutdown...")
             
-            # Send final alert to admin channel
-            try:
-                if self.admin_channel:
-                    await self.admin_channel.send(" Bot is shutting down gracefully...")
-            except:
-                pass
+            # Cancel background tasks
+            if hasattr(self, '_webhook_task'):
+                self._webhook_task.cancel()
+                try:
+                    await self._webhook_task
+                except asyncio.CancelledError:
+                    pass
+                    
+            if hasattr(self, '_webhook_processor'):
+                self._webhook_processor.cancel()
+                try:
+                    await self._webhook_processor
+                except asyncio.CancelledError:
+                    pass
+                    
+            # Stop tasks
+            self.check_yummi_balances.cancel()
+            self.health_check_task.cancel()
+            
+            # Clean up resources
+            if hasattr(self, 'session') and self.session:
+                await self.session.close()
+                logger.info("HTTP session closed successfully")
                 
-        finally:
-            # Call parent's close
+            if hasattr(self, 'pool') and self.pool:
+                await self.pool.close()
+                logger.info("Database pool closed successfully")
+                
+            # Call parent's close method
             await super().close()
+            
+            logger.info("Graceful shutdown completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
+            raise
             
     async def setup_hook(self):
         """Set up the bot's background tasks and signal handlers"""
@@ -423,6 +448,9 @@ class WalletBudBot(commands.Bot):
             
             # Set up webhook routing
             self.app.router.add_post('/webhook', self.handle_webhook)
+            
+            # Start webhook server
+            self._webhook_task = asyncio.create_task(self.start_webhook())
             
             # Start webhook processor
             self._webhook_processor = asyncio.create_task(self._process_webhook_queue())
@@ -463,7 +491,7 @@ class WalletBudBot(commands.Bot):
             await self.init_blockfrost()
             logger.info("Blockfrost client initialized")
             if self.admin_channel:
-                await self.admin_channel.send("✅ Blockfrost client initialized")
+                await self.admin_channel.send("✅ Blockfrost API connection established")
             
             # Initialize HTTP session
             self.session = aiohttp.ClientSession(connector=self.connector)
@@ -1055,7 +1083,7 @@ class WalletBudBot(commands.Bot):
                 await asyncio.sleep(60)  # Wait longer on error
                 
     async def init_blockfrost(self):
-        """Initialize Blockfrost API client with proper error handling and retries"""
+        """Initialize Blockfrost API client with proper error handling"""
         if not BLOCKFROST_PROJECT_ID:
             logger.error("BLOCKFROST_PROJECT_ID environment variable is not set")
             if self.admin_channel:
@@ -1063,17 +1091,18 @@ class WalletBudBot(commands.Bot):
             raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
             
         try:
-            base_url = os.getenv('BLOCKFROST_BASE_URL', ApiUrls.mainnet.value)
+            # Initialize Blockfrost client with mainnet URL by default
+            base_url = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0/')
             self.blockfrost = BlockFrostApi(
                 project_id=BLOCKFROST_PROJECT_ID,
                 base_url=base_url
             )
-            # Test connection
-            await self.blockfrost.health()
+            
+            # Test connection with a simple endpoint
+            await self.blockfrost.info()
             logger.info("Blockfrost client initialized successfully")
-            self.health_metrics['blockfrost_init'] = datetime.utcnow()
             if self.admin_channel:
-                await self.admin_channel.send("ℹ️ INFO: Blockfrost API connection established")
+                await self.admin_channel.send("✅ Blockfrost API connection established")
             
         except Exception as e:
             logger.error(f"Failed to initialize Blockfrost client: {e}")
@@ -1143,50 +1172,27 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error in on_resumed: {str(e)}", exc_info=True)
 
-    async def check_webhook_rate_limit(self, ip: str) -> bool:
-        """Check if webhook request exceeds rate limit"""
-        # Use a more granular rate limit per IP
-        rate_key = f"webhook:{ip}"
-        now = datetime.utcnow()
-        
-        async with self.rate_limiter.acquire("webhook"):
-            # Get current state
-            state = self.webhook_rate_limits.get(rate_key, {
-                'count': 0,
-                'reset_at': now
-            })
+    async def start_webhook(self):
+        """Start the webhook server"""
+        try:
+            port = int(os.getenv('PORT', 8080))
             
-            # Reset if window has passed
-            if now > state['reset_at']:
-                state = {
-                    'count': 0,
-                    'reset_at': now + timedelta(minutes=1)
-                }
+            runner = web.AppRunner(self.app)
+            await runner.setup()
+            
+            site = web.TCPSite(runner, '0.0.0.0', port)
+            await site.start()
+            
+            logger.info(f"Webhook server started on port {port}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"✅ Webhook server started on port {port}")
                 
-            # Check limit
-            if state['count'] >= WEBHOOK_RATE_LIMIT:
-                return False
-                
-            # Update state
-            state['count'] += 1
-            self.webhook_rate_limits[rate_key] = state
-            
-            # Clean up old entries every 100 requests
-            if random.random() < 0.01:  # 1% chance
-                self._cleanup_rate_limits()
-                
-            return True
-            
-    def _cleanup_rate_limits(self):
-        """Clean up expired rate limit entries"""
-        now = datetime.utcnow()
-        expired = [
-            k for k, v in self.webhook_rate_limits.items()
-            if now > v['reset_at']
-        ]
-        for k in expired:
-            del self.webhook_rate_limits[k]
-            
+        except Exception as e:
+            logger.error(f"Failed to start webhook server: {e}")
+            if self.admin_channel:
+                await self.admin_channel.send(f"🚨 ERROR: Failed to start webhook server: {e}")
+            raise
+
     async def handle_webhook(self, request: web.Request) -> web.Response:
         """Handle incoming webhooks with comprehensive validation and rate limiting"""
         request_id = get_request_id()
