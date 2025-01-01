@@ -175,11 +175,10 @@ class DatabaseMaintenance:
                     RETURNING t.tx_hash
                 """
                 
-                result = await execute_query(
+                result = await fetch_all(
                     query,
                     cutoff_date,
                     BATCH_SIZE,
-                    fetchall=True,
                     conn=conn
                 )
                 
@@ -226,11 +225,10 @@ class DatabaseMaintenance:
                     RETURNING t.tx_hash
                 """
                 
-                result = await execute_query(
+                result = await fetch_all(
                     query,
                     cutoff_date,
                     BATCH_SIZE,
-                    fetchall=True,
                     conn=conn
                 )
                 

@@ -63,6 +63,15 @@ RATE_LIMITS = {
     }
 }
 
+# Webhook rate limiting configuration
+RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '60'))  # Window in seconds
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv('RATE_LIMIT_MAX_REQUESTS', '100'))  # Max requests per window
+MAX_QUEUE_SIZE = int(os.getenv('MAX_QUEUE_SIZE', '10000'))  # Maximum events in queue
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))  # Maximum retry attempts
+MAX_EVENT_AGE = int(os.getenv('MAX_EVENT_AGE', '86400'))  # Maximum age of events in seconds (24 hours)
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', '100'))  # Process events in batches
+MAX_WEBHOOK_SIZE = int(os.getenv('MAX_WEBHOOK_SIZE', '1048576'))  # Maximum webhook payload size in bytes (1MB)
+
 # Blockfrost network configuration
 BLOCKFROST_NETWORKS = {
     'mainnet': 'https://cardano-mainnet.blockfrost.io/api/v0',

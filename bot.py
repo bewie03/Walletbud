@@ -1,3 +1,4 @@
+# Standard library imports
 import os
 import re
 import ssl
@@ -5,24 +6,31 @@ import sys
 import time
 import json
 import uuid
-import certifi
+import hmac
+import hashlib
 import asyncio
 import logging
+import traceback
+from datetime import datetime, timedelta
+from ipaddress import ip_network
+from collections import defaultdict
+from typing import Dict, List, Any, Optional, Union, Callable
+
+# Third-party imports
+import certifi
 import discord
+from discord import app_commands
 import aiohttp
 import asyncpg
 import requests
-import traceback
-import hmac
-import hashlib
 import psutil
-from datetime import datetime, timedelta
-from ipaddress import ip_network
 from aiohttp import web
 from discord.ext import commands, tasks
-from typing import Dict, List, Any, Optional, Union, Callable
-from collections import defaultdict
+from blockfrost import BlockFrostApi, ApiUrls
+from blockfrost.api.cardano.network import network
 from urllib3.exceptions import InsecureRequestWarning
+
+# Local imports
 from database import (
     get_pool,
     add_wallet_for_user,
@@ -40,11 +48,6 @@ from database import (
     get_database_url,
     DatabaseError
 )
-
-import discord
-from discord import app_commands
-from blockfrost import BlockFrostApi, ApiUrls
-from blockfrost.api.cardano.network import network
 from database_maintenance import DatabaseMaintenance
 from webhook_queue import WebhookQueue
 from decorators import dm_only, has_blockfrost, command_cooldown
