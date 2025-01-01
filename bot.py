@@ -54,7 +54,6 @@ from database import (
     update_ada_balance,
     should_notify,
     update_notification_settings,
-    get_user_notification_settings,
     get_wallet_addresses,
     get_stake_address_for_user,
     get_user_stake_addresses,
