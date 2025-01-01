@@ -7,6 +7,7 @@ import logging
 import asyncio
 import json
 import time
+import os
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -21,6 +22,9 @@ from config import (
     BATCH_SIZE,
     MAX_WEBHOOK_SIZE
 )
+
+# Get port from Heroku environment, default to 8080 for local development
+PORT = int(os.environ.get('PORT', 8080))
 
 logger = logging.getLogger(__name__)
 

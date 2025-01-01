@@ -4,7 +4,7 @@ import logging
 import asyncio
 import asyncpg
 from datetime import datetime
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Tuple
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -18,171 +18,328 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable not set")
 
-# Global connection pool
+# Database configuration constants
+DB_CONFIG = {
+    'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '2')),
+    'MAX_POOL_SIZE': int(os.getenv('DB_MAX_POOL_SIZE', '10')),
+    'MAX_QUERIES_PER_CONN': int(os.getenv('DB_MAX_QUERIES', '50000')),
+    'COMMAND_TIMEOUT': int(os.getenv('DB_COMMAND_TIMEOUT', '60')),
+    'TRANSACTION_TIMEOUT': int(os.getenv('DB_TRANSACTION_TIMEOUT', '60')),
+    'RETRY_ATTEMPTS': int(os.getenv('DB_RETRY_ATTEMPTS', '3')),
+    'RETRY_DELAY': int(os.getenv('DB_RETRY_DELAY', '1')),
+    'ALLOWED_COLUMNS': {
+        'notification_settings': {'ada_transactions', 'token_changes', 'nft_updates', 
+                                'delegation_status', 'policy_updates', 'balance_alerts'}
+    }
+}
+
+# Global connection pool with proper locking
 _pool = None
 _pool_lock = asyncio.Lock()
+_pool_init_error = None
+
+class DatabaseError(Exception):
+    """Base class for database exceptions"""
+    pass
+
+class ConnectionError(DatabaseError):
+    """Database connection error"""
+    pass
+
+class QueryError(DatabaseError):
+    """Database query error"""
+    pass
 
 async def init_db():
-    """Initialize database connection pool"""
-    global _pool
-    async with _pool_lock:
-        if _pool is None:
-            try:
-                # Get DATABASE_URL from environment
-                database_url = os.getenv('DATABASE_URL')
-                
-                # Handle Heroku's database URL format
-                if database_url and database_url.startswith('postgres://'):
-                    database_url = database_url.replace('postgres://', 'postgresql://', 1)
-                
-                if not database_url:
-                    raise ValueError("DATABASE_URL environment variable not set")
-                
-                logger.info("Initializing database connection pool...")
-                _pool = await asyncpg.create_pool(
-                    database_url,
-                    min_size=1,      # Minimum connections for Heroku's free tier
-                    max_size=5,      # Maximum connections for Heroku's free tier
-                    timeout=30,      # Connection timeout
-                    command_timeout=30,  # Command timeout
-                    max_queries=50000,   # Max queries per connection
-                    max_inactive_connection_lifetime=300.0,  # 5 minutes
-                    ssl=True,  # Required for Heroku Postgres
-                    server_settings={
-                        'application_name': 'WalletBud',
-                        'statement_timeout': '30000',  # 30 seconds
-                        'idle_in_transaction_session_timeout': '300000'  # 5 minutes
-                    }
-                )
-                logger.info("Database connection pool initialized successfully")
-                
-                # Run migrations if needed
-                await run_migrations()
-                
-            except Exception as e:
-                logger.error(f"Failed to initialize database pool: {str(e)}", exc_info=True)
-                raise
-
-async def close_db():
-    """Close database connection pool"""
-    global _pool
+    """Initialize database connection pool with proper error handling"""
+    global _pool, _pool_init_error
+    
+    if _pool_init_error:
+        logger.warning("Previous pool initialization failed, resetting error state")
+        _pool_init_error = None
+    
     async with _pool_lock:
         if _pool is not None:
-            await _pool.close()
-            _pool = None
-            logger.info("Database connection pool closed")
-
-async def cleanup_pool():
-    """Clean up the database connection pool"""
-    await close_db()
+            logger.warning("Database pool already initialized")
+            return _pool
+            
+        try:
+            # Determine SSL mode based on URL
+            ssl_required = 'amazonaws.com' in DATABASE_URL or 'herokuapp.com' in DATABASE_URL
+            ssl_mode = 'require' if ssl_required else None
+            
+            # Create connection pool with configurable settings
+            _pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=DB_CONFIG['MIN_POOL_SIZE'],
+                max_size=DB_CONFIG['MAX_POOL_SIZE'],
+                command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
+                ssl=ssl_mode,
+                max_cached_statement_lifetime=600,
+                max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
+                server_settings={
+                    'application_name': 'WalletBud',
+                    'statement_timeout': f"{DB_CONFIG['COMMAND_TIMEOUT']}000",
+                    'idle_in_transaction_session_timeout': f"{DB_CONFIG['TRANSACTION_TIMEOUT']}000",
+                    'lock_timeout': '10000'  # 10 second lock timeout
+                }
+            )
+            
+            # Test connection
+            async with _pool.acquire() as conn:
+                await conn.execute('SELECT 1')
+                
+            logger.info(
+                f"Database pool initialized (size: {DB_CONFIG['MIN_POOL_SIZE']}-{DB_CONFIG['MAX_POOL_SIZE']})"
+            )
+            return _pool
+            
+        except Exception as e:
+            _pool_init_error = str(e)
+            logger.error(f"Failed to initialize database pool: {str(e)}")
+            raise ConnectionError(f"Database initialization failed: {str(e)}")
 
 async def get_pool():
-    """Get database connection pool, initializing if necessary"""
+    """Get database connection pool with initialization check"""
     global _pool
-    
     if _pool is None:
-        async with _pool_lock:
-            # Double-check pattern
-            if _pool is None:
-                try:
-                    # Get DATABASE_URL from environment
-                    database_url = os.getenv('DATABASE_URL')
-                    
-                    # Handle Heroku's database URL format
-                    if database_url and database_url.startswith('postgres://'):
-                        database_url = database_url.replace('postgres://', 'postgresql://', 1)
-                    
-                    if not database_url:
-                        raise ValueError("DATABASE_URL environment variable not set")
-                    
-                    logger.info("Initializing database connection pool...")
-                    _pool = await asyncpg.create_pool(
-                        database_url,
-                        min_size=1,      # Minimum connections for Heroku's free tier
-                        max_size=5,      # Maximum connections for Heroku's free tier
-                        timeout=30,      # Connection timeout
-                        command_timeout=30,  # Command timeout
-                        max_queries=50000,   # Max queries per connection
-                        max_inactive_connection_lifetime=300.0,  # 5 minutes
-                        ssl=True,  # Required for Heroku Postgres
-                        server_settings={
-                            'application_name': 'WalletBud',
-                            'statement_timeout': '30000',  # 30 seconds
-                            'idle_in_transaction_session_timeout': '300000'  # 5 minutes
-                        }
-                    )
-                    logger.info("Database connection pool initialized successfully")
-                except Exception as e:
-                    logger.error(f"Failed to initialize database pool: {str(e)}", exc_info=True)
-                    raise
-    
+        # Create connection pool with configurable settings
+        try:
+            # Determine SSL mode based on URL
+            ssl_required = 'amazonaws.com' in DATABASE_URL or 'herokuapp.com' in DATABASE_URL
+            ssl_mode = 'require' if ssl_required else None
+            
+            # Create connection pool with configurable settings
+            _pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=DB_CONFIG['MIN_POOL_SIZE'],
+                max_size=DB_CONFIG['MAX_POOL_SIZE'],
+                command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
+                ssl=ssl_mode,
+                max_cached_statement_lifetime=600,
+                max_queries=DB_CONFIG['MAX_QUERIES_PER_CONN'],
+                server_settings={
+                    'application_name': 'WalletBud',
+                    'statement_timeout': f"{DB_CONFIG['COMMAND_TIMEOUT']}000",
+                    'idle_in_transaction_session_timeout': f"{DB_CONFIG['TRANSACTION_TIMEOUT']}000",
+                    'lock_timeout': '10000'  # 10 second lock timeout
+                }
+            )
+            
+            # Test connection
+            async with _pool.acquire() as conn:
+                await conn.execute('SELECT 1')
+                
+            logger.info(
+                f"Database pool initialized (size: {DB_CONFIG['MIN_POOL_SIZE']}-{DB_CONFIG['MAX_POOL_SIZE']})"
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize database pool: {str(e)}")
+            _pool = None
+            raise ConnectionError(f"Database initialization failed: {str(e)}")
+            
     return _pool
 
-async def execute_query(query: str, *args):
-    """Execute a database query with retry logic"""
-    max_retries = 3
-    retry_delay = 1  # seconds
+async def fetch_all(query: str, *args, retries: int = None) -> List[asyncpg.Record]:
+    """Fetch all rows from a database query with retries
     
-    for attempt in range(max_retries):
+    Args:
+        query: SQL query to execute
+        *args: Query parameters
+        retries: Number of retry attempts
+        
+    Returns:
+        List[asyncpg.Record]: Query results
+        
+    Raises:
+        QueryError: If query fails after all retries
+    """
+    retries = retries if retries is not None else DB_CONFIG['RETRY_ATTEMPTS']
+    last_error = None
+    
+    for attempt in range(retries):
         try:
             pool = await get_pool()
             async with pool.acquire() as conn:
                 async with conn.transaction():
-                    return await conn.execute(query, *args)
-        except asyncpg.exceptions.ConnectionDoesNotExistError:
-            # Connection was closed, retry
+                    return await conn.fetch(query, *args)
+                    
+        except asyncpg.InterfaceError:
+            # Connection is broken, force pool reinitialization
             global _pool
-            _pool = None  # Force pool recreation
-            if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay * (attempt + 1))
-                continue
-            raise
+            _pool = None
+            continue
+            
+        except asyncpg.PostgresError as e:
+            last_error = e
+            if attempt < retries - 1:
+                delay = DB_CONFIG['RETRY_DELAY'] * (2 ** attempt)
+                logger.warning(f"Query failed (attempt {attempt + 1}/{retries}), retrying in {delay}s: {str(e)}")
+                await asyncio.sleep(delay)
+            
         except Exception as e:
-            logger.error(f"Database query failed: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-            raise
+            raise QueryError(f"Unexpected error executing query: {str(e)}")
+            
+    raise QueryError(f"Query failed after {retries} attempts: {str(last_error)}")
 
-async def execute_many(query: str, args_list: list) -> None:
-    """Execute a database query with multiple sets of parameters
+async def fetch_one(query: str, *args, retries: int = None) -> Optional[asyncpg.Record]:
+    """Fetch a single row with retries
     
     Args:
-        query (str): SQL query to execute
-        args_list (list): List of parameter sets
-    """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.executemany(query, args_list)
-            logger.debug(f"Executed batch query: {query}")
-
-async def fetch_all(query: str, *args) -> List[asyncpg.Record]:
-    """Fetch all rows from a database query
-    
-    Args:
-        query (str): SQL query to execute
+        query: SQL query to execute
         *args: Query parameters
-        
-    Returns:
-        List[asyncpg.Record]: List of query results
-    """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetch(query, *args)
-
-async def fetch_one(query: str, *args) -> Optional[asyncpg.Record]:
-    """Fetch a single row from a database query
-    
-    Args:
-        query (str): SQL query to execute
-        *args: Query parameters
+        retries: Number of retry attempts
         
     Returns:
         Optional[asyncpg.Record]: Query result or None if not found
+        
+    Raises:
+        QueryError: If query fails after all retries
+    """
+    retries = retries if retries is not None else DB_CONFIG['RETRY_ATTEMPTS']
+    last_error = None
+    
+    for attempt in range(retries):
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    return await conn.fetchrow(query, *args)
+                    
+        except asyncpg.InterfaceError:
+            # Connection is broken, force pool reinitialization
+            global _pool
+            _pool = None
+            continue
+            
+        except asyncpg.PostgresError as e:
+            last_error = e
+            if attempt < retries - 1:
+                delay = DB_CONFIG['RETRY_DELAY'] * (2 ** attempt)
+                logger.warning(f"Query failed (attempt {attempt + 1}/{retries}), retrying in {delay}s: {str(e)}")
+                await asyncio.sleep(delay)
+            
+        except Exception as e:
+            raise QueryError(f"Unexpected error executing query: {str(e)}")
+            
+    raise QueryError(f"Query failed after {retries} attempts: {str(last_error)}")
+
+async def execute_transaction(queries: List[tuple[str, tuple]], retries: int = None) -> None:
+    """Execute multiple queries in a single transaction with retries
+    
+    Args:
+        queries: List of (query, args) tuples to execute
+        retries: Number of retry attempts
+        
+    Raises:
+        QueryError: If transaction fails after all retries
     """
     pool = await get_pool()
+    retry_count = retries if retries is not None else DB_CONFIG['RETRY_ATTEMPTS']
+    
     async with pool.acquire() as conn:
-        return await conn.fetchrow(query, *args)
+        async with conn.transaction():
+            for query, args in queries:
+                try:
+                    await conn.execute(query, *args)
+                except Exception as e:
+                    logger.error(f"Error executing query in transaction: {e}")
+                    if retry_count > 0:
+                        await asyncio.sleep(DB_CONFIG['RETRY_DELAY'])
+                        return await execute_transaction(queries, retry_count - 1)
+                    raise QueryError(f"Transaction failed after {DB_CONFIG['RETRY_ATTEMPTS']} retries: {e}")
+
+async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
+    """Add a wallet with proper validation and error handling
+    
+    Args:
+        user_id: Discord user ID
+        address: Wallet address
+        stake_address: Optional stake address
+        
+    Returns:
+        bool: Success status
+        
+    Raises:
+        ValueError: If input validation fails
+    """
+    # Validate inputs
+    if not user_id or not address:
+        raise ValueError("user_id and address are required")
+        
+    if not isinstance(user_id, str) or not isinstance(address, str):
+        raise ValueError("user_id and address must be strings")
+        
+    if stake_address and not isinstance(stake_address, str):
+        raise ValueError("stake_address must be a string if provided")
+        
+    try:
+        # Check if wallet already exists
+        existing = await fetch_one(
+            "SELECT id FROM wallets WHERE address = $1",
+            address
+        )
+        if existing:
+            logger.warning(f"Wallet {address} already exists")
+            return False
+            
+        # Add wallet and initialize notification settings in transaction
+        queries = [
+            (
+                """
+                INSERT INTO wallets (user_id, address, stake_address)
+                VALUES ($1, $2, $3)
+                RETURNING id
+                """,
+                (user_id, address, stake_address)
+            ),
+            (
+                """
+                INSERT INTO notification_settings (user_id)
+                VALUES ($1)
+                ON CONFLICT (user_id) DO NOTHING
+                """,
+                (user_id,)
+            )
+        ]
+        
+        await execute_transaction(queries)
+        logger.info(f"Successfully added wallet {address} for user {user_id}")
+        return True
+        
+    except QueryError as e:
+        logger.error(f"Failed to add wallet: {str(e)}")
+        return False
+
+async def update_notification_setting(user_id: str, setting: str, enabled: bool) -> bool:
+    """Update a notification setting with proper validation
+    
+    Args:
+        user_id: Discord user ID
+        setting: Setting name to update
+        enabled: New setting value
+        
+    Returns:
+        bool: Success status
+        
+    Raises:
+        ValueError: If setting name is invalid
+    """
+    if not validate_column_name('notification_settings', setting):
+        raise ValueError(f"Invalid notification setting: {setting}")
+        
+    query = f"""
+        UPDATE notification_settings 
+        SET {setting} = $1 
+        WHERE user_id = $2
+    """
+    
+    try:
+        await execute_transaction([(query, (enabled, user_id))])
+        return True
+    except QueryError as e:
+        logger.error(f"Failed to update notification setting: {str(e)}")
+        return False
 
 # Database initialization SQL
 INIT_SQL = """
@@ -380,45 +537,166 @@ async def get_db_version() -> int:
         logger.error(f"Failed to get database version: {str(e)}")
         return 0
 
-async def run_migrations():
-    """Run any pending database migrations"""
+async def check_database_schema(pool) -> None:
+    """Verify database schema including tables, columns, constraints and indices
+    
+    Raises:
+        DatabaseError: If schema verification fails
+    """
     try:
-        current = await get_db_version()
-        logger.info(f"Current database version: {current}")
-        
-        if current >= CURRENT_VERSION:
-            logger.info("Database is up to date")
-            return True
+        async with pool.acquire() as conn:
+            # Check tables
+            tables = await conn.fetch("""
+                SELECT table_name, column_name, data_type, 
+                       is_nullable, column_default,
+                       character_maximum_length
+                FROM information_schema.columns 
+                WHERE table_schema = 'public'
+                ORDER BY table_name, ordinal_position
+            """)
             
-        pool = await get_pool()
+            # Check constraints
+            constraints = await conn.fetch("""
+                SELECT tc.table_name, tc.constraint_name, tc.constraint_type,
+                       kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu 
+                    ON tc.constraint_name = kcu.constraint_name
+                WHERE tc.table_schema = 'public'
+            """)
+            
+            # Check indices
+            indices = await conn.fetch("""
+                SELECT schemaname, tablename, indexname, indexdef
+                FROM pg_indexes
+                WHERE schemaname = 'public'
+            """)
+            
+            # Validate expected schema
+            expected_tables = {
+                'wallets': {
+                    'columns': {'id', 'user_id', 'address', 'stake_address', 'created_at'},
+                    'constraints': {'wallets_pkey', 'wallets_address_key'},
+                    'indices': {'idx_wallets_user_id', 'idx_wallets_address'}
+                },
+                'notification_settings': {
+                    'columns': {'user_id', 'ada_transactions', 'token_transfers', 
+                              'nft_updates', 'delegation_status', 'policy_updates'},
+                    'constraints': {'notification_settings_pkey'},
+                    'indices': {'idx_notification_settings_user_id'}
+                },
+                # Add other tables here
+            }
+            
+            # Verify tables and columns
+            found_tables = {t['table_name'] for t in tables}
+            for table, expected in expected_tables.items():
+                if table not in found_tables:
+                    raise DatabaseError(f"Missing required table: {table}")
+                    
+                found_columns = {t['column_name'] for t in tables if t['table_name'] == table}
+                missing_columns = expected['columns'] - found_columns
+                if missing_columns:
+                    raise DatabaseError(f"Missing columns in {table}: {missing_columns}")
+                    
+            # Verify constraints
+            for table, expected in expected_tables.items():
+                found_constraints = {c['constraint_name'] for c in constraints 
+                                  if c['table_name'] == table}
+                missing_constraints = expected['constraints'] - found_constraints
+                if missing_constraints:
+                    raise DatabaseError(f"Missing constraints in {table}: {missing_constraints}")
+                    
+            # Verify indices
+            for table, expected in expected_tables.items():
+                found_indices = {i['indexname'] for i in indices if i['tablename'] == table}
+                missing_indices = expected['indices'] - found_indices
+                if missing_indices:
+                    raise DatabaseError(f"Missing indices in {table}: {missing_indices}")
+                    
+            logger.info("Database schema verification completed successfully")
+            
+    except asyncpg.PostgresError as e:
+        raise DatabaseError(f"Schema verification failed: {str(e)}")
+        
+    except Exception as e:
+        raise DatabaseError(f"Unexpected error during schema verification: {str(e)}")
+
+async def run_migrations(pool) -> None:
+    """Run database migrations with proper error handling and validation
+    
+    Raises:
+        DatabaseError: If migrations fail
+    """
+    try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                # Reset version if needed
-                if current > 0:
-                    await conn.execute("DELETE FROM db_version")
-                    current = 0
-                    logger.info("Reset database version")
+                # Get current version
+                current_version = await conn.fetchval("""
+                    SELECT version FROM db_version 
+                    ORDER BY updated_at DESC LIMIT 1
+                """)
                 
-                # Run all migrations in order
-                for version in range(current + 1, CURRENT_VERSION + 1):
-                    if version in MIGRATIONS:
-                        logger.info(f"Running migration to version {version}")
-                        migration = MIGRATIONS[version]
-                        if isinstance(migration, list):
-                            for statement in migration[:-1]:  # Execute all but the last statement
-                                await conn.execute(statement)
-                            # Execute the version update statement with parameter
-                            await conn.execute(migration[-1], version)
-                        else:
-                            await conn.execute(migration, version)
-                        logger.info(f"Completed migration to version {version}")
+                if current_version is None:
+                    current_version = 0
                     
-                logger.info("All migrations completed successfully")
-                return True
+                # Get all migrations after current version
+                pending_migrations = {v: sql for v, sql in MIGRATIONS.items() 
+                                   if v > current_version}
                 
+                if not pending_migrations:
+                    logger.info(f"Database is up to date at version {current_version}")
+                    return
+                    
+                # Run migrations in version order
+                for version in sorted(pending_migrations.keys()):
+                    logger.info(f"Running migration to version {version}")
+                    
+                    # Start migration
+                    await conn.execute("""
+                        INSERT INTO migration_history (version, started_at)
+                        VALUES ($1, CURRENT_TIMESTAMP)
+                    """, version)
+                    
+                    try:
+                        # Run migration SQL
+                        await conn.execute(pending_migrations[version], version)
+                        
+                        # Update version
+                        await conn.execute("""
+                            UPDATE db_version SET version = $1, 
+                            updated_at = CURRENT_TIMESTAMP
+                        """, version)
+                        
+                        # Mark migration as completed
+                        await conn.execute("""
+                            UPDATE migration_history 
+                            SET completed_at = CURRENT_TIMESTAMP,
+                                success = true
+                            WHERE version = $1
+                        """, version)
+                        
+                        logger.info(f"Successfully migrated to version {version}")
+                        
+                    except Exception as e:
+                        # Log migration failure
+                        await conn.execute("""
+                            UPDATE migration_history 
+                            SET completed_at = CURRENT_TIMESTAMP,
+                                success = false,
+                                error = $2
+                            WHERE version = $1
+                        """, version, str(e))
+                        
+                        raise DatabaseError(
+                            f"Migration to version {version} failed: {str(e)}"
+                        )
+                        
+    except asyncpg.PostgresError as e:
+        raise DatabaseError(f"Database migration failed: {str(e)}")
+        
     except Exception as e:
-        logger.error(f"Failed to run migrations: {str(e)}")
-        return False
+        raise DatabaseError(f"Unexpected error during migration: {str(e)}")
 
 async def init_db():
     """Initialize database and run migrations"""
@@ -437,7 +715,7 @@ async def init_db():
         
         # Run migrations
         try:
-            await run_migrations()
+            await run_migrations(_pool)
             logger.info("Database migrations completed successfully")
         except Exception as e:
             logger.error(f"Failed to run migrations: {str(e)}")
@@ -451,281 +729,13 @@ async def init_db():
             logger.error(f"Error details: {e.__dict__}")
         raise
 
-async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
-    """Add a wallet to monitor
-    
-    Args:
-        user_id (str): Discord user ID
-        address (str): Wallet address to monitor
-        stake_address (str): Stake address
-        
-    Returns:
-        bool: Success status
-    """
-    logger.info(f"Adding wallet {address[:20]}... for user {user_id}")
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # First, ensure user exists
-            await conn.execute(
-                """
-                INSERT INTO wallets (user_id, address, stake_address, monitoring_since)
-                VALUES ($1, $2, $3, NOW())
-                ON CONFLICT (user_id, address) DO NOTHING
-                """,
-                user_id, address, stake_address
-            )
-            logger.debug(f"User {user_id} ensured in database")
-            
-            # Then add wallet
-            await conn.execute(
-                """
-                INSERT INTO notification_settings (user_id)
-                VALUES ($1)
-                ON CONFLICT (user_id) DO NOTHING
-                """,
-                user_id
-            )
-            logger.info(f"Wallet {address[:20]}... added successfully")
-            return True
-    except Exception as e:
-        logger.error(f"Failed to add wallet {address[:20]}... for user {user_id}: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        return False
-
-async def remove_wallet(user_id: str, address: str) -> bool:
-    """Remove a wallet from monitoring
-    
-    Args:
-        user_id (str): Discord user ID
-        address (str): Wallet address to remove
-        
-    Returns:
-        bool: Success status
-    """
-    logger.info(f"Removing wallet {address[:20]}... for user {user_id}")
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                DELETE FROM wallets
-                WHERE user_id = $1 AND address = $2
-                """,
-                user_id, address
-            )
-            success = result.split()[1] != '0'
-            if success:
-                logger.info(f"Wallet {address[:20]}... removed successfully")
-            else:
-                logger.warning(f"No wallet {address[:20]}... found for user {user_id}")
-            return success
-    except Exception as e:
-        logger.error(f"Failed to remove wallet {address[:20]}... for user {user_id}: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        return False
-
-async def get_wallet(user_id: str, address: str):
-    """Get a specific wallet
-    
-    Args:
-        user_id (str): Discord user ID
-        address (str): Wallet address
-        
-    Returns:
-        Record: Wallet record or None if not found
-    """
-    logger.debug(f"Fetching wallet {address[:20]}... for user {user_id}")
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            record = await conn.fetchrow(
-                """
-                SELECT * FROM wallets
-                WHERE user_id = $1 AND address = $2
-                """,
-                user_id, address
-            )
-            if record:
-                logger.debug(f"Found wallet {address[:20]}... for user {user_id}")
-            else:
-                logger.debug(f"No wallet {address[:20]}... found for user {user_id}")
-            return record
-    except Exception as e:
-        logger.error(f"Failed to fetch wallet {address[:20]}... for user {user_id}: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        return None
-
-async def get_all_wallets() -> List[asyncpg.Record]:
-    """Get all monitored wallets
-    
-    Returns:
-        List[asyncpg.Record]: List of wallet records
-    """
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug("Fetching all wallets")
-            return await conn.fetch("SELECT * FROM wallets")
-    except Exception as e:
-        logger.error(f"Error getting all wallets: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        return []
-
-async def get_all_wallets_for_user(user_id: str) -> List[str]:
-    """Get all wallets for a specific user
-    
-    Args:
-        user_id (str): Discord user ID
-        
-    Returns:
-        List[str]: List of wallet addresses
-    """
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching wallets for user {user_id}")
-            rows = await conn.fetch(
-                "SELECT address FROM wallets WHERE user_id = $1",
-                user_id
-            )
-            return [row['address'] for row in rows]
-    except Exception as e:
-        logger.error(f"Error getting user wallets: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        return []
-
-async def get_user_id_for_wallet(address: str):
-    """Get the user ID associated with a wallet
-    
-    Args:
-        address (str): Wallet address
-        
-    Returns:
-        str: Discord user ID or None if not found
-    """
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching user ID for wallet {address[:20]}...")
-            return await conn.fetchval(
-                "SELECT user_id FROM wallets WHERE address = $1",
-                address
-            )
-    except Exception as e:
-        logger.error(f"Error getting user ID: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        return None
-
-async def get_last_yummi_check(address: str) -> Optional[datetime]:
-    """Get the last time YUMMI requirement was checked
-    
-    Args:
-        address (str): Wallet address
-        
-    Returns:
-        Optional[datetime]: Last check time or None if never checked
-    """
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching last YUMMI check for wallet {address[:20]}...")
-            return await conn.fetchval(
-                "SELECT last_updated FROM wallets WHERE address = $1",
-                address
-            )
-    except Exception as e:
-        logger.error(f"Error getting last YUMMI check: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        return None
-
-async def update_last_yummi_check(address: str):
-    """Update the last YUMMI check time
-    
-    Args:
-        address (str): Wallet address
-    """
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Updating last YUMMI check for wallet {address[:20]}...")
-            await conn.execute(
-                """
-                UPDATE wallets 
-                SET last_updated = NOW()
-                WHERE address = $1
-                """,
-                address
-            )
-    except Exception as e:
-        logger.error(f"Error updating last YUMMI check: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-
-async def update_last_checked(wallet_id: int):
-    """Update the last checked timestamp
-    
-    Args:
-        wallet_id (int): Wallet ID to update
-    """
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Updating last checked for wallet ID {wallet_id}...")
-            query = """
-                UPDATE wallets 
-                SET last_updated = CURRENT_TIMESTAMP 
-                WHERE id = $1
-            """
-            await conn.execute(query, wallet_id)
-            return True
-    except Exception as e:
-        logger.error(f"Error updating last checked: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        return False
-
-async def get_wallet_id(user_id: str, address: str):
-    """Get wallet ID for a user's wallet
-    
-    Args:
-        user_id (str): Discord user ID
-        address (str): Wallet address
-        
-    Returns:
-        int: Wallet ID or None if not found
-    """
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching wallet ID for user {user_id} and address {address[:20]}...")
-            return await conn.fetchval(
-                """
-                SELECT id FROM wallets
-                WHERE user_id = $1 AND address = $2
-                """,
-                user_id, address
-            )
-    except Exception as e:
-        logger.error(f"Error getting wallet ID: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
-        return None
-
 async def add_transaction(wallet_id: int, tx_hash: str, metadata: dict = None) -> bool:
     """Add a transaction to the database with metadata
     
     Args:
-        wallet_id (int): Wallet ID
-        tx_hash (str): Transaction hash
-        metadata (dict, optional): Transaction metadata. Defaults to None.
+        wallet_id: Wallet ID
+        tx_hash: Transaction hash
+        metadata: Transaction metadata. Defaults to None.
         
     Returns:
         bool: Success status
@@ -771,8 +781,8 @@ async def get_transaction_metadata(wallet_id: int, tx_hash: str) -> Optional[dic
     """Get transaction metadata from the database
     
     Args:
-        wallet_id (int): Wallet ID
-        tx_hash (str): Transaction hash
+        wallet_id: Wallet ID
+        tx_hash: Transaction hash
         
     Returns:
         Optional[dict]: Transaction metadata or None if not found
@@ -798,7 +808,7 @@ async def get_notification_settings(user_id: str):
     """Get user's notification settings
     
     Args:
-        user_id (str): Discord user ID
+        user_id: Discord user ID
         
     Returns:
         dict: Dictionary of notification settings
@@ -835,29 +845,27 @@ async def update_notification_setting(user_id: str, setting: str, enabled: bool)
     """Update a specific notification setting
     
     Args:
-        user_id (str): Discord user ID
-        setting (str): Setting name
-        enabled (bool): Whether to enable or disable
+        user_id: Discord user ID
+        setting: Setting name
+        enabled: Whether to enable or disable
         
     Returns:
         bool: Success status
     """
+    if setting not in DB_CONFIG['ALLOWED_COLUMNS']['notification_settings']:
+        raise ValueError(f"Invalid notification setting: {setting}")
+        
+    query = f"""
+        UPDATE notification_settings 
+        SET {setting} = $1 
+        WHERE user_id = $2
+    """
+    
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Update specific setting
-            query = f"""
-                UPDATE notification_settings 
-                SET {setting} = $1
-                WHERE user_id = $2
-            """
-            logger.debug(f"Updating notification setting {setting} for user {user_id}...")
-            result = await conn.execute(query, enabled, user_id)
-            return result == "UPDATE 1"
+        await execute_query(query, enabled, user_id)
+        return True
     except Exception as e:
-        logger.error(f"Error updating notification setting: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        logger.error(f"Failed to update notification setting: {e}")
         return False
 
 async def should_notify(user_id: str, notification_type: str) -> bool:
@@ -881,37 +889,172 @@ async def get_recent_transactions(address: str, hours: int = 1) -> List[asyncpg.
     """Get transactions in the last N hours
     
     Args:
-        address (str): The wallet address
-        hours (int): Number of hours to look back
+        address: The wallet address
+        hours: Number of hours to look back
         
     Returns:
         List[asyncpg.Record]: List of transactions
     """
+    query = """
+        SELECT t.tx_hash, t.metadata, t.created_at
+        FROM transactions t
+        JOIN wallets w ON w.id = t.wallet_id
+        WHERE w.address = $1
+          AND t.created_at > NOW() - $2 * INTERVAL '1 hour'
+        ORDER BY t.created_at DESC
+        LIMIT 100
+    """
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            logger.debug(f"Fetching recent transactions for wallet {address[:20]}...")
-            return await conn.fetch(
-                """
-                SELECT t.* FROM transactions t
-                JOIN wallets w ON t.wallet_id = w.id
-                WHERE w.address = $1
-                AND t.created_at > NOW() - interval '$2 hours'
-                ORDER BY t.created_at DESC
-                """,
-                address, hours
-            )
-    except Exception as e:
-        logger.error(f"Error getting recent transactions: {str(e)}")
-        if hasattr(e, '__dict__'):
-            logger.error(f"Error details: {e.__dict__}")
+        return await fetch_all(query, address, hours)
+    except QueryError as e:
+        logger.error(f"Failed to get recent transactions: {str(e)}")
+        return []
+
+async def get_wallet_info(address: str) -> Dict[str, Any]:
+    """Get wallet information with a single optimized query
+    
+    Args:
+        address: Wallet address
+        
+    Returns:
+        Dict containing wallet info, stake address, and delegation status
+    """
+    query = """
+        SELECT w.address, w.stake_address, w.monitoring_since,
+               w.last_updated, w.ada_balance,
+               d.pool_id as delegation_pool,
+               json_build_object(
+                   'ada_transactions', ns.ada_transactions,
+                   'token_transfers', ns.token_transfers,
+                   'nft_updates', ns.nft_updates,
+                   'delegation_status', ns.delegation_status,
+                   'policy_updates', ns.policy_updates
+               ) as notification_settings
+        FROM wallets w
+        LEFT JOIN delegation_status d ON d.stake_address = w.stake_address
+        LEFT JOIN notification_settings ns ON ns.user_id = w.user_id
+        WHERE w.address = $1
+    """
+    try:
+        record = await fetch_one(query, address)
+        if record:
+            return dict(record)
+        return {}
+    except QueryError as e:
+        logger.error(f"Failed to get wallet info: {str(e)}")
+        return {}
+
+async def update_wallet_state(address: str, updates: Dict[str, Any]) -> bool:
+    """Update multiple wallet attributes in a single transaction
+    
+    Args:
+        address: Wallet address
+        updates: Dictionary of updates to apply
+            {
+                'ada_balance': int,
+                'token_balances': dict,
+                'utxo_state': dict,
+                'delegation_pool': str,
+                'last_checked': datetime
+            }
+        
+    Returns:
+        bool: Success status
+    """
+    queries = []
+    
+    if 'ada_balance' in updates:
+        queries.append((
+            "UPDATE wallets SET ada_balance = $1 WHERE address = $2",
+            (updates['ada_balance'], address)
+        ))
+        
+    if 'token_balances' in updates:
+        queries.append((
+            "UPDATE wallets SET token_balances = $1 WHERE address = $2",
+            (json.dumps(updates['token_balances']), address)
+        ))
+        
+    if 'utxo_state' in updates:
+        queries.append((
+            "UPDATE wallets SET utxo_state = $1 WHERE address = $2",
+            (json.dumps(updates['utxo_state']), address)
+        ))
+        
+    if 'delegation_pool' in updates:
+        queries.append((
+            """
+            INSERT INTO delegation_status (stake_address, pool_id)
+            SELECT stake_address, $1 FROM wallets WHERE address = $2
+            ON CONFLICT (stake_address) DO UPDATE SET pool_id = $1
+            """,
+            (updates['delegation_pool'], address)
+        ))
+        
+    if 'last_checked' in updates:
+        queries.append((
+            "UPDATE wallets SET last_updated = $1 WHERE address = $2",
+            (updates['last_checked'], address)
+        ))
+        
+    if not queries:
+        return True
+        
+    try:
+        await execute_transaction(queries)
+        return True
+    except QueryError as e:
+        logger.error(f"Failed to update wallet state: {str(e)}")
+        return False
+
+async def get_user_wallets(user_id: str) -> List[Dict[str, Any]]:
+    """Get all wallets for a user with optimized query
+    
+    Args:
+        user_id: Discord user ID
+        
+    Returns:
+        List of wallet records with all relevant information
+    """
+    query = """
+        SELECT 
+            w.address,
+            w.stake_address,
+            w.monitoring_since,
+            w.ada_balance,
+            w.token_balances,
+            d.pool_id as delegation_pool,
+            (
+                SELECT json_agg(json_build_object(
+                    'tx_hash', t.tx_hash,
+                    'created_at', t.created_at,
+                    'metadata', t.metadata
+                ))
+                FROM (
+                    SELECT tx_hash, created_at, metadata
+                    FROM transactions
+                    WHERE wallet_id = w.id
+                    ORDER BY created_at DESC
+                    LIMIT 10
+                ) t
+            ) as recent_transactions
+        FROM wallets w
+        LEFT JOIN delegation_status d ON d.stake_address = w.stake_address
+        WHERE w.user_id = $1
+        ORDER BY w.monitoring_since DESC
+    """
+    try:
+        records = await fetch_all(query, user_id)
+        return [dict(record) for record in records]
+    except QueryError as e:
+        logger.error(f"Failed to get user wallets: {str(e)}")
         return []
 
 async def check_ada_balance(address: str) -> tuple[bool, int]:
     """Check if ADA balance is below threshold
     
     Args:
-        address (str): The wallet address
+        address: The wallet address
         
     Returns:
         tuple[bool, int]: (is_below_threshold, current_balance_ada)
@@ -940,8 +1083,8 @@ async def update_ada_balance(address: str, balance: float) -> bool:
     """Update wallet's ADA balance
     
     Args:
-        address (str): Wallet address
-        balance (float): Current ADA balance
+        address: Wallet address
+        balance: Current ADA balance
         
     Returns:
         bool: Success status
@@ -969,8 +1112,8 @@ async def update_token_balances(address: str, token_balances: dict) -> bool:
     """Update wallet's token balances
     
     Args:
-        address (str): Wallet address
-        token_balances (dict): Dictionary of token_id -> amount
+        address: Wallet address
+        token_balances: Dictionary of token_id -> amount
         
     Returns:
         bool: Success status
@@ -1000,7 +1143,7 @@ async def get_wallet_balance(address: str) -> int:
     """Get wallet's current ADA balance
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         int: Current ADA balance in lovelace
@@ -1024,8 +1167,8 @@ async def update_utxo_state(address: str, utxo_state: dict):
     """Update the UTxO state for a wallet address
     
     Args:
-        address (str): Wallet address
-        utxo_state (dict): New UTxO state
+        address: Wallet address
+        utxo_state: New UTxO state
         
     Returns:
         bool: Success status
@@ -1053,7 +1196,7 @@ async def get_stake_address(address: str):
     """Get cached stake address for a wallet
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         Optional[str]: Stake address if cached, None otherwise
@@ -1074,8 +1217,8 @@ async def update_stake_address(address: str, stake_address: str):
     """Update stake address for a wallet
     
     Args:
-        address (str): Wallet address
-        stake_address (str): Stake address
+        address: Wallet address
+        stake_address: Stake address
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1093,8 +1236,8 @@ async def is_reward_processed(stake_address: str, epoch: int):
     """Check if a staking reward has been processed
     
     Args:
-        stake_address (str): Stake address
-        epoch (int): Epoch number
+        stake_address: Stake address
+        epoch: Epoch number
         
     Returns:
         bool: True if reward was processed
@@ -1122,9 +1265,9 @@ async def add_processed_reward(stake_address: str, epoch: int, amount: int):
     """Add a processed staking reward
     
     Args:
-        stake_address (str): Stake address
-        epoch (int): Epoch number
-        amount (int): Reward amount in lovelace
+        stake_address: Stake address
+        epoch: Epoch number
+        amount: Reward amount in lovelace
         
     Returns:
         bool: Success status
@@ -1152,7 +1295,7 @@ async def get_last_transactions(address: str) -> List[str]:
     """Retrieve the last set of processed transactions for a wallet
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         List[str]: List of transaction hashes
@@ -1193,7 +1336,7 @@ async def get_utxo_state(address: str) -> Optional[dict]:
     """Get the UTxO state for a wallet address
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         Optional[dict]: Dictionary containing UTxO state or None if not found
@@ -1221,8 +1364,8 @@ async def get_wallet_for_user(user_id: str, address: str) -> Optional[dict]:
     """Get wallet details for a specific user and address
     
     Args:
-        user_id (str): Discord user ID
-        address (str): Wallet address
+        user_id: Discord user ID
+        address: Wallet address
         
     Returns:
         Optional[dict]: Wallet record with all details or None if not found
@@ -1256,8 +1399,8 @@ async def is_token_change_processed(wallet_id: int, tx_hash: str) -> bool:
     """Check if a token change has been processed
     
     Args:
-        wallet_id (int): Wallet ID
-        tx_hash (str): Transaction hash
+        wallet_id: Wallet ID
+        tx_hash: Transaction hash
         
     Returns:
         bool: True if change was processed
@@ -1286,8 +1429,8 @@ async def add_processed_token_change(wallet_id: int, tx_hash: str) -> bool:
     """Add a processed token change
     
     Args:
-        wallet_id (int): Wallet ID
-        tx_hash (str): Transaction hash
+        wallet_id: Wallet ID
+        tx_hash: Transaction hash
         
     Returns:
         bool: Success status
@@ -1315,7 +1458,7 @@ async def get_new_tokens(address: str) -> List[str]:
     """Get new tokens added to a wallet
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         List[str]: List of new token IDs
@@ -1345,7 +1488,7 @@ async def get_removed_nfts(address: str) -> List[str]:
     """Get NFTs removed from a wallet
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         List[str]: List of removed NFT IDs
@@ -1375,7 +1518,7 @@ async def get_yummi_warning_count(wallet_id: int) -> int:
     """Get the number of YUMMI warnings for a wallet
     
     Args:
-        wallet_id (int): Wallet ID
+        wallet_id: Wallet ID
         
     Returns:
         int: Number of warnings (0 if no warnings)
@@ -1403,7 +1546,7 @@ async def increment_yummi_warning(wallet_id: int) -> int:
     """Increment the YUMMI warning count for a wallet
     
     Args:
-        wallet_id (int): Wallet ID
+        wallet_id: Wallet ID
         
     Returns:
         int: New warning count
@@ -1434,7 +1577,7 @@ async def reset_yummi_warning(wallet_id: int) -> bool:
     """Reset the YUMMI warning count for a wallet
     
     Args:
-        wallet_id (int): Wallet ID
+        wallet_id: Wallet ID
         
     Returns:
         bool: Success status
@@ -1461,7 +1604,7 @@ async def get_delegation_status(address: str):
     """Get the current delegation status for a wallet
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         str: Pool ID or None if not delegated
@@ -1489,8 +1632,8 @@ async def update_delegation_status(address: str, pool_id: str):
     """Update the delegation status for a wallet
     
     Args:
-        address (str): Wallet address
-        pool_id (str): Pool ID
+        address: Wallet address
+        pool_id: Pool ID
         
     Returns:
         bool: Success status
@@ -1520,7 +1663,7 @@ async def get_policy_expiry(policy_id: str):
     """Get the expiry time for a policy
     
     Args:
-        policy_id (str): Policy ID
+        policy_id: Policy ID
         
     Returns:
         int: Slot number when policy expires or None
@@ -1548,8 +1691,8 @@ async def update_policy_expiry(policy_id: str, expiry_slot: int):
     """Update or insert policy expiry information
     
     Args:
-        policy_id (str): Policy ID
-        expiry_slot (int): Slot number when policy expires
+        policy_id: Policy ID
+        expiry_slot: Slot number when policy expires
         
     Returns:
         bool: Success status
@@ -1579,7 +1722,7 @@ async def get_dapp_interactions(address: str) -> str:
     """Get the last processed DApp interaction for a wallet
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         str: Last processed tx hash or None
@@ -1609,8 +1752,8 @@ async def update_dapp_interaction(address: str, tx_hash: str) -> bool:
     """Update the last processed DApp interaction
     
     Args:
-        address (str): Wallet address
-        tx_hash (str): Transaction hash
+        address: Wallet address
+        tx_hash: Transaction hash
         
     Returns:
         bool: Success status
@@ -1639,7 +1782,7 @@ async def get_last_dapp_tx(address: str) -> Optional[str]:
     """Get the last processed DApp transaction for a wallet
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         Optional[str]: Transaction hash or None if not found
@@ -1667,8 +1810,8 @@ async def update_last_dapp_tx(address: str, tx_hash: str) -> bool:
     """Update the last processed DApp transaction for a wallet
     
     Args:
-        address (str): Wallet address
-        tx_hash (str): Transaction hash
+        address: Wallet address
+        tx_hash: Transaction hash
         
     Returns:
         bool: True if successful, False otherwise
@@ -1744,7 +1887,7 @@ async def initialize_notification_settings(user_id: str):
     """Initialize default notification settings for a new user
     
     Args:
-        user_id (str): Discord user ID
+        user_id: Discord user ID
     """
     try:
         pool = await get_pool()
@@ -1801,33 +1944,29 @@ async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
     """Get the user ID associated with a stake address
     
     Args:
-        stake_address (str): Stake address
+        stake_address: Stake address
         
     Returns:
         Optional[str]: Discord user ID or None if not found
     """
+    query = """
+        SELECT DISTINCT user_id 
+        FROM wallets 
+        WHERE stake_address = $1
+    """
+    
     try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                '''
-                SELECT DISTINCT user_id 
-                FROM wallets 
-                WHERE stake_address = $1
-                LIMIT 1
-                ''',
-                stake_address
-            )
-            return row['user_id'] if row else None
+        result = await fetch_one(query, stake_address)
+        return result['user_id'] if result else None
     except Exception as e:
-        logger.error(f"Error getting user ID for stake address: {str(e)}")
+        logger.error(f"Error getting user ID for stake address: {e}")
         return None
 
 async def get_last_policy_check(address: str):
     """Get the last time policy expiry was checked
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         Optional[datetime]: Last check time or None if never checked
@@ -1848,7 +1987,7 @@ async def update_last_policy_check(address: str):
     """Update the last policy check time
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1865,7 +2004,7 @@ async def get_monitoring_since(address: str) -> datetime:
     """Get when monitoring started for a wallet
     
     Args:
-        address (str): Wallet address
+        address: Wallet address
         
     Returns:
         datetime: When monitoring started
@@ -1881,29 +2020,27 @@ async def get_monitoring_since(address: str) -> datetime:
             address
         )
 
-async def get_all_monitored_addresses():
-    """Get all monitored addresses and stake addresses"""
-    try:
-        addresses = []
-        stake_addresses = []
+async def get_all_monitored_addresses(pool):
+    """Get all monitored addresses and stake addresses
+    
+    Args:
+        pool: Database connection pool
         
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                # Get all addresses and stake addresses
-                query = 'SELECT address, stake_address FROM wallets'
-                rows = await conn.fetch(query)
-                
-                for row in rows:
-                    addresses.append(row['address'])
-                    if row['stake_address']:
-                        stake_addresses.append(row['stake_address'])
-                        
-        return addresses, stake_addresses
+    Returns:
+        List[str]: List of monitored addresses
+    """
+    try:
+        query = """
+            SELECT DISTINCT address 
+            FROM wallets;
+        """
+        
+        result = await pool.fetch(query)
+        return [row['address'] for row in result] if result else []
         
     except Exception as e:
-        logger.error(f"Error getting monitored addresses: {str(e)}")
-        return [], []
+        logger.error(f"Error getting monitored addresses: {e}")
+        return []
 
 async def get_addresses_for_stake(stake_address: str) -> list[str]:
     """Get all addresses for a stake address"""
@@ -2027,9 +2164,9 @@ async def add_wallet_for_user(user_id: str, address: str, stake_address: str = N
     """Add a wallet to monitor
     
     Args:
-        user_id (str): Discord user ID
-        address (str): Wallet address to monitor
-        stake_address (str): Stake address
+        user_id: Discord user ID
+        address: Wallet address to monitor
+        stake_address: Stake address
         
     Returns:
         bool: Success status
@@ -2054,8 +2191,8 @@ async def remove_wallet_for_user(user_id: str, address: str):
     """Remove a wallet from monitoring
     
     Args:
-        user_id (str): Discord user ID
-        address (str): Wallet address to remove
+        user_id: Discord user ID
+        address: Wallet address to remove
         
     Returns:
         bool: Success status
@@ -2079,9 +2216,9 @@ async def update_notification_settings(user_id: str, setting: str, enabled: bool
     """Update a specific notification setting
     
     Args:
-        user_id (str): Discord user ID
-        setting (str): Setting name
-        enabled (bool): Whether to enable or disable
+        user_id: Discord user ID
+        setting: Setting name
+        enabled: Whether to enable or disable
         
     Returns:
         bool: Success status
@@ -2106,7 +2243,7 @@ async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
     """Get user ID associated with a stake address
     
     Args:
-        stake_address (str): Stake address to look up
+        stake_address: Stake address to look up
         
     Returns:
         Optional[str]: Discord user ID or None if not found
@@ -2156,42 +2293,14 @@ async def execute_many(query: str, args_list: list) -> None:
     """Execute a database query with multiple sets of parameters
     
     Args:
-        query (str): SQL query to execute
-        args_list (list): List of parameter sets
+        query: SQL query to execute
+        args_list: List of parameter sets
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.executemany(query, args_list)
             logger.debug(f"Executed batch query: {query}")
-
-async def fetch_all(query: str, *args) -> list:
-    """Fetch all rows from a database query
-    
-    Args:
-        query (str): SQL query to execute
-        *args: Query parameters
-        
-    Returns:
-        list: List of query results
-    """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetch(query, *args)
-
-async def fetch_one(query: str, *args) -> Optional[asyncpg.Record]:
-    """Fetch a single row from a database query
-    
-    Args:
-        query (str): SQL query to execute
-        *args: Query parameters
-        
-    Returns:
-        Optional[asyncpg.Record]: Query result or None if not found
-    """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetchrow(query, *args)
 
 async def main():
     """Example usage of database functions"""
