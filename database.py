@@ -2393,8 +2393,36 @@ def init_db_sync():
         asyncio.set_event_loop(loop)
         
         try:
-            loop.run_until_complete(init_db(database_url))
-            logger.info("Database initialized successfully")
+            # Create SSL context
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # Create pool
+            pool = loop.run_until_complete(
+                asyncpg.create_pool(
+                    database_url,
+                    min_size=5,
+                    max_size=20,
+                    command_timeout=60,
+                    ssl=ssl_context
+                )
+            )
+            
+            try:
+                # Get connection from pool
+                conn = loop.run_until_complete(pool.acquire())
+                try:
+                    # Initialize database with connection
+                    loop.run_until_complete(init_db(conn))
+                    logger.info("Database initialized successfully")
+                finally:
+                    # Always release the connection
+                    loop.run_until_complete(pool.release(conn))
+            finally:
+                # Always close the pool
+                loop.run_until_complete(pool.close())
+                
         finally:
             loop.close()
             
