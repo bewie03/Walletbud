@@ -141,15 +141,16 @@ CREATE TABLE IF NOT EXISTS wallets (
     user_id TEXT NOT NULL,
     address TEXT NOT NULL,
     stake_address TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    ada_balance BIGINT DEFAULT 0,
+    monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_policy_check TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(user_id, address)
 );
 
 -- Create notification_settings table
 CREATE TABLE IF NOT EXISTS notification_settings (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT UNIQUE NOT NULL,
+    user_id TEXT PRIMARY KEY,
     ada_transactions BOOLEAN DEFAULT TRUE,
     token_changes BOOLEAN DEFAULT TRUE,
     nft_updates BOOLEAN DEFAULT TRUE,
@@ -158,21 +159,38 @@ CREATE TABLE IF NOT EXISTS notification_settings (
     policy_expiry BOOLEAN DEFAULT TRUE,
     delegation_status BOOLEAN DEFAULT TRUE,
     dapp_interactions BOOLEAN DEFAULT TRUE,
-    failed_transactions BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    failed_transactions BOOLEAN DEFAULT TRUE
 );
 
 -- Create transactions table
 CREATE TABLE IF NOT EXISTS transactions (
-    id SERIAL PRIMARY KEY,
+    id SERIAL,
     wallet_id INTEGER REFERENCES wallets(id),
     tx_hash TEXT NOT NULL,
-    block_time TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(wallet_id, tx_hash)
-);
+    metadata JSONB,
+    archived BOOLEAN DEFAULT FALSE,
+    archived_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+) PARTITION BY RANGE (created_at);
+
+-- Create partitions for transactions
+DO $$
+BEGIN
+    FOR y IN 2025..2025 LOOP
+        FOR m IN 1..12 LOOP
+            EXECUTE format(
+                'CREATE TABLE IF NOT EXISTS transactions_%s_%s PARTITION OF transactions
+                FOR VALUES FROM (%L) TO (%L)',
+                y, LPAD(m::text, 2, '0'),
+                format('%s-%s-01 00:00:00+00', y, LPAD(m::text, 2, '0')),
+                format('%s-%s-01 00:00:00+00', 
+                    CASE WHEN m = 12 THEN y + 1 ELSE y END,
+                    CASE WHEN m = 12 THEN '01' ELSE LPAD((m + 1)::text, 2, '0') END
+                )
+            );
+        END LOOP;
+    END LOOP;
+END $$;
 
 -- Create failed_transactions table
 CREATE TABLE IF NOT EXISTS failed_transactions (
@@ -181,7 +199,6 @@ CREATE TABLE IF NOT EXISTS failed_transactions (
     tx_hash TEXT NOT NULL,
     error_message TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(wallet_id, tx_hash)
 );
 
@@ -192,8 +209,7 @@ CREATE TABLE IF NOT EXISTS asset_history (
     asset_id TEXT NOT NULL,
     policy_id TEXT NOT NULL,
     amount BIGINT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 """
 
@@ -297,16 +313,14 @@ async def create_indices(conn):
         "CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address)",
         "CREATE INDEX IF NOT EXISTS idx_wallets_stake_address ON wallets(stake_address)",
-        "CREATE INDEX IF NOT EXISTS idx_wallets_updated_at ON wallets(updated_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_wallets_last_updated ON wallets(last_updated DESC)",
         
         # Notification settings indices
         "CREATE INDEX IF NOT EXISTS idx_notification_settings_user_id ON notification_settings(user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_notification_settings_updated_at ON notification_settings(updated_at DESC)",
         
         # Transactions indices
         "CREATE INDEX IF NOT EXISTS idx_transactions_wallet_tx ON transactions(wallet_id, tx_hash)",
         "CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_transactions_block_time ON transactions(block_time DESC)",
         
         # Failed transactions indices
         "CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet ON failed_transactions(wallet_id)",
@@ -336,7 +350,7 @@ async def init_db():
                 logger.info("Creating migration tables...")
                 await conn.execute(CREATE_MIGRATION_TABLES)
                 
-                # Step 2: Create timestamp update function
+                # Step 2: Create timestamp function
                 logger.info("Creating timestamp update function...")
                 await conn.execute(CREATE_TIMESTAMP_FUNCTION)
                 
@@ -344,7 +358,7 @@ async def init_db():
                 logger.info("Creating database tables...")
                 await conn.execute(CREATE_TABLES_SQL)
                 
-                # Step 4: Create triggers for timestamp updates
+                # Step 4: Create triggers
                 logger.info("Creating timestamp update triggers...")
                 await conn.execute(CREATE_TRIGGERS_SQL)
                 
@@ -362,11 +376,7 @@ async def init_db():
                 if current_version < CURRENT_VERSION:
                     await migrate_database(conn)
                 
-                # Step 7: Create indices
-                logger.info("Creating database indices...")
-                await create_indices(conn)
-                
-                # Step 8: Initialize notification settings for existing users
+                # Step 7: Initialize notification settings for existing users
                 logger.info("Initializing notification settings...")
                 users = await conn.fetch(
                     "SELECT DISTINCT user_id FROM wallets WHERE user_id IS NOT NULL"
@@ -2322,21 +2332,24 @@ MIGRATIONS = {
     1: [
         # Step 1: Create base tables
         """
+        -- Create wallets table
         CREATE TABLE IF NOT EXISTS wallets (
             id SERIAL PRIMARY KEY,
             user_id TEXT NOT NULL,
             address TEXT NOT NULL,
             stake_address TEXT,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            ada_balance BIGINT DEFAULT 0,
+            monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            last_updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            last_policy_check TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
             UNIQUE(user_id, address)
         );
         """,
         
         """
+        -- Create notification_settings table
         CREATE TABLE IF NOT EXISTS notification_settings (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT UNIQUE NOT NULL,
+            user_id TEXT PRIMARY KEY,
             ada_transactions BOOLEAN DEFAULT TRUE,
             token_changes BOOLEAN DEFAULT TRUE,
             nft_updates BOOLEAN DEFAULT TRUE,
@@ -2345,144 +2358,94 @@ MIGRATIONS = {
             policy_expiry BOOLEAN DEFAULT TRUE,
             delegation_status BOOLEAN DEFAULT TRUE,
             dapp_interactions BOOLEAN DEFAULT TRUE,
-            failed_transactions BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            failed_transactions BOOLEAN DEFAULT TRUE
         );
         """,
         
         """
+        -- Create transactions table
         CREATE TABLE IF NOT EXISTS transactions (
-            id SERIAL PRIMARY KEY,
+            id SERIAL,
             wallet_id INTEGER REFERENCES wallets(id),
             tx_hash TEXT NOT NULL,
-            block_time TIMESTAMP WITH TIME ZONE,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            UNIQUE(wallet_id, tx_hash)
-        );
+            metadata JSONB,
+            archived BOOLEAN DEFAULT FALSE,
+            archived_at TIMESTAMP WITH TIME ZONE,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        ) PARTITION BY RANGE (created_at);
         """,
         
         """
+        -- Create partitions for transactions
+        DO $$
+        BEGIN
+            FOR y IN 2025..2025 LOOP
+                FOR m IN 1..12 LOOP
+                    EXECUTE format(
+                        'CREATE TABLE IF NOT EXISTS transactions_%s_%s PARTITION OF transactions
+                        FOR VALUES FROM (%L) TO (%L)',
+                        y, LPAD(m::text, 2, '0'),
+                        format('%s-%s-01 00:00:00+00', y, LPAD(m::text, 2, '0')),
+                        format('%s-%s-01 00:00:00+00', 
+                            CASE WHEN m = 12 THEN y + 1 ELSE y END,
+                            CASE WHEN m = 12 THEN '01' ELSE LPAD((m + 1)::text, 2, '0') END
+                        )
+                    );
+                END LOOP;
+            END LOOP;
+        END $$;
+        """,
+        
+        """
+        -- Create failed_transactions table
         CREATE TABLE IF NOT EXISTS failed_transactions (
             id SERIAL PRIMARY KEY,
             wallet_id INTEGER REFERENCES wallets(id),
             tx_hash TEXT NOT NULL,
             error_message TEXT,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
             UNIQUE(wallet_id, tx_hash)
         );
         """,
         
         """
+        -- Create asset_history table
         CREATE TABLE IF NOT EXISTS asset_history (
             id SERIAL PRIMARY KEY,
             wallet_id INTEGER REFERENCES wallets(id),
             asset_id TEXT NOT NULL,
             policy_id TEXT NOT NULL,
             amount BIGINT NOT NULL,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
         """,
         
-        # Step 2: Create timestamp function
-        """
-        CREATE OR REPLACE FUNCTION update_updated_at_column()
-        RETURNS TRIGGER AS $$
-        BEGIN
-            NEW.updated_at = CURRENT_TIMESTAMP;
-            RETURN NEW;
-        END;
-        $$ language 'plpgsql';
-        """,
-        
-        # Step 3: Create triggers
-        """
-        DO $$ 
-        BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_wallets_updated_at') THEN
-                CREATE TRIGGER update_wallets_updated_at 
-                    BEFORE UPDATE ON wallets 
-                    FOR EACH ROW 
-                    EXECUTE FUNCTION update_updated_at_column();
-            END IF;
-        END $$;
-        """,
-        
-        """
-        DO $$ 
-        BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_notification_settings_updated_at') THEN
-                CREATE TRIGGER update_notification_settings_updated_at 
-                    BEFORE UPDATE ON notification_settings 
-                    FOR EACH ROW 
-                    EXECUTE FUNCTION update_updated_at_column();
-            END IF;
-        END $$;
-        """,
-        
-        """
-        DO $$ 
-        BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_transactions_updated_at') THEN
-                CREATE TRIGGER update_transactions_updated_at 
-                    BEFORE UPDATE ON transactions 
-                    FOR EACH ROW 
-                    EXECUTE FUNCTION update_updated_at_column();
-            END IF;
-        END $$;
-        """,
-        
-        """
-        DO $$ 
-        BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_failed_transactions_updated_at') THEN
-                CREATE TRIGGER update_failed_transactions_updated_at 
-                    BEFORE UPDATE ON failed_transactions 
-                    FOR EACH ROW 
-                    EXECUTE FUNCTION update_updated_at_column();
-            END IF;
-        END $$;
-        """,
-        
-        """
-        DO $$ 
-        BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'update_asset_history_updated_at') THEN
-                CREATE TRIGGER update_asset_history_updated_at 
-                    BEFORE UPDATE ON asset_history 
-                    FOR EACH ROW 
-                    EXECUTE FUNCTION update_updated_at_column();
-            END IF;
-        END $$;
-        """,
-        
-        # Step 4: Create indices
+        # Step 2: Create indices for wallets
         """
         CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
         CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
         CREATE INDEX IF NOT EXISTS idx_wallets_stake_address ON wallets(stake_address);
-        CREATE INDEX IF NOT EXISTS idx_wallets_updated_at ON wallets(updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_wallets_last_updated ON wallets(last_updated DESC);
         """,
         
+        # Step 3: Create indices for notification_settings
         """
         CREATE INDEX IF NOT EXISTS idx_notification_settings_user_id ON notification_settings(user_id);
-        CREATE INDEX IF NOT EXISTS idx_notification_settings_updated_at ON notification_settings(updated_at DESC);
         """,
         
+        # Step 4: Create indices for transactions (on parent table)
         """
         CREATE INDEX IF NOT EXISTS idx_transactions_wallet_tx ON transactions(wallet_id, tx_hash);
         CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_transactions_block_time ON transactions(block_time DESC);
         """,
         
+        # Step 5: Create indices for failed_transactions
         """
         CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet ON failed_transactions(wallet_id);
         CREATE INDEX IF NOT EXISTS idx_failed_transactions_created ON failed_transactions(created_at DESC);
         """,
         
+        # Step 6: Create indices for asset_history
         """
         CREATE INDEX IF NOT EXISTS idx_asset_history_wallet ON asset_history(wallet_id);
         CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id);

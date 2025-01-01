@@ -153,3 +153,16 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Support
 
 For support, please open an issue on GitHub or contact the maintainers.
+
+## Database Management
+
+The application uses a PostgreSQL database with a robust migration system. Key features:
+
+- Automatic schema initialization and updates
+- Version-controlled migrations
+- Error handling and logging
+- Support for future schema changes
+
+To make database changes, add a new version to the migrations in `database.py`.
+
+The database initialization is now more robust and can handle future schema changes through the migration system. When you need to make database changes in the future, just add a new migration version to the MIGRATIONS dictionary.
