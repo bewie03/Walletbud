@@ -220,6 +220,24 @@ class WalletBudBot(commands.Bot):
         "NFT/Token Contract": ["721", "20", "nft", "token"]  # NFT and Token standards
     }
 
+    # Singleton instance for ClientSession
+    _blockfrost_session = None
+    _session_lock = asyncio.Lock()
+    
+    @classmethod
+    async def get_blockfrost_session(cls):
+        """Get or create the singleton ClientSession instance"""
+        async with cls._session_lock:
+            if cls._blockfrost_session is None or cls._blockfrost_session.closed:
+                connector = aiohttp.TCPConnector()
+                cls._blockfrost_session = aiohttp.ClientSession(
+                    connector=connector,
+                    headers={
+                        'project_id': 'mainnet0vqb8DAEyXDyGuUR1pA7W8VkgPbnhWAc'
+                    }
+                )
+            return cls._blockfrost_session
+
     def __init__(self, *args, **kwargs):
         """Initialize the bot with required intents"""
         intents = discord.Intents.default()
@@ -248,8 +266,6 @@ class WalletBudBot(commands.Bot):
         # Initialize components
         self.rate_limiter = RateLimiter(MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_COOLDOWN)
         self.db_maintenance = DatabaseMaintenance()
-        self.blockfrost_session = None
-        self.session = None
         self.connector = None
         
         # Initialize webhook components
@@ -312,6 +328,56 @@ class WalletBudBot(commands.Bot):
         # Task will be started in setup_hook
         self.health_lock = asyncio.Lock()
         
+        # Initialize locks
+        self._locks = {}
+        
+        # Setup signal handlers
+        self._setup_signal_handlers()
+
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown"""
+        import signal
+        
+        def handle_sigterm(*args):
+            """Handle SIGTERM by initiating cleanup"""
+            logger.info("Received SIGTERM signal")
+            asyncio.create_task(self.cleanup_and_exit())
+            
+        # Register SIGTERM handler
+        signal.signal(signal.SIGTERM, handle_sigterm)
+
+    async def cleanup_and_exit(self):
+        """Cleanup all resources and exit"""
+        try:
+            logger.info("Starting cleanup before exit...")
+            
+            # Cancel all tasks
+            await self._cancel_background_tasks()
+            
+            # Close all sessions
+            if self._blockfrost_session and not self._blockfrost_session.closed:
+                await self._blockfrost_session.close()
+            if self.session and not self.session.closed:
+                await self.session.close()
+            if self.connector and not self.connector.closed:
+                await self.connector.close()
+                
+            # Close database
+            if hasattr(self, 'pool') and self.pool:
+                await self.pool.close()
+                
+            # Call parent cleanup
+            await self.close()
+            
+            logger.info("Cleanup completed, exiting...")
+            
+            # Exit cleanly
+            sys.exit(0)
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            sys.exit(1)
+
     def register_cleanup_handlers(self):
         """Register all cleanup handlers for graceful shutdown"""
         # Database cleanup
@@ -379,15 +445,18 @@ class WalletBudBot(commands.Bot):
             
     async def _cleanup_session(self):
         """Cleanup HTTP session"""
-        if hasattr(self, 'session') and self.session:
-            try:
-                if not self.session.closed:
-                    await self.session.close()
-                self.session = None
+        try:
+            if self.session and not self.session.closed:
+                await self.session.close()
                 logger.info("HTTP session cleaned up")
-            except Exception as e:
-                logger.error(f"Error cleaning up HTTP session: {e}")
-
+        except Exception as e:
+            logger.error(f"Error cleaning up HTTP session: {e}")
+        finally:
+            self.session = None
+            if self.connector and not self.connector.closed:
+                await self.connector.close()
+                self.connector = None
+                
     async def _cleanup_tasks(self):
         """Cleanup background tasks"""
         try:
@@ -405,15 +474,15 @@ class WalletBudBot(commands.Bot):
             
     async def _cleanup_blockfrost(self):
         """Cleanup Blockfrost session"""
-        if hasattr(self, 'blockfrost_session') and self.blockfrost_session:
-            try:
-                if not self.blockfrost_session.closed:
-                    await self.blockfrost_session.close()
-                self.blockfrost_session = None
+        try:
+            if self._blockfrost_session and not self._blockfrost_session.closed:
+                await self._blockfrost_session.close()
                 logger.info("Blockfrost session cleaned up")
-            except Exception as e:
-                logger.error(f"Error cleaning up Blockfrost session: {e}")
-
+        except Exception as e:
+            logger.error(f"Error cleaning up Blockfrost session: {e}")
+        finally:
+            self._blockfrost_session = None
+            
     async def close(self):
         """Clean up resources and perform graceful shutdown"""
         logger.info("Starting graceful shutdown...")
@@ -445,8 +514,12 @@ class WalletBudBot(commands.Bot):
         try:
             logger.info("Running cleanup handler...")
             
-            # Ensure all sessions are closed
-            await self._cleanup_blockfrost()
+            # Close the singleton session if it exists
+            if self._blockfrost_session and not self._blockfrost_session.closed:
+                await self._blockfrost_session.close()
+                logger.info("Blockfrost session cleaned up")
+            
+            # Close other resources
             await self._cleanup_database()
             await self._cleanup_session()
             
@@ -798,9 +871,9 @@ class WalletBudBot(commands.Bot):
 
             # Check Blockfrost API
             try:
-                if self.blockfrost_session:
+                if self._blockfrost_session:
                     base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
-                    async with self.blockfrost_session.get(f'{base_url}/health') as response:
+                    async with self._blockfrost_session.get(f'{base_url}/health') as response:
                         if response.status == 200:
                             health = await response.json()
                             if health.get('is_healthy'):
@@ -948,31 +1021,13 @@ class WalletBudBot(commands.Bot):
 
     async def on_disconnect(self):
         """Called when the bot disconnects from Discord"""
-        logger.warning("Bot disconnected from Discord Gateway")
-        try:
-            # Log detailed connection info
-            logger.error("=== Connection Debug Info ===")
-            logger.error(f"Last sequence: {self.ws.sequence if hasattr(self, 'ws') else 'No websocket'}")
-            logger.error(f"Latency: {self.latency * 1000:.2f}ms")
-            logger.error(f"Is closed: {self.is_closed()}")
-            logger.error(f"Is ready: {self.is_ready()}")
-            logger.error(f"User: {self.user if hasattr(self, 'user') else 'No user'}")
-            
-            # Try to reconnect if not shutting down
-            if not self.is_closed():
-                logger.info("Attempting to reconnect...")
-                try:
-                    # Update presence to show reconnecting status
-                    activity = discord.Activity(
-                        type=discord.ActivityType.watching,
-                        name="Reconnecting..."
-                    )
-                    await self.change_presence(status=discord.Status.idle, activity=activity)
-                except Exception as e:
-                    logger.error(f"Failed to update presence: {e}")
+        logger.info("Bot disconnected from Discord")
+        await self._cleanup()
 
-        except Exception as e:
-            logger.error(f"Error in on_disconnect: {str(e)}", exc_info=True)
+    async def on_shutdown(self):
+        """Called when the bot is shutting down"""
+        logger.info("Bot is shutting down")
+        await self._cleanup()
 
     async def check_connections(self):
         """Check all connections and log their status"""
@@ -993,7 +1048,7 @@ class WalletBudBot(commands.Bot):
             # Check Blockfrost connection
             try:
                 base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
-                async with self.blockfrost_session.get(f'{base_url}/health') as response:
+                async with self._blockfrost_session.get(f'{base_url}/health') as response:
                     if response.status == 200:
                         health = await response.json()
                         if health.get('is_healthy'):
@@ -1083,23 +1138,18 @@ class WalletBudBot(commands.Bot):
             raise ValueError("BLOCKFROST_PROJECT_ID environment variable is not set")
             
         try:
-            # Create aiohttp session with proper headers
-            self.blockfrost_session = aiohttp.ClientSession(
-                headers={
-                    'project_id': 'mainnet0vqb8DAEyXDyGuUR1pA7W8VkgPbnhWAc'
-                }
-            )
-            
+            # Get or create the singleton session
+            session = await self.get_blockfrost_session()
             base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
             
             # Test connection by checking root endpoint first
-            async with self.blockfrost_session.get(f'{base_url}/') as response:
+            async with session.get(f'{base_url}/') as response:
                 if response.status == 200:
                     root = await response.json()
                     logger.info("Blockfrost root endpoint accessible")
                     
                     # Now check health endpoint
-                    async with self.blockfrost_session.get(f'{base_url}/health') as health_response:
+                    async with session.get(f'{base_url}/health') as health_response:
                         if health_response.status == 200:
                             health = await health_response.json()
                             if health.get('is_healthy'):
@@ -1120,9 +1170,6 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Failed to initialize Blockfrost client: {e}")
             if self.admin_channel:
                 await self.admin_channel.send(f"Error: Failed to initialize Blockfrost client: {e}")
-            if hasattr(self, 'blockfrost_session') and self.blockfrost_session:
-                await self.blockfrost_session.close()
-            self.blockfrost_session = None
             raise
 
     async def blockfrost_request(
@@ -1144,12 +1191,12 @@ class WalletBudBot(commands.Bot):
         Raises:
             Exception: If API request fails
         """
-        if not hasattr(self, 'blockfrost_session') or not self.blockfrost_session:
+        if not hasattr(self, '_blockfrost_session') or not self._blockfrost_session:
             raise Exception("Blockfrost session not initialized")
             
         try:
             base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
-            async with self.blockfrost_session.request(method, f'{base_url}{endpoint}', **kwargs) as response:
+            async with self._blockfrost_session.request(method, f'{base_url}{endpoint}', **kwargs) as response:
                 if response.status == 200:
                     result = await response.json()
                     
@@ -1580,7 +1627,7 @@ class WalletBudBot(commands.Bot):
         try:
             # Get current balance
             base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
-            async with self.blockfrost_session.get(f'{base_url}/addresses/{address}/assets') as response:
+            async with self._blockfrost_session.get(f'{base_url}/addresses/{address}/assets') as response:
                 if response.status == 200:
                     current_balance = await response.json()
                 else:
@@ -1641,8 +1688,10 @@ class WalletBudBot(commands.Bot):
 
     async def fetch_wallet_assets(self, address: str) -> List[Dict]:
         """Fetch assets for a single wallet address"""
+        session = await self.get_blockfrost_session()
         base_url = 'https://cardano-mainnet.blockfrost.io/api/v0'
-        async with self.blockfrost_session.get(f'{base_url}/addresses/{address}/assets') as response:
+        
+        async with session.get(f'{base_url}/addresses/{address}/assets') as response:
             if response.status == 200:
                 return await response.json()
             else:
