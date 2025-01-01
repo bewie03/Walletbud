@@ -309,6 +309,7 @@ class WalletBudBot(commands.Bot):
         
         # Initialize health check task
         self.health_check_task = tasks.loop(minutes=5)(self.monitor_health)
+        self.health_check_task.start()
         self.health_lock = asyncio.Lock()
         
     def register_cleanup_handlers(self):
@@ -456,12 +457,6 @@ class WalletBudBot(commands.Bot):
             
             # Start webhook processor
             self._webhook_processor = asyncio.create_task(self._process_webhook_queue())
-            
-            # Start health check task
-            self.health_check_task.start()
-            
-            # Start YUMMI balance check task
-            self.check_yummi_balances.start()
             
             # Log successful setup
             logger.info("Bot setup completed successfully")
@@ -1625,7 +1620,6 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error checking balance for {address}: {e}")
             raise
 
-    @tasks.loop(minutes=5)
     async def monitor_health(self):
         """Monitor bot health and update metrics"""
         try:
