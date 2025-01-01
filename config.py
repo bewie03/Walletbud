@@ -286,8 +286,8 @@ def validate_token_name(value: str, name: str) -> str:
 
 def validate_hex(value: str, length: int, name: str) -> str:
     """Validate hexadecimal string of specific length"""
-    if not value or not re.fullmatch(rf"(?i)[a-f0-9]{{{length}}}", value):
-        raise ValueError(f"{name} must be a {length}-character hexadecimal string, got: {value}")
+    if not re.match(f'^[0-9a-fA-F]{{{length}}}$', value):
+        raise ValueError(f"{name} must be a {length}-character hexadecimal string")
     return value.lower()
 
 @dataclass
@@ -348,6 +348,13 @@ ENV_VARS = {
         description="Webhook verification secret",
         required=False,
         default="default_webhook_secret",
+        sensitive=True
+    ),
+    'APPLICATION_ID': EnvVar(
+        name='APPLICATION_ID',
+        description="Discord application ID for the bot",
+        required=True,
+        validator=lambda x, _: str(int(x)),  # Ensure it's a valid integer
         sensitive=True
     ),
     'ADMIN_CHANNEL_ID': EnvVar(
@@ -568,6 +575,7 @@ ENV_VARS = {
 
 # Export configuration variables
 DISCORD_TOKEN = ENV_VARS['DISCORD_TOKEN'].get_value()
+APPLICATION_ID = ENV_VARS['APPLICATION_ID'].get_value()
 ADMIN_CHANNEL_ID = ENV_VARS['ADMIN_CHANNEL_ID'].get_value()
 BLOCKFROST_PROJECT_ID = ENV_VARS['BLOCKFROST_PROJECT_ID'].get_value()
 BLOCKFROST_BASE_URL = ENV_VARS['BLOCKFROST_BASE_URL'].get_value()
