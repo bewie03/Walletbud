@@ -1085,17 +1085,24 @@ class WalletBudBot(commands.Bot):
                 base_url='https://cardano-mainnet.blockfrost.io/api/v0'
             )
             
-            # Test connection by checking network health
-            health = await self.blockfrost.health()
-            if health.get('is_healthy'):
-                logger.info("Blockfrost client initialized successfully")
-                if self.admin_channel:
-                    await self.admin_channel.send("Blockfrost API connection established")
+            # Test connection by checking root endpoint first
+            root = await self.blockfrost.root()
+            if root:
+                logger.info("Blockfrost root endpoint accessible")
                 
-                # Update health metrics
-                self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
+                # Now check health endpoint
+                health = await self.blockfrost.health()
+                if health.get('is_healthy'):
+                    logger.info("Blockfrost client initialized successfully")
+                    if self.admin_channel:
+                        await self.admin_channel.send("Blockfrost API connection established")
+                    
+                    # Update health metrics
+                    self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
+                else:
+                    raise Exception(f"Blockfrost API is not healthy: {health}")
             else:
-                raise Exception(f"Blockfrost API is not healthy: {health}")
+                raise Exception("Could not access Blockfrost root endpoint")
             
         except Exception as e:
             logger.error(f"Failed to initialize Blockfrost client: {e}")
