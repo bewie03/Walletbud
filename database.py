@@ -43,31 +43,25 @@ _pool_lock = asyncio.Lock()
 _pool = None
 
 async def get_pool():
-    """Get database connection pool with proper SSL configuration"""
+    """Get database connection pool with Heroku PostgreSQL SSL configuration"""
     global _pool
     try:
         if not _pool:
-            ssl_context = ssl.create_default_context(cafile=os.getenv('SSL_CERT_FILE', '/etc/ssl/certs/ca-certificates.crt'))
-            ssl_context.verify_mode = ssl.CERT_REQUIRED
-            
             # Parse DATABASE_URL
             db_url = os.getenv('DATABASE_URL')
             if not db_url:
                 raise ValueError("DATABASE_URL environment variable not set")
             
-            # Add SSL mode to connection string if not present
-            if 'sslmode=' not in db_url.lower():
-                db_url += '?sslmode=verify-full'
-            
+            # For Heroku PostgreSQL, we use their SSL configuration
             _pool = await asyncpg.create_pool(
                 db_url,
                 min_size=1,
                 max_size=10,
-                ssl=ssl_context,
+                ssl='require',  # This tells PostgreSQL to use SSL without verification
                 command_timeout=60,
                 server_settings={'application_name': 'WalletBud'}
             )
-            logger.info("Database pool created successfully")
+            logger.info("Database pool created successfully with SSL")
         return _pool
     except Exception as e:
         logger.error(f"Failed to create database pool: {str(e)}")
@@ -2271,12 +2265,7 @@ def init_db_sync():
     """Synchronous version of init_db for Heroku release phase"""
     import asyncio
     
-    # Configure SSL for the event loop
-    import ssl
-    ssl_context = ssl.create_default_context(cafile=os.getenv('SSL_CERT_FILE', '/etc/ssl/certs/ca-certificates.crt'))
-    ssl_context.verify_mode = ssl.CERT_REQUIRED
-    
-    # Create new event loop with SSL configuration
+    # Create new event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
