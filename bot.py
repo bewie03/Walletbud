@@ -10,6 +10,7 @@ import certifi
 import discord
 import aiohttp
 from aiohttp import web
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Callable, Coroutine
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -1623,6 +1624,34 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error checking balance for {address}: {e}")
             raise
+
+    @tasks.loop(minutes=5)
+    async def monitor_health(self):
+        """Monitor bot health and update metrics"""
+        try:
+            async with self.health_lock:
+                # Update start time if not set
+                if not self.health_metrics['start_time']:
+                    self.health_metrics['start_time'] = datetime.now()
+                
+                # Check connections
+                await self.check_connections()
+                
+                # Clean up any expired cooldowns
+                await self._cleanup_cooldowns()
+                
+                # Update metrics
+                self.update_health_metrics('last_health_check', datetime.now())
+                
+                logger.debug("Health check completed successfully")
+                
+        except Exception as e:
+            logger.error(f"Error in health monitor: {e}")
+            self.health_metrics['errors'].append({
+                'time': datetime.now(),
+                'error': str(e),
+                'type': 'health_monitor'
+            })
 
 if __name__ == "__main__":
     try:
