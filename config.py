@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 from ipaddress import ip_network
 import json
+from dotenv import load_dotenv
 
 # Environment and logging configuration
 ENV = os.getenv('ENV', 'development')
