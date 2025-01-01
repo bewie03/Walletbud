@@ -357,55 +357,56 @@ ENV_VARS = {
     ),
     'MAX_REQUESTS_PER_SECOND': EnvVar(
         name='MAX_REQUESTS_PER_SECOND',
-        description="Maximum number of requests allowed per second",
+        description="Maximum API requests per second",
         default="10",
         validator=validate_positive_int,
         required=False
     ),
     'BURST_LIMIT': EnvVar(
         name='BURST_LIMIT',
-        default="50",
+        description="Maximum burst requests allowed",
+        default="20",
         validator=validate_positive_int,
         required=False
     ),
     'RATE_LIMIT_COOLDOWN': EnvVar(
         name='RATE_LIMIT_COOLDOWN',
-        description="Rate Limit Cooldown",
+        description="Rate limit cooldown in seconds",
         default="60",
         validator=validate_positive_int,
         required=False
     ),
     'RATE_LIMIT_WINDOW': EnvVar(
         name='RATE_LIMIT_WINDOW',
-        description="Rate Limit Window",
+        description="Rate limit window in seconds",
         default="60",
         validator=validate_positive_int,
         required=False
     ),
     'RATE_LIMIT_MAX_REQUESTS': EnvVar(
         name='RATE_LIMIT_MAX_REQUESTS',
-        description="Rate Limit Max Requests",
+        description="Maximum requests per rate limit window",
         default="100",
         validator=validate_positive_int,
         required=False
     ),
     'MAX_QUEUE_SIZE': EnvVar(
         name='MAX_QUEUE_SIZE',
-        description="Max Queue Size",
+        description="Maximum webhook queue size",
         default="1000",
         validator=validate_positive_int,
         required=False
     ),
     'MAX_RETRIES': EnvVar(
         name='MAX_RETRIES',
-        description="Max Retries",
+        description="Maximum number of retries for failed operations",
         default="3",
         validator=validate_positive_int,
         required=False
     ),
     'MAX_EVENT_AGE': EnvVar(
         name='MAX_EVENT_AGE',
-        description="Max Event Age",
+        description="Maximum event age in seconds",
         default="3600",
         validator=validate_positive_int,
         required=False
@@ -571,6 +572,11 @@ ADMIN_CHANNEL_ID = ENV_VARS['ADMIN_CHANNEL_ID'].get_value()
 BLOCKFROST_PROJECT_ID = ENV_VARS['BLOCKFROST_PROJECT_ID'].get_value()
 BLOCKFROST_BASE_URL = ENV_VARS['BLOCKFROST_BASE_URL'].get_value()
 WEBHOOK_SECRET = ENV_VARS['WEBHOOK_SECRET'].get_value()
+
+# Rate limiting configuration
+MAX_REQUESTS_PER_SECOND = ENV_VARS['MAX_REQUESTS_PER_SECOND'].get_value()
+BURST_LIMIT = ENV_VARS['BURST_LIMIT'].get_value()
+RATE_LIMIT_COOLDOWN = ENV_VARS['RATE_LIMIT_COOLDOWN'].get_value()
 
 # Rate limiting and queue configuration
 RATE_LIMIT_WINDOW = ENV_VARS['RATE_LIMIT_WINDOW'].get_value()
