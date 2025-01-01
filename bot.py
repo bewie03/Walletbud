@@ -35,33 +35,82 @@ from urllib3.exceptions import InsecureRequestWarning
 
 # Local imports
 from database import (
+    # Core database functions
     get_pool,
-    add_wallet_for_user,
-    remove_wallet_for_user,
-    get_user_id_for_stake_address,
-    get_user_wallets,
-    get_notification_settings,
-    update_notification_setting,
-    initialize_notification_settings,
-    get_wallet_for_user,
     init_db,
-    get_all_monitored_addresses,
-    get_addresses_for_stake,
-    update_pool_for_stake,
     get_database_url,
+    execute_with_retry,
+    fetch_all,
+    fetch_one,
+    execute_query,
+    execute_many,
+    
+    # Wallet management
+    validate_address,
+    add_wallet,
+    get_wallet_for_user,
+    get_user_wallets,
     get_wallet_info,
     get_wallet_balance,
     update_ada_balance,
-    should_notify,
-    update_notification_settings,
-    get_wallet_addresses,
+    update_wallet_state,
+    check_ada_balance,
+    update_token_balances,
+    
+    # Stake address management
+    get_stake_address,
+    update_stake_address,
     get_stake_address_for_user,
     get_user_stake_addresses,
-    get_stake_address_info,
+    get_user_id_for_stake_address,
+    get_addresses_for_stake,
+    
+    # Pool management
     get_pool_info,
-    update_stake_address,
+    update_pool_for_stake,
     update_stake_pool,
-    update_wallet_info
+    get_delegation_status,
+    update_delegation_status,
+    
+    # Transaction management
+    add_transaction,
+    get_transaction_metadata,
+    add_failed_transaction,
+    add_asset_history,
+    get_last_transactions,
+    get_last_dapp_tx,
+    update_last_dapp_tx,
+    get_dapp_interactions,
+    update_dapp_interaction,
+    is_token_change_processed,
+    add_processed_token_change,
+    
+    # Policy management
+    get_policy_expiry,
+    update_policy_expiry,
+    get_last_policy_check,
+    update_last_policy_check,
+    
+    # Monitoring
+    get_monitoring_since,
+    get_all_monitored_addresses,
+    get_new_tokens,
+    get_removed_nfts,
+    get_yummi_warning_count,
+    increment_yummi_warning,
+    reset_yummi_warning,
+    
+    # Notification settings
+    get_notification_settings,
+    update_notification_setting,
+    initialize_notification_settings,
+    should_notify,
+    update_notification_settings,
+    
+    # Database errors
+    DatabaseError,
+    ConnectionError,
+    QueryError
 )
 from database_maintenance import DatabaseMaintenance
 from utils import (
