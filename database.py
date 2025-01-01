@@ -47,27 +47,28 @@ _error_threshold = timedelta(minutes=5)  # Time window for error counting
 _error_count = 0
 _max_errors = 3  # Max errors before forcing pool recreation
 
+def should_recreate_pool(current_time):
+    """Determine if pool should be recreated based on age and errors"""
+    pool_age = (current_time - _pool_creation_time) if _pool_creation_time else timedelta.max
+    error_window = (current_time - _last_error_time) if _last_error_time else timedelta.max
+    
+    return (
+        not _pool or  # No pool exists
+        pool_age > _pool_max_age or  # Pool is too old
+        (_error_count >= _max_errors and error_window < _error_threshold) or  # Too many recent errors
+        (_error_count > 0 and error_window < timedelta(seconds=30))  # Any error in last 30s
+    )
+
 async def get_pool():
-    """Get database connection pool with Heroku PostgreSQL SSL configuration"""
+    """Get database connection pool with proper Heroku PostgreSQL SSL configuration"""
     global _pool, _pool_creation_time, _last_error_time, _error_count
 
     async with _pool_lock:
         try:
-            # Check if pool needs recreation
             current_time = datetime.now()
             
-            # Calculate pool age and error conditions
-            pool_age = (current_time - _pool_creation_time) if _pool_creation_time else timedelta.max
-            error_window = (current_time - _last_error_time) if _last_error_time else timedelta.max
-            
-            should_recreate = (
-                not _pool or  # No pool exists
-                pool_age > _pool_max_age or  # Pool is too old
-                (_error_count >= _max_errors and error_window < _error_threshold)  # Too many recent errors
-            )
-            
-            if should_recreate:
-                logger.info("Recreating database connection pool")
+            if should_recreate_pool(current_time):
+                logger.info("Creating/recreating database connection pool")
                 
                 # Clean up old pool if it exists
                 if _pool:
@@ -76,20 +77,15 @@ async def get_pool():
                     except Exception as e:
                         logger.warning(f"Error closing old pool: {e}")
                 
-                # Create new pool
+                # Create SSL context for Heroku
                 ssl_context = ssl.create_default_context(cafile=certifi.where())
                 ssl_context.check_hostname = False
                 ssl_context.verify_mode = ssl.CERT_NONE
                 
-                db_url = os.getenv('DATABASE_URL')
-                if not db_url:
-                    raise ValueError("DATABASE_URL environment variable not set")
+                # Get database URL with proper configuration
+                db_url = get_database_url()
                 
-                # Convert postgres:// to postgresql:// if needed
-                if db_url.startswith('postgres://'):
-                    db_url = 'postgresql://' + db_url[len('postgres://'):]
-                
-                # Create new pool with proper configuration
+                # Create new pool with proper Heroku configuration
                 _pool = await asyncpg.create_pool(
                     db_url,
                     min_size=DB_CONFIG['MIN_POOL_SIZE'],
@@ -100,7 +96,8 @@ async def get_pool():
                     server_settings={
                         'application_name': 'walletbud',
                         'statement_timeout': str(DB_CONFIG['TRANSACTION_TIMEOUT'] * 1000),
-                        'idle_in_transaction_session_timeout': '300000'  # 5 minutes
+                        'idle_in_transaction_session_timeout': '300000',  # 5 minutes
+                        'client_encoding': 'UTF8'
                     }
                 )
                 
@@ -113,48 +110,66 @@ async def get_pool():
                 _last_error_time = None
                 
                 logger.info("Successfully created new database connection pool")
-            
-            # Test pool with a simple query
-            try:
+                
+                # Test pool with a simple query
                 async with _pool.acquire() as conn:
                     await conn.fetchval('SELECT 1')
-            except Exception as e:
-                # Track error
-                _error_count += 1
-                _last_error_time = current_time
-                logger.error(f"Pool test query failed: {str(e)}")
-                raise
+                    logger.info("Database connection test successful")
             
             return _pool
             
         except Exception as e:
+            _error_count += 1
+            _last_error_time = current_time
+            
             logger.error(f"Error in get_pool: {str(e)}")
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
-            raise
+                
+            # Check if this is a connection error
+            if isinstance(e, (asyncpg.exceptions.PostgresConnectionError, 
+                            asyncpg.exceptions.TLSError,
+                            asyncpg.exceptions.InterfaceError)):
+                raise ConnectionError(f"Database connection error: {str(e)}")
+            
+            raise DatabaseError(f"Database error: {str(e)}")
+
+def get_database_url():
+    """Get and validate database URL with proper Heroku postgres:// to postgresql:// conversion"""
+    url = os.getenv('DATABASE_URL')
+    if not url:
+        raise ConnectionError("DATABASE_URL environment variable not set")
+        
+    # Convert postgres:// to postgresql:// for Heroku
+    if url.startswith('postgres://'):
+        url = url.replace('postgres://', 'postgresql://', 1)
+        
+    # Add SSL mode if not specified
+    if 'sslmode=' not in url.lower():
+        url += '?sslmode=require'
+    
+    # Add SSL cert verification if not specified
+    if 'sslcert=' not in url.lower():
+        url += '&sslcert=' + certifi.where()
+        
+    return url
 
 async def reset_pool():
     """Reset the connection pool with proper cleanup"""
-    global _pool, _pool_creation_time, _error_count, _last_error_time
+    global _pool, _pool_creation_time, _last_error_time, _error_count
     
-    try:
-        async with _pool_lock:
-            if _pool:
-                try:
-                    await _pool.close()
-                except Exception as e:
-                    logger.warning(f"Error closing pool during reset: {e}")
-                
-            _pool = None
-            _pool_creation_time = None
-            _error_count = 0
-            _last_error_time = None
-            
-            logger.info("Database connection pool reset successfully")
-            
-    except Exception as e:
-        logger.error(f"Error resetting pool: {str(e)}")
-        raise
+    async with _pool_lock:
+        if _pool:
+            try:
+                await _pool.close()
+            except Exception as e:
+                logger.warning(f"Error closing pool: {e}")
+        
+        _pool = None
+        _pool_creation_time = None
+        _error_count = 0
+        _last_error_time = None
+        logger.info("Database connection pool reset")
 
 # Enhanced retry logic with exponential backoff
 RETRY_DELAYS = [1, 2, 5, 10, 30]  # Exponential backoff delays
@@ -198,18 +213,6 @@ async def execute_with_retry(func, *args, retries=None):
             
     raise QueryError(f"Database operation failed after {retries} attempts: {str(last_error)}")
 
-def get_database_url() -> str:
-    """Get and validate database URL with proper Heroku postgres:// to postgresql:// conversion"""
-    url = os.getenv('DATABASE_URL')
-    if not url:
-        raise ConnectionError("DATABASE_URL environment variable not set")
-    
-    # Heroku provides postgres://, but asyncpg requires postgresql://
-    if url.startswith('postgres://'):
-        url = url.replace('postgres://', 'postgresql://', 1)
-    
-    return url
-
 async def fetch_all(query: str, *args, retries=None) -> List[asyncpg.Record]:
     """Fetch all rows with retry logic and proper error handling"""
     async def _fetch(conn, *args):
@@ -250,23 +253,183 @@ class QueryError(DatabaseError):
     """Database query error"""
     pass
 
-async def init_db() -> bool:
-    """Initialize database and run migrations
-    
-    Returns:
-        bool: True if successful
-        
-    Raises:
-        DatabaseError: If initialization fails
+# Database initialization SQL - Split into initial schema and migrations
+INIT_SQL = """
+-- Create version tracking tables first
+CREATE TABLE IF NOT EXISTS migration_history (
+    id SERIAL PRIMARY KEY,
+    version INTEGER NOT NULL,
+    applied_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    success BOOLEAN DEFAULT TRUE,
+    error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS db_version (
+    id SERIAL PRIMARY KEY,
+    version INTEGER NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create core tables
+CREATE TABLE IF NOT EXISTS wallets (
+    id SERIAL PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    address TEXT UNIQUE NOT NULL,
+    stake_address TEXT,
+    monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_checked TIMESTAMP WITH TIME ZONE,
+    last_policy_check TIMESTAMP WITH TIME ZONE,
+    ada_balance BIGINT DEFAULT 0,
+    token_balances JSONB DEFAULT '{}'::jsonb,
+    utxo_state JSONB DEFAULT '{}'::jsonb,
+    delegation_pool TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
+CREATE INDEX IF NOT EXISTS idx_wallets_address ON wallets(address);
+CREATE INDEX IF NOT EXISTS idx_wallets_stake_address ON wallets(stake_address);
+"""
+
+# Current database version
+CURRENT_VERSION = 1
+
+# Database migrations
+MIGRATIONS = {
+    1: """
+    -- Add any missing indices
+    DO $$ BEGIN
+        -- Add monitoring_since index if it doesn't exist
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_monitoring_since') THEN
+            CREATE INDEX idx_wallets_monitoring_since ON wallets(monitoring_since);
+        END IF;
+
+        -- Add last_policy_check index if it doesn't exist
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_last_policy_check') THEN
+            CREATE INDEX idx_wallets_last_policy_check ON wallets(last_policy_check);
+        END IF;
+
+        -- Add delegation_pool index if it doesn't exist
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_delegation_pool') THEN
+            CREATE INDEX idx_wallets_delegation_pool ON wallets(delegation_pool);
+        END IF;
+    END $$;
     """
+}
+
+async def get_db_version(conn) -> int:
+    """Get current database version"""
+    try:
+        # Check if version table exists
+        version_exists = await conn.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'db_version'
+            )
+            """
+        )
+        
+        if not version_exists:
+            return 0
+            
+        result = await conn.fetchrow(
+            "SELECT version FROM db_version ORDER BY id DESC LIMIT 1"
+        )
+        return result['version'] if result else 0
+    except Exception as e:
+        logger.error(f"Error getting database version: {e}")
+        return 0
+
+async def run_migration(conn, version: int, sql: str) -> bool:
+    """Run a single migration with proper error handling"""
+    try:
+        async with conn.transaction():
+            # Run the migration
+            await conn.execute(sql)
+            
+            # Record successful migration
+            await conn.execute(
+                """
+                INSERT INTO migration_history (version, applied_at, success)
+                VALUES ($1, NOW(), TRUE)
+                """,
+                version
+            )
+            
+            # Update db version
+            await conn.execute(
+                """
+                INSERT INTO db_version (version, updated_at)
+                VALUES ($1, NOW())
+                """,
+                version
+            )
+            
+            logger.info(f"Successfully applied migration {version}")
+            return True
+            
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Error applying migration {version}: {error_msg}")
+        
+        # Record failed migration
+        try:
+            await conn.execute(
+                """
+                INSERT INTO migration_history (version, applied_at, success, error)
+                VALUES ($1, NOW(), FALSE, $2)
+                """,
+                version, error_msg
+            )
+        except Exception as inner_e:
+            logger.error(f"Error recording migration failure: {inner_e}")
+            
+        return False
+
+async def migrate_database(conn) -> bool:
+    """Run all pending migrations with proper error handling"""
+    try:
+        # Get current version
+        current_version = await get_db_version(conn)
+        logger.info(f"Current database version: {current_version}")
+        
+        # Apply pending migrations
+        for version in range(current_version + 1, CURRENT_VERSION + 1):
+            if version in MIGRATIONS:
+                logger.info(f"Applying migration {version}...")
+                
+                # Validate migration
+                if not await validate_migration(conn, version, MIGRATIONS[version]):
+                    error_msg = f"Migration {version} failed validation"
+                    logger.error(error_msg)
+                    raise DatabaseError(error_msg)
+                
+                # Run migration
+                if not await run_migration(conn, version, MIGRATIONS[version]):
+                    error_msg = f"Migration {version} failed"
+                    logger.error(error_msg)
+                    raise DatabaseError(error_msg)
+                    
+        return True
+        
+    except Exception as e:
+        logger.error(f"Database migration failed: {e}")
+        raise DatabaseError(f"Failed to migrate database: {e}")
+
+async def init_db() -> bool:
+    """Initialize database with proper error handling"""
     try:
         # Get connection from pool
-        async with _pool.acquire() as conn:
-            # Create tables
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Create initial schema
             await conn.execute(INIT_SQL)
+            logger.info("Initial schema created successfully")
             
             # Run migrations
             await migrate_database(conn)
+            logger.info("Database migrations completed successfully")
             
             # Initialize notification settings for existing users
             users = await conn.fetch(
@@ -275,10 +438,13 @@ async def init_db() -> bool:
             for user in users:
                 await initialize_notification_settings(user['user_id'])
                 
+            logger.info("Database initialization completed successfully")
             return True
             
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
         raise DatabaseError(f"Failed to initialize database: {e}")
 
 async def add_wallet(user_id: str, address: str, stake_address: str = None) -> bool:
@@ -369,347 +535,6 @@ async def update_notification_setting(user_id: str, setting: str, enabled: bool)
     except QueryError as e:
         logger.error(f"Failed to update notification setting: {str(e)}")
         return False
-
-# Database initialization SQL
-INIT_SQL = """
--- Create version tracking tables first
-CREATE TABLE IF NOT EXISTS migration_history (
-    version INTEGER NOT NULL,
-    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    completed_at TIMESTAMP WITH TIME ZONE,
-    success BOOLEAN,
-    error TEXT,
-    PRIMARY KEY (version)
-);
-
-CREATE TABLE IF NOT EXISTS db_version (
-    version INTEGER PRIMARY KEY,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Create wallets table first since it's referenced by other tables
-CREATE TABLE IF NOT EXISTS wallets (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    address TEXT UNIQUE NOT NULL,
-    stake_address TEXT,
-    ada_balance BIGINT DEFAULT 0,
-    token_balances JSONB DEFAULT '{}',
-    utxo_state JSONB DEFAULT '{}',
-    delegation_pool TEXT,
-    last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    last_policy_check TIMESTAMP WITH TIME ZONE
-);
-
--- Create indices for wallets table after the table is fully created
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_id') THEN
-        CREATE INDEX idx_wallets_id ON wallets(id);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_user_id') THEN
-        CREATE INDEX idx_wallets_user_id ON wallets(user_id);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_address') THEN
-        CREATE INDEX idx_wallets_address ON wallets(address);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_stake_address') THEN
-        CREATE INDEX idx_wallets_stake_address ON wallets(stake_address);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_delegation_pool') THEN
-        CREATE INDEX idx_wallets_delegation_pool ON wallets(delegation_pool);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_last_checked') THEN
-        CREATE INDEX idx_wallets_last_checked ON wallets(last_checked);
-    END IF;
-END $$;
-
--- Add GiST index for JSONB fields for faster querying
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_token_balances') THEN
-        CREATE INDEX idx_wallets_token_balances ON wallets USING gin (token_balances);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_wallets_utxo_state') THEN
-        CREATE INDEX idx_wallets_utxo_state ON wallets USING gin (utxo_state);
-    END IF;
-END $$;
-
--- Create other tables that reference wallets
-CREATE TABLE IF NOT EXISTS delegation_status (
-    stake_address TEXT PRIMARY KEY,
-    pool_id TEXT,
-    last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_delegation_status_stake_address') THEN
-        CREATE INDEX idx_delegation_status_stake_address ON delegation_status(stake_address);
-    END IF;
-END $$;
-
-CREATE TABLE IF NOT EXISTS notification_settings (
-    user_id TEXT PRIMARY KEY,
-    ada_transactions BOOLEAN DEFAULT true,
-    token_changes BOOLEAN DEFAULT true,
-    nft_updates BOOLEAN DEFAULT true,
-    delegation_status BOOLEAN DEFAULT true,
-    policy_updates BOOLEAN DEFAULT true,
-    balance_alerts BOOLEAN DEFAULT true,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_notification_settings_user_id') THEN
-        CREATE INDEX idx_notification_settings_user_id ON notification_settings(user_id);
-    END IF;
-END $$;
-
-CREATE TABLE IF NOT EXISTS processed_rewards (
-    stake_address TEXT NOT NULL,
-    epoch INTEGER NOT NULL,
-    amount BIGINT NOT NULL,
-    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    PRIMARY KEY (stake_address, epoch)
-);
-
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_processed_rewards_stake_address') THEN
-        CREATE INDEX idx_processed_rewards_stake_address ON processed_rewards(stake_address);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_processed_rewards_epoch') THEN
-        CREATE INDEX idx_processed_rewards_epoch ON processed_rewards(epoch);
-    END IF;
-END $$;
-
-CREATE TABLE IF NOT EXISTS processed_token_changes (
-    wallet_id INTEGER REFERENCES wallets(id),
-    tx_hash TEXT NOT NULL,
-    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    PRIMARY KEY (wallet_id, tx_hash)
-);
-
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_processed_token_changes_wallet') THEN
-        CREATE INDEX idx_processed_token_changes_wallet ON processed_token_changes(wallet_id);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_processed_token_changes_tx') THEN
-        CREATE INDEX idx_processed_token_changes_tx ON processed_token_changes(tx_hash);
-    END IF;
-END $$;
-
-CREATE TABLE IF NOT EXISTS failed_transactions (
-    id SERIAL PRIMARY KEY,
-    wallet_id INTEGER REFERENCES wallets(id),
-    tx_hash TEXT NOT NULL,
-    error_type TEXT NOT NULL,
-    error_details JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_failed_transactions_wallet') THEN
-        CREATE INDEX idx_failed_transactions_wallet ON failed_transactions(wallet_id);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_failed_transactions_tx') THEN
-        CREATE INDEX idx_failed_transactions_tx ON failed_transactions(tx_hash);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_failed_transactions_error') THEN
-        CREATE INDEX idx_failed_transactions_error ON failed_transactions(error_type);
-    END IF;
-END $$;
-
-CREATE TABLE IF NOT EXISTS asset_history (
-    id SERIAL PRIMARY KEY,
-    wallet_id INTEGER REFERENCES wallets(id),
-    asset_id TEXT NOT NULL,
-    tx_hash TEXT NOT NULL,
-    action TEXT NOT NULL,
-    quantity NUMERIC NOT NULL,
-    metadata JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_asset_history_wallet') THEN
-        CREATE INDEX idx_asset_history_wallet ON asset_history(wallet_id);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_asset_history_asset') THEN
-        CREATE INDEX idx_asset_history_asset ON asset_history(asset_id);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_asset_history_tx') THEN
-        CREATE INDEX idx_asset_history_tx ON asset_history(tx_hash);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_asset_history_action') THEN
-        CREATE INDEX idx_asset_history_action ON asset_history(action);
-    END IF;
-END $$;
-
-CREATE TABLE IF NOT EXISTS policy_expiry (
-    policy_id TEXT PRIMARY KEY,
-    expiry_slot BIGINT NOT NULL,
-    last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_policy_expiry_slot') THEN
-        CREATE INDEX idx_policy_expiry_slot ON policy_expiry(expiry_slot);
-    END IF;
-END $$;
-
-CREATE TABLE IF NOT EXISTS dapp_interactions (
-    wallet_id INTEGER REFERENCES wallets(id),
-    last_tx TEXT,
-    last_checked TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    PRIMARY KEY (wallet_id)
-);
-
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_dapp_interactions_tx') THEN
-        CREATE INDEX idx_dapp_interactions_tx ON dapp_interactions(last_tx);
-    END IF;
-END $$;
-"""
-
-# Database version tracking
-CURRENT_VERSION = 4
-
-# Migration SQL statements
-MIGRATIONS = {
-    1: """
-        -- Initial schema
-        CREATE TABLE IF NOT EXISTS migration_history (
-            version INTEGER PRIMARY KEY,
-            applied_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            success BOOLEAN DEFAULT TRUE
-        );
-        
-        CREATE TABLE IF NOT EXISTS db_version (
-            version INTEGER PRIMARY KEY,
-            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-        );
-    """,
-    2: """
-        -- Add delegation_pool column if it doesn't exist
-        DO $$ 
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 
-                FROM information_schema.columns 
-                WHERE table_name = 'wallets' 
-                AND column_name = 'delegation_pool'
-            ) THEN
-                ALTER TABLE wallets ADD COLUMN delegation_pool TEXT;
-                CREATE INDEX IF NOT EXISTS idx_wallets_delegation_pool ON wallets(delegation_pool);
-            END IF;
-        END $$;
-    """,
-    3: """
-        -- Add last_policy_check column if it doesn't exist
-        DO $$ 
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 
-                FROM information_schema.columns 
-                WHERE table_name = 'wallets' 
-                AND column_name = 'last_policy_check'
-            ) THEN
-                ALTER TABLE wallets ADD COLUMN last_policy_check TIMESTAMP WITH TIME ZONE;
-            END IF;
-        END $$;
-    """,
-    4: """
-        -- Add monitoring_since column if it doesn't exist
-        DO $$ 
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 
-                FROM information_schema.columns 
-                WHERE table_name = 'wallets' 
-                AND column_name = 'monitoring_since'
-            ) THEN
-                ALTER TABLE wallets ADD COLUMN monitoring_since TIMESTAMP WITH TIME ZONE DEFAULT NOW();
-            END IF;
-        END $$;
-    """
-}
-
-async def get_db_version(conn) -> int:
-    """Get current database version"""
-    try:
-        async with conn.transaction():
-            result = await conn.fetchrow(
-                "SELECT version FROM db_version ORDER BY version DESC LIMIT 1"
-            )
-            return result['version'] if result else 0
-    except Exception as e:
-        logger.error(f"Error getting database version: {e}")
-        return 0
-
-async def run_migration(conn, version: int, sql: str) -> bool:
-    """Run a single migration"""
-    try:
-        async with conn.transaction():
-            # Run the migration
-            await conn.execute(sql)
-            
-            # Record migration
-            await conn.execute(
-                """
-                INSERT INTO migration_history (version, applied_at, success)
-                VALUES ($1, NOW(), TRUE)
-                """,
-                version
-            )
-            
-            # Update db version
-            await conn.execute(
-                """
-                INSERT INTO db_version (version, updated_at)
-                VALUES ($1, NOW())
-                ON CONFLICT (version) 
-                DO UPDATE SET updated_at = NOW()
-                """,
-                version
-            )
-            
-            logger.info(f"Successfully applied migration {version}")
-            return True
-    except Exception as e:
-        logger.error(f"Error applying migration {version}: {e}")
-        return False
-
-async def migrate_database(conn) -> bool:
-    """Run all pending migrations"""
-    try:
-        current_version = await get_db_version(conn)
-        logger.info(f"Current database version: {current_version}")
-        
-        # Run each pending migration in order
-        for version in range(current_version + 1, CURRENT_VERSION + 1):
-            if version in MIGRATIONS:
-                logger.info(f"Applying migration {version}...")
-                if not await run_migration(conn, version, MIGRATIONS[version]):
-                    raise DatabaseError(f"Migration {version} failed")
-        
-        return True
-    except Exception as e:
-        logger.error(f"Database migration failed: {e}")
-        raise DatabaseError(f"Database migration failed: {e}")
-
-async def init_db():
-    """Initialize database and run migrations"""
-    try:
-        # Create initial pool
-        pool = await get_pool()
-        
-        # Run migrations
-        await migrate_database(pool)
-        
-        logger.info("Database initialization and migration completed successfully")
-        return pool
-    except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
-        raise DatabaseError(f"Database initialization failed: {e}")
 
 async def add_transaction(wallet_id: int, tx_hash: str, metadata: dict = None) -> bool:
     """Add a transaction to the database with metadata
