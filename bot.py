@@ -4,6 +4,7 @@ import ssl
 import sys
 import json
 import time
+import uuid
 import signal
 import psutil
 import asyncio
@@ -24,6 +25,7 @@ from config import (
     DISCORD_TOKEN, APPLICATION_ID, ADMIN_CHANNEL_ID,
     BLOCKFROST_PROJECT_ID, BLOCKFROST_BASE_URL, DATABASE_URL, WEBHOOK_SECRET,
     MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_COOLDOWN,
+    YUMMI_POLICY_ID,
     validate_config
 )
 from shutdown_manager import ShutdownManager
@@ -1208,9 +1210,7 @@ class WalletBudBot(commands.Bot):
             port = int(os.getenv('PORT', 8080))
             
             # Initialize webhook components
-            self.app = web.Application()
-            self.app.router.add_post('/webhook', self.handle_webhook)
-            self.runner = web.AppRunner(self.app)
+            self.runner = web.AppRunner(app)  # Use global app
             await self.runner.setup()
             
             # Create site and start it
@@ -1292,88 +1292,6 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error processing webhook request {request_id}: {str(e)}")
             return web.Response(status=500, text="Internal server error")
 
-    async def _handle_transaction_webhook(self, payload: dict):
-        """Handle transaction webhook from Blockfrost"""
-        try:
-            # Extract transaction details
-            tx_hash = payload['tx']['hash']
-            block_height = payload['block']['height']
-            confirmations = payload['confirmations']
-            
-            # Only process if we have enough confirmations
-            min_confirmations = int(os.getenv('WEBHOOK_CONFIRMATIONS', 3))
-            if confirmations < min_confirmations:
-                logger.info(f"Transaction {tx_hash} has only {confirmations} confirmations, waiting for {min_confirmations}")
-                return
-                
-            # Get transaction details
-            tx_details = await self.blockfrost_request(f'/txs/{tx_hash}')
-            
-            # Process transaction outputs
-            for output in tx_details['outputs']:
-                # Get wallet address
-                address = output['address']
-                
-                # Check if this is a monitored wallet
-                async with self.pool.acquire() as conn:
-                    wallet = await conn.fetchrow(
-                        "SELECT user_id, notify_ada_transactions, notify_token_changes FROM wallets WHERE address = $1",
-                        address
-                    )
-                    
-                    if wallet:
-                        # Send notification to user
-                        user_id = wallet['user_id']
-                        
-                        # Create notification message
-                        message = f"🔔 New transaction detected!\n"
-                        message += f"Transaction: `{tx_hash}`\n"
-                        message += f"Block Height: {block_height}\n"
-                        message += f"Confirmations: {confirmations}\n"
-                        
-                        # Send DM to user
-                        await self.send_dm(user_id, message)
-                        
-            logger.info(f"Successfully processed transaction webhook for tx {tx_hash}")
-            
-        except Exception as e:
-            logger.error(f"Error processing transaction webhook: {e}")
-            raise
-
-    async def _handle_delegation_webhook(self, payload: dict):
-        """Handle delegation webhook from Blockfrost"""
-        try:
-            # Extract delegation details
-            stake_address = payload['stake_address']
-            pool_id = payload['pool_id']
-            amount = payload['amount']
-            
-            # Check if this is a monitored stake address
-            async with self.pool.acquire() as conn:
-                wallet = await conn.fetchrow(
-                    "SELECT user_id, notify_delegation_status FROM wallets WHERE stake_address = $1",
-                    stake_address
-                )
-                
-                if wallet and wallet['notify_delegation_status']:
-                    # Send notification to user
-                    user_id = wallet['user_id']
-                    
-                    # Create notification message
-                    message = f"🔔 Delegation Update!\n"
-                    message += f"Stake Address: `{stake_address}`\n"
-                    message += f"Pool: `{pool_id}`\n"
-                    message += f"Amount: {amount} ADA\n"
-                    
-                    # Send DM to user
-                    await self.send_dm(user_id, message)
-                    
-            logger.info(f"Successfully processed delegation webhook for stake address {stake_address}")
-            
-        except Exception as e:
-            logger.error(f"Error processing delegation webhook: {e}")
-            raise
-
     def _validate_webhook_structure(self, webhook_data: dict):
         """Validate webhook data structure"""
         required_fields = ['webhook_id', 'webhook_type', 'created_at', 'payload']
@@ -1408,7 +1326,147 @@ class WalletBudBot(commands.Bot):
                 if field not in payload:
                     raise ValueError(f"Missing required delegation field: {field}")
 
+    async def _handle_transaction_webhook(self, payload: dict):
+        """Handle transaction webhook from Blockfrost"""
+        try:
+            # Extract transaction details
+            tx_hash = payload['tx']['hash']
+            block_height = payload['block']['height']
+            confirmations = payload['confirmations']
+            
+            # Only process if we have enough confirmations
+            min_confirmations = int(os.getenv('WEBHOOK_CONFIRMATIONS', 3))
+            if confirmations < min_confirmations:
+                logger.info(f"Transaction {tx_hash} has only {confirmations} confirmations, waiting for {min_confirmations}")
+                return
+                
+            # Get transaction details
+            tx_details = await self.blockfrost_request(f'/txs/{tx_hash}')
+            
+            # Process transaction outputs
+            for output in tx_details['outputs']:
+                # Get wallet address
+                address = output['address']
+                
+                # Check if this is a monitored wallet
+                async with self.pool.acquire() as conn:
+                    wallet = await conn.fetchrow(
+                        "SELECT user_id, notify_ada_transactions, notify_token_changes FROM wallets WHERE address = $1",
+                        address
+                    )
+                    
+                    if wallet:
+                        # Send notification to user
+                        user_id = wallet['user_id']
+                        
+                        # Create notification message
+                        message = f" New transaction detected!\n"
+                        message += f"Transaction: `{tx_hash}`\n"
+                        message += f"Block Height: {block_height}\n"
+                        message += f"Confirmations: {confirmations}\n"
+                        
+                        # Send DM to user
+                        await self.send_dm(user_id, message)
+                        
+            logger.info(f"Successfully processed transaction webhook for tx {tx_hash}")
+            
+        except Exception as e:
+            logger.error(f"Error processing transaction webhook: {e}")
+            raise
+
+    async def _handle_delegation_webhook(self, payload: dict):
+        """Handle delegation webhook from Blockfrost"""
+        try:
+            # Extract delegation details
+            stake_address = payload['stake_address']
+            pool_id = payload['pool_id']
+            amount = payload['amount']
+            
+            # Check if this is a monitored stake address
+            async with self.pool.acquire() as conn:
+                wallet = await conn.fetchrow(
+                    "SELECT user_id, notify_delegation_status FROM wallets WHERE stake_address = $1",
+                    stake_address
+                )
+                
+                if wallet and wallet['notify_delegation_status']:
+                    # Send notification to user
+                    user_id = wallet['user_id']
+                    
+                    # Create notification message
+                    message = f" Delegation Update!\n"
+                    message += f"Stake Address: `{stake_address}`\n"
+                    message += f"Pool: `{pool_id}`\n"
+                    message += f"Amount: {amount} ADA\n"
+                    
+                    # Send DM to user
+                    await self.send_dm(user_id, message)
+                    
+            logger.info(f"Successfully processed delegation webhook for stake address {stake_address}")
+            
+        except Exception as e:
+            logger.error(f"Error processing delegation webhook: {e}")
+            raise
+
+    async def _check_yummi_balances(self):
+        """Check YUMMI token balances for all wallets"""
+        try:
+            async with self.yummi_check_lock:
+                if self.processing_yummi:
+                    logger.info("YUMMI balance check already in progress")
+                    return
+                    
+                self.processing_yummi = True
+                
+            try:
+                # Get all wallets
+                pool = await get_pool()
+                wallets = await pool.fetch("SELECT * FROM wallets")
+                
+                for wallet in wallets:
+                    try:
+                        # Skip if notifications disabled
+                        if not await self.should_notify(wallet['user_id'], 'token_changes'):
+                            continue
+                            
+                        # Get token balances
+                        address = wallet['address']
+                        token_balances = await self.blockfrost_request(f'/addresses/{address}/utxos')
+                        
+                        # Process token balances
+                        for utxo in token_balances:
+                            for amount in utxo['amount']:
+                                if amount['unit'] != 'lovelace':  # Skip ADA
+                                    # Check if it's a YUMMI token
+                                    policy_id = amount['unit'][:56]
+                                    if policy_id == os.getenv('YUMMI_POLICY_ID'):
+                                        # Send notification
+                                        message = f"🍬 YUMMI Token Update!\n"
+                                        message += f"Address: `{address}`\n"
+                                        message += f"Balance: {amount['quantity']} YUMMI\n"
+                                        
+                                        await self.send_dm(wallet['user_id'], message)
+                                        
+                    except Exception as e:
+                        logger.error(f"Error checking YUMMI balance for wallet {wallet['address']}: {e}")
+                        continue
+                        
+            finally:
+                self.processing_yummi = False
+                
+        except Exception as e:
+            logger.error(f"Error in YUMMI balance check: {e}")
+
 if __name__ == "__main__":
+    # Create aiohttp app
+    app = web.Application()
+
+    # Create bot instance
+    bot = WalletBudBot()
+
+    # Add webhook route
+    app.router.add_post('/webhook', bot.handle_webhook)
+
     try:
         # Configure logging for production
         logging.basicConfig(
@@ -1420,9 +1478,6 @@ if __name__ == "__main__":
         # Configure event loop policy for Windows
         if sys.platform == 'win32':
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-        # Create bot instance
-        bot = WalletBudBot()
 
         async def main():
             try:

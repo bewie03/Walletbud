@@ -510,10 +510,9 @@ ENV_VARS = {
     ),
     'YUMMI_POLICY_ID': EnvVar(
         name='YUMMI_POLICY_ID',
-        description="YUMMI Policy ID (56-character hex)",
+        description="Policy ID for YUMMI tokens",
         validator=validate_policy_id,
-        required=False,
-        default=None
+        required=True,
     ),
     'YUMMI_TOKEN_NAME': EnvVar(
         name='YUMMI_TOKEN_NAME',
