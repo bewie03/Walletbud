@@ -291,6 +291,12 @@ class WalletBudBot(commands.Bot):
             'blockfrost_init': None,
             'webhook_success': 0,
             'webhook_failure': 0,
+            'last_health_check': None,
+            'is_healthy': True,
+            'discord_connection': None,
+            'admin_channel': None,
+            'discord_status': None,
+            'connections': None,
             'errors': []
         }
         # Initialize health cache
@@ -799,8 +805,13 @@ class WalletBudBot(commands.Bot):
                 
             # Check database connection
             try:
-                pool = await get_pool()
-                async with pool.acquire() as conn:
+                if not self.pool:
+                    await self.init_database()
+                    
+                if not self.pool:
+                    raise Exception("Database pool not initialized")
+                    
+                async with self.pool.acquire() as conn:
                     await conn.execute("SELECT 1")
                     pool_stats = await conn.fetchrow("""
                         SELECT 
@@ -821,21 +832,35 @@ class WalletBudBot(commands.Bot):
                     'healthy': False,
                     'error': str(e)
                 }
+                # Try to reinitialize database connection
+                try:
+                    await self.init_database()
+                except Exception as init_error:
+                    logger.error(f"Failed to reinitialize database: {init_error}")
             health_data['components']['database'] = db_health
                 
             # Check Blockfrost API
             try:
-                bf_health = await self.blockfrost_request('/health')
-                network = await self.blockfrost_request('/network')
-                limits = await self.blockfrost_request('/metrics/endpoints')
+                bf_health_response = await self.blockfrost_request('/health')
+                network_response = await self.blockfrost_request('/network')
+                limits_response = await self.blockfrost_request('/metrics/endpoints')
+                
+                # Ensure responses are dictionaries
+                bf_health_data = bf_health_response if isinstance(bf_health_response, dict) else {}
+                network_data = network_response if isinstance(network_response, dict) else {}
+                limits_data = limits_response if isinstance(limits_response, dict) else {}
+                
+                if isinstance(limits_response, list) and limits_response:
+                    # If it's a list, take the first item
+                    limits_data = limits_response[0]
                 
                 bf_health = {
                     'healthy': True,
-                    'network': network.get('network', 'unknown'),
-                    'sync_progress': network.get('sync_progress', 0),
+                    'network': network_data.get('network', 'unknown'),
+                    'sync_progress': network_data.get('sync_progress', 0),
                     'rate_limits': {
-                        'remaining': limits.get('calls_remaining', 0),
-                        'total': limits.get('calls_quota', 0)
+                        'remaining': limits_data.get('calls_remaining', 0),
+                        'total': limits_data.get('calls_quota', 0)
                     }
                 }
             except Exception as e:
@@ -1003,86 +1028,91 @@ class WalletBudBot(commands.Bot):
         """Called when the bot connects to Discord"""
         try:
             logger.info("Bot connected to Discord")
-            await self.update_health_metrics('discord_status', 'connected')
+            await self.update_health_metrics('discord_status', 'Connected')
             
             # Check all connections on connect
+            logger.info("Checking all connections...")
             await self.check_connections()
             
+            # Initialize components if needed
+            if not self.pool:
+                await self.init_database()
+            if not self.blockfrost_session:
+                await self.init_blockfrost()
+                
         except Exception as e:
-            logger.error(f"Error in on_connect: {str(e)}")
+            logger.error(f"Error in on_connect: {e}", exc_info=True)
 
     async def on_disconnect(self):
         """Called when the bot disconnects from Discord"""
         try:
             logger.warning("Bot disconnected from Discord")
-            await self.update_health_metrics('discord_status', 'disconnected')
+            await self.update_health_metrics('discord_status', 'Disconnected')
             
-            # Log disconnect to admin channel
-            if self.admin_channel:
-                embed = discord.Embed(
-                    title="Bot Disconnected",
-                    description="WalletBud bot has disconnected from Discord. Attempting to reconnect...",
-                    color=discord.Color.red()
-                )
+            # Update health metrics
+            await self.update_health_metrics('is_healthy', False)
+            
+            # Log disconnection to admin channel if possible
+            if self.admin_channel and hasattr(self.admin_channel, 'send'):
                 try:
+                    embed = discord.Embed(
+                        title="Bot Disconnected",
+                        description="Lost connection to Discord",
+                        color=discord.Color.red()
+                    )
                     await self.admin_channel.send(embed=embed)
-                except:
-                    logger.error("Failed to send disconnect notification to admin channel")
-            
+                except Exception as e:
+                    logger.error(f"Could not send disconnect notification: {e}")
+                    
         except Exception as e:
-            logger.error(f"Error in on_disconnect: {str(e)}")
+            logger.error(f"Error in on_disconnect: {e}", exc_info=True)
 
     async def check_connections(self):
         """Check all connections and log their status"""
         try:
-            logger.info("Checking all connections...")
-            
             # Check Discord connection
             discord_status = "Connected" if self.is_ready() else "Disconnected"
             logger.info(f"Discord Status: {discord_status}")
-            
+            await self.update_health_metrics('discord_status', discord_status)
+
             # Check database connection
             try:
-                await self.pool.fetchval('SELECT 1')
-                db_status = "Connected"
+                if not self.pool:
+                    await self.init_database()
+                    
+                if not self.pool:
+                    raise Exception("Database pool not initialized")
+                    
+                async with self.pool.acquire() as conn:
+                    await conn.fetchval("SELECT 1")
+                    db_status = "Connected"
             except Exception as e:
                 db_status = f"Error: {str(e)}"
+                # Try to reinitialize database
+                try:
+                    await self.init_database()
+                except Exception:
+                    pass
             logger.info(f"Database Status: {db_status}")
-            
+
             # Check Blockfrost connection
             try:
                 health = await self.blockfrost_request('/health')
-                bf_status = "Connected" if health.get('is_healthy') else "Unhealthy"
+                bf_status = "Connected"
             except Exception as e:
                 bf_status = f"Error: {str(e)}"
             logger.info(f"Blockfrost Status: {bf_status}")
-            
-            # Update health metrics
+
+            # Update overall connection status
             await self.update_health_metrics('connections', {
                 'discord': discord_status,
                 'database': db_status,
                 'blockfrost': bf_status,
-                'checked_at': datetime.utcnow().isoformat()
+                'timestamp': datetime.utcnow().isoformat()
             })
-            
-            # Log to admin channel if there are issues
-            if any(x.startswith("Error") for x in [discord_status, db_status, bf_status]):
-                if self.admin_channel:
-                    embed = discord.Embed(
-                        title="Connection Status Alert",
-                        description="One or more connections have issues:",
-                        color=discord.Color.orange()
-                    )
-                    embed.add_field(name="Discord", value=discord_status)
-                    embed.add_field(name="Database", value=db_status)
-                    embed.add_field(name="Blockfrost", value=bf_status)
-                    try:
-                        await self.admin_channel.send(embed=embed)
-                    except:
-                        logger.error("Failed to send connection status to admin channel")
-            
+
         except Exception as e:
-            logger.error(f"Error checking connections: {str(e)}")
+            logger.error(f"Error checking connections: {e}", exc_info=True)
             
     async def init_ssl_context() -> ssl.SSLContext:
         """Initialize SSL context with proper security settings"""
