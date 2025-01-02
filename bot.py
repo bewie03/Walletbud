@@ -793,10 +793,10 @@ class WalletBudBot(commands.Bot):
             
             # Check Discord connection
             discord_health = {
-                'healthy': self.is_ready(),
+                'healthy': self.is_ready() and self.health_metrics.get('discord_connection', False),
                 'latency': round(self.latency * 1000, 2),  # ms
-                'guilds': len(self.guilds),
-                'shards': len(self.shards) if hasattr(self, 'shards') else 1
+                'guild_count': len(self.guilds) if self.is_ready() else 0,
+                'status': self.health_metrics.get('discord_status', 'unknown')
             }
             if not discord_health['healthy']:
                 health_data['status'] = 'unhealthy'
@@ -1028,42 +1028,19 @@ class WalletBudBot(commands.Bot):
         """Called when the bot connects to Discord"""
         try:
             logger.info("Bot connected to Discord")
-            await self.update_health_metrics('discord_status', 'Connected')
-            
-            # Check all connections on connect
-            logger.info("Checking all connections...")
+            await self.update_health_metrics('discord_status', 'connected')
+            await self.update_health_metrics('discord_connection', True)
             await self.check_connections()
-            
-            # Initialize components if needed
-            if not self.pool:
-                await self.init_database()
-            if not self.blockfrost_session:
-                await self.init_blockfrost()
-                
         except Exception as e:
             logger.error(f"Error in on_connect: {e}", exc_info=True)
 
     async def on_disconnect(self):
         """Called when the bot disconnects from Discord"""
         try:
-            logger.warning("Bot disconnected from Discord")
-            await self.update_health_metrics('discord_status', 'Disconnected')
-            
-            # Update health metrics
-            await self.update_health_metrics('is_healthy', False)
-            
-            # Log disconnection to admin channel if possible
-            if self.admin_channel and hasattr(self.admin_channel, 'send'):
-                try:
-                    embed = discord.Embed(
-                        title="Bot Disconnected",
-                        description="Lost connection to Discord",
-                        color=discord.Color.red()
-                    )
-                    await self.admin_channel.send(embed=embed)
-                except Exception as e:
-                    logger.error(f"Could not send disconnect notification: {e}")
-                    
+            logger.info("Bot disconnected from Discord")
+            await self.update_health_metrics('discord_status', 'disconnected')
+            await self.update_health_metrics('discord_connection', False)
+            await self.check_connections()
         except Exception as e:
             logger.error(f"Error in on_disconnect: {e}", exc_info=True)
 
@@ -1071,7 +1048,7 @@ class WalletBudBot(commands.Bot):
         """Check all connections and log their status"""
         try:
             # Check Discord connection
-            discord_status = "Connected" if self.is_ready() else "Disconnected"
+            discord_status = "connected" if self.is_ready() else "disconnected"
             logger.info(f"Discord Status: {discord_status}")
             await self.update_health_metrics('discord_status', discord_status)
 
@@ -1084,10 +1061,17 @@ class WalletBudBot(commands.Bot):
                     raise Exception("Database pool not initialized")
                     
                 async with self.pool.acquire() as conn:
-                    await conn.fetchval("SELECT 1")
-                    db_status = "Connected"
+                    await conn.execute("SELECT 1")
+                    pool_stats = await conn.fetchrow("""
+                        SELECT 
+                            count(*) as used_connections,
+                            (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_size,
+                            (SELECT setting::int FROM pg_settings WHERE name = 'min_pool_size') as min_size
+                        FROM pg_stat_activity
+                    """)
+                    db_status = "connected"
             except Exception as e:
-                db_status = f"Error: {str(e)}"
+                db_status = f"error: {str(e)}"
                 # Try to reinitialize database
                 try:
                     await self.init_database()
@@ -1098,9 +1082,9 @@ class WalletBudBot(commands.Bot):
             # Check Blockfrost connection
             try:
                 health = await self.blockfrost_request('/health')
-                bf_status = "Connected"
+                bf_status = "connected"
             except Exception as e:
-                bf_status = f"Error: {str(e)}"
+                bf_status = f"error: {str(e)}"
             logger.info(f"Blockfrost Status: {bf_status}")
 
             # Update overall connection status
