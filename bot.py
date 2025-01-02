@@ -759,92 +759,189 @@ class WalletBudBot(commands.Bot):
     async def health_check(self) -> Dict[str, Any]:
         """Comprehensive health check of all system components"""
         try:
-            async with await self._ensure_interaction_lock():
-                # Check Discord connection
-                if not self.is_ready():
-                    logger.warning("Bot is not connected to Discord")
-                    return False
+            # Try to get from cache first
+            if hasattr(self, '_health_cache') and 'data' in self._health_cache:
+                return self._health_cache['data']
+                
+            health_data = {
+                'status': 'healthy',
+                'timestamp': datetime.utcnow().isoformat(),
+                'components': {}
+            }
+            
+            # Check Discord connection
+            discord_health = {
+                'healthy': self.is_ready(),
+                'latency': round(self.latency * 1000, 2),  # ms
+                'guilds': len(self.guilds),
+                'shards': len(self.shards) if hasattr(self, 'shards') else 1
+            }
+            if not discord_health['healthy']:
+                health_data['status'] = 'unhealthy'
+                discord_health['error'] = 'Bot is not connected to Discord'
+            health_data['components']['discord'] = discord_health
+                
+            # Check database connection
+            try:
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    await conn.execute("SELECT 1")
+                    pool_stats = await conn.fetchrow("""
+                        SELECT 
+                            count(*) as used_connections,
+                            (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_size,
+                            (SELECT setting::int FROM pg_settings WHERE name = 'min_pool_size') as min_size
+                        FROM pg_stat_activity
+                    """)
+                    db_health = {
+                        'healthy': True,
+                        'used_connections': pool_stats['used_connections'],
+                        'max_size': pool_stats['max_size'],
+                        'min_size': pool_stats['min_size']
+                    }
+            except Exception as e:
+                health_data['status'] = 'unhealthy'
+                db_health = {
+                    'healthy': False,
+                    'error': str(e)
+                }
+            health_data['components']['database'] = db_health
+                
+            # Check Blockfrost API
+            try:
+                bf_health = await self.blockfrost_request('/health')
+                network = await self.blockfrost_request('/network')
+                limits = await self.blockfrost_request('/metrics/endpoints')
+                
+                bf_health = {
+                    'healthy': True,
+                    'network': network.get('network', 'unknown'),
+                    'sync_progress': network.get('sync_progress', 0),
+                    'rate_limits': {
+                        'remaining': limits.get('calls_remaining', 0),
+                        'total': limits.get('calls_quota', 0)
+                    }
+                }
+            except Exception as e:
+                health_data['status'] = 'unhealthy'
+                bf_health = {
+                    'healthy': False,
+                    'error': str(e)
+                }
+            health_data['components']['blockfrost'] = bf_health
+            
+            # Check system resources
+            try:
+                process = psutil.Process()
+                system_health = {
+                    'healthy': True,
+                    'cpu_percent': process.cpu_percent(),
+                    'memory_percent': process.memory_percent(),
+                    'uptime': str(datetime.utcnow() - self.health_metrics['start_time']) if self.health_metrics.get('start_time') else 'unknown'
+                }
+                
+                # Set degraded if high resource usage
+                if system_health['cpu_percent'] > 80 or system_health['memory_percent'] > 80:
+                    health_data['status'] = 'degraded'
+                    system_health['warning'] = 'High resource usage'
                     
-                # Check database connection
-                try:
-                    pool = await get_pool()
-                    async with pool.acquire() as conn:
-                        await conn.execute("SELECT 1")
-                except Exception as e:
-                    logger.error(f"Database health check failed: {e}")
-                    return False
-                    
-                # Check Blockfrost API
-                try:
-                    await self.blockfrost_request('/health')
-                except Exception as e:
-                    logger.error(f"Blockfrost API health check failed: {e}")
-                    return False
-                    
-                return True
+            except Exception as e:
+                system_health = {
+                    'healthy': False,
+                    'error': str(e)
+                }
+            health_data['components']['system'] = system_health
+            
+            # Add recent errors if any
+            recent_errors = [err for err in self.health_metrics.get('errors', [])[-5:]]
+            if recent_errors:
+                health_data['recent_errors'] = recent_errors
+                
+            # Cache the results
+            if not hasattr(self, '_health_cache'):
+                self._health_cache = TTLCache(maxsize=1, ttl=HEALTH_METRICS_TTL)
+            self._health_cache['data'] = health_data
+                
+            return health_data
                 
         except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return False
-            
+            logger.error(f"Health check failed: {e}", exc_info=True)
+            return {
+                'status': 'unhealthy',
+                'timestamp': datetime.utcnow().isoformat(),
+                'error': str(e),
+                'components': {}
+            }
+
     async def monitor_health(self):
         """Monitor bot health status"""
         try:
             # Perform health check
-            is_healthy = await self.health_check()
+            health_data = await self.health_check()
             
             # Update metrics
-            self.update_health_metrics('last_health_check', datetime.now())
-            self.update_health_metrics('is_healthy', is_healthy)
+            self.update_health_metrics('last_health_check', datetime.utcnow())
+            self.update_health_metrics('is_healthy', health_data['status'] == 'healthy')
             
-            # Log status
-            if is_healthy:
-                logger.info("Health check passed")
+            # Log status and alert if needed
+            if health_data['status'] == 'healthy':
+                logger.info("Health check passed: All systems operational")
             else:
-                logger.warning("Health check failed")
+                # Format error message
+                unhealthy_components = [
+                    name for name, data in health_data['components'].items() 
+                    if not data.get('healthy', False)
+                ]
                 
+                if health_data['status'] == 'degraded':
+                    logger.warning(f"Health check warning: System degraded. Components: {unhealthy_components}")
+                else:
+                    logger.error(f"Health check failed: System unhealthy. Components: {unhealthy_components}")
+                
+                # Alert admin channel if available
+                if self.admin_channel:
+                    embed = discord.Embed(
+                        title="🚨 Health Alert",
+                        description=f"Status: {health_data['status'].upper()}",
+                        color=discord.Color.red() if health_data['status'] == 'unhealthy' else discord.Color.orange()
+                    )
+                    
+                    # Add component statuses
+                    for name, data in health_data['components'].items():
+                        status = "✅" if data.get('healthy', False) else "❌"
+                        value = f"Status: {status}\n"
+                        
+                        if 'error' in data:
+                            value += f"Error: {data['error']}\n"
+                        if 'warning' in data:
+                            value += f"Warning: {data['warning']}\n"
+                            
+                        # Add component-specific details
+                        if name == 'discord' and 'latency' in data:
+                            value += f"Latency: {data['latency']}ms\n"
+                        elif name == 'database' and 'used_connections' in data:
+                            value += f"Connections: {data['used_connections']}/{data['max_size']}\n"
+                        elif name == 'blockfrost' and 'rate_limits' in data:
+                            value += f"API Calls Remaining: {data['rate_limits']['remaining']}\n"
+                        elif name == 'system' and 'cpu_percent' in data:
+                            value += f"CPU: {data['cpu_percent']}%\nMemory: {data['memory_percent']}%\n"
+                            
+                        embed.add_field(name=name.title(), value=value, inline=True)
+                    
+                    # Add recent errors if any
+                    if health_data.get('recent_errors'):
+                        error_list = "\n".join(f"• {err}" for err in health_data['recent_errors'])
+                        embed.add_field(
+                            name="Recent Errors",
+                            value=f"```\n{error_list}\n```",
+                            inline=False
+                        )
+                    
+                    await self.admin_channel.send(embed=embed)
+            
         except Exception as e:
-            logger.error(f"Health monitoring failed: {e}")
-
-    @app_commands.command(name="health")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def health(self, interaction: discord.Interaction):
-        """Check bot health status"""
-        try:
-            # Run health check
-            health = await self.health_check()
+            logger.error(f"Health monitoring failed: {e}", exc_info=True)
             
-            # Create embed
-            embed = discord.Embed(
-                title=" Bot Health Status",
-                color=discord.Color.green() if health else discord.Color.red()
-            )
-            
-            # Components
-            components = []
-            if health:
-                components.append("✅ **Discord**: Connected")
-                components.append("✅ **Database**: Connected")
-                components.append("✅ **Blockfrost**: Connected")
-            else:
-                components.append("❌ **Discord**: Disconnected")
-                components.append("❌ **Database**: Disconnected")
-                components.append("❌ **Blockfrost**: Disconnected")
-            embed.add_field(
-                name="Components",
-                value="\n".join(components),
-                inline=False
-            )
-            
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            
-        except Exception as e:
-            logger.error(f"Error in health command: {e}")
-            await interaction.response.send_message(
-                " Error running health check. Check logs for details.",
-                ephemeral=True
-            )
-
     async def on_ready(self):
         """Called when the bot is ready and connected to Discord"""
         try:
@@ -1427,6 +1524,18 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error in YUMMI balance check: {e}")
 
+async def main(app):
+    """Main entry point for the bot when running locally"""
+    try:
+        # Initialize the bot
+        await bot.start(os.getenv('DISCORD_TOKEN'))
+    except Exception as e:
+        logger.error(f"Failed to start bot: {str(e)}")
+        raise
+    finally:
+        if not bot.is_closed():
+            await bot.close()
+
 if __name__ == "__main__":
     # Create aiohttp app for local development
     app = web.Application()
@@ -1434,12 +1543,20 @@ if __name__ == "__main__":
     # Initialize bot instance
     bot = WalletBudBot()
     
-    # Add webhook route
+    # Add webhook route and health check
     app.router.add_post('/webhook', bot.handle_webhook)
+    app.router.add_get('/health', bot.health_check)
     
-    # Run everything in the event loop
+    # Add cleanup callback
+    app.on_cleanup.append(bot.close)
+    
+    # Run the application
     try:
-        asyncio.run(main())
+        web.run_app(
+            app,
+            port=int(os.getenv('PORT', 8080)),
+            ssl_context=bot.ssl_context
+        )
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
         sys.exit(1)

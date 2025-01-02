@@ -9,6 +9,7 @@ from discord import app_commands
 from datetime import datetime
 import psutil
 from typing import Optional, Dict, Any
+from cachetools import TTLCache
 from database import (
     get_notification_settings,
     update_notification_setting,
@@ -36,8 +37,8 @@ class SystemCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._health_lock = asyncio.Lock()
-        self._last_health_check = None
-        self._health_cache = {}
+        # Use TTLCache for health metrics
+        self._health_cache = TTLCache(maxsize=1, ttl=HEALTH_METRICS_TTL)
         self.health_monitor.start()
         super().__init__()
 
@@ -49,102 +50,153 @@ class SystemCommands(commands.Cog):
     async def health_monitor(self):
         """Background task to monitor system health"""
         try:
-            health_data = await self._check_health_metrics()
-            self._health_cache = health_data
-            self._last_health_check = datetime.now()
-            
-            # Log any concerning metrics
-            if not health_data['blockfrost']['healthy']:
-                logger.error("Blockfrost API health check failed")
-            if health_data['system']['memory_percent'] > 90:
-                logger.warning("High memory usage detected")
-            if health_data['system']['cpu_percent'] > 80:
-                logger.warning("High CPU usage detected")
+            async with self._health_lock:
+                health_data = await self.bot.health_check()
                 
+                # Update cache
+                self._health_cache['data'] = health_data
+                
+                # Log issues if status is not healthy
+                if health_data['status'] != 'healthy':
+                    logger.warning(f"Health check reported status: {health_data['status']}")
+                    for component, data in health_data['components'].items():
+                        if not data.get('healthy', False):
+                            logger.warning(f"Unhealthy component {component}: {data.get('error', 'No error details')}")
+                
+                # Alert admin channel if configured
+                if (
+                    health_data['status'] == 'unhealthy' and 
+                    hasattr(self.bot, 'admin_channel') and 
+                    self.bot.admin_channel
+                ):
+                    embed = discord.Embed(
+                        title="⚠️ System Health Alert",
+                        description=f"Status: {health_data['status']}",
+                        color=discord.Color.red()
+                    )
+                    for component, data in health_data['components'].items():
+                        if not data.get('healthy', False):
+                            embed.add_field(
+                                name=f"❌ {component}",
+                                value=data.get('error', 'No error details'),
+                                inline=False
+                            )
+                    try:
+                        await self.bot.admin_channel.send(embed=embed)
+                    except Exception as e:
+                        logger.error(f"Failed to send health alert: {e}")
+                
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error(f"Health monitor error: {e}", exc_info=True)
+            logger.error(f"Error in health monitor: {e}", exc_info=True)
 
     async def _check_health_metrics(self) -> Dict[str, Any]:
         """Gather all health metrics"""
-        health_data = {
-            'discord': {
-                'connected': self.bot.is_ready(),
-                'latency': round(self.bot.latency * 1000)
-            },
-            'database': {'connected': False, 'error': None},
-            'blockfrost': {'healthy': False, 'error': None},
-            'system': {},
-            'rate_limits': {
-                'blockfrost': {
-                    'remaining': 0,
-                    'reset_at': None,
-                    'total': 0
-                },
-                'discord': {
-                    'global_rate_limit': False,
-                    'command_rate_limits': {}
-                }
-            }
-        }
-        
-        # Check database
         try:
-            if hasattr(self.bot, 'pool') and self.bot.pool:
-                async with self.bot.pool.acquire() as conn:
-                    await conn.execute("SELECT 1")
-                health_data['database']['connected'] = True
-        except Exception as e:
-            health_data['database']['error'] = str(e)
-            logger.error(f"Database health check failed: {e}", exc_info=True)
-
-        # Check Blockfrost with rate limits
-        try:
-            if hasattr(self.bot, 'blockfrost') and self.bot.blockfrost:
-                health = await self.bot.blockfrost.health()
-                health_data['blockfrost']['healthy'] = health and health.is_healthy
+            # Try to get from cache first
+            if 'data' in self._health_cache:
+                return self._health_cache['data']
+            
+            # Get fresh data if not in cache
+            async with self._health_lock:
+                health_data = await self.bot.health_check()
+                self._health_cache['data'] = health_data
+                return health_data
                 
-                # Get rate limit info if available
-                if hasattr(self.bot.blockfrost, 'get_rate_limits'):
-                    rate_limits = await self.bot.blockfrost.get_rate_limits()
-                    health_data['rate_limits']['blockfrost'] = {
-                        'remaining': rate_limits.remaining,
-                        'reset_at': rate_limits.reset_at,
-                        'total': rate_limits.total
-                    }
         except Exception as e:
-            health_data['blockfrost']['error'] = str(e)
-            logger.error(f"Blockfrost health check failed: {e}", exc_info=True)
-
-        # System metrics with more detail
-        try:
-            process = psutil.Process()
-            memory = psutil.virtual_memory()
-            disk = psutil.disk_usage('/')
-            
-            health_data['system'] = {
-                'memory_used': process.memory_info().rss / 1024 / 1024,
-                'memory_percent': process.memory_percent(),
-                'system_memory': {
-                    'total': memory.total / (1024 * 1024 * 1024),
-                    'available': memory.available / (1024 * 1024 * 1024),
-                    'percent': memory.percent
-                },
-                'cpu_percent': process.cpu_percent(),
-                'cpu_count': psutil.cpu_count(),
-                'disk_usage': {
-                    'total': disk.total / (1024 * 1024 * 1024),
-                    'used': disk.used / (1024 * 1024 * 1024),
-                    'free': disk.free / (1024 * 1024 * 1024),
-                    'percent': disk.percent
-                },
-                'uptime': datetime.now() - self.bot.start_time if hasattr(self.bot, 'start_time') else None,
-                'thread_count': len(process.threads()),
-                'open_files': len(process.open_files())
+            logger.error(f"Error checking health metrics: {e}", exc_info=True)
+            return {
+                'status': 'unhealthy',
+                'error': str(e),
+                'components': {}
             }
-        except Exception as e:
-            logger.error(f"System metrics check failed: {e}", exc_info=True)
+
+    @app_commands.command(name="health", description="Check bot and API status")
+    @command_cooldown(COMMAND_COOLDOWN)
+    async def health(self, interaction: discord.Interaction):
+        """Show detailed system health status"""
+        await interaction.response.defer(ephemeral=True)
+        
+        try:
+            # Get health data
+            health_data = await self._check_health_metrics()
             
-        return health_data
+            # Create health status embed
+            status = health_data['status']
+            color = {
+                'healthy': discord.Color.green(),
+                'degraded': discord.Color.orange(),
+                'unhealthy': discord.Color.red()
+            }.get(status, discord.Color.greyple())
+            
+            embed = discord.Embed(
+                title="🏥 System Health Status",
+                description=(
+                    f"Overall Status: {status.title()}\n"
+                    f"{'✅' if status == 'healthy' else '⚠️' if status == 'degraded' else '❌'}"
+                ),
+                color=color
+            )
+            
+            # Add component status fields
+            for component, data in health_data['components'].items():
+                healthy = data.get('healthy', False)
+                field_value = [f"Status: {'✅' if healthy else '❌'}"]
+                
+                # Add component-specific metrics
+                if component == 'discord':
+                    field_value.extend([
+                        f"Latency: {data['latency']}ms",
+                        f"Guilds: {data['guilds']}",
+                        f"Shards: {data['shards']}"
+                    ])
+                elif component == 'blockfrost' and healthy:
+                    field_value.extend([
+                        f"Network: {data['network']}",
+                        f"Sync: {data['sync_progress']}%"
+                    ])
+                    if 'rate_limits' in data:
+                        field_value.append(
+                            f"Rate Limits: {data['rate_limits']['remaining']}/{data['rate_limits']['total']}"
+                        )
+                elif component == 'database' and healthy:
+                    field_value.extend([
+                        f"Pool: {data['used_connections']}/{data['max_size']}",
+                        f"Min Size: {data['min_size']}"
+                    ])
+                elif component == 'system' and healthy:
+                    field_value.extend([
+                        f"CPU: {data['cpu_percent']}%",
+                        f"Memory: {data['memory_percent']}%",
+                        f"Uptime: {data['uptime']}"
+                    ])
+                
+                embed.add_field(
+                    name=f"{component.title()}",
+                    value="\n".join(field_value),
+                    inline=True
+                )
+            
+            # Add error details if present
+            if 'error' in health_data:
+                embed.add_field(
+                    name="❌ Error Details",
+                    value=f"```{health_data['error']}```",
+                    inline=False
+                )
+            
+            # Add timestamp
+            embed.set_footer(text=f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"Error showing health status: {e}", exc_info=True)
+            await interaction.followup.send(
+                "❌ An error occurred while checking health status. Please try again later.",
+                ephemeral=True
+            )
 
     def _create_paginated_embed(self, title: str, fields: list, description: str = "") -> list[discord.Embed]:
         """Create paginated embeds if content exceeds Discord's limits"""
@@ -233,113 +285,6 @@ class SystemCommands(commands.Cog):
             logger.error(f"Error showing help: {e}", exc_info=True)
             await interaction.response.send_message(
                 "❌ An error occurred while showing help. Please try again later.",
-                ephemeral=True
-            )
-
-    @app_commands.command(name="health", description="Check bot and API status")
-    @command_cooldown(COMMAND_COOLDOWN)
-    async def health(self, interaction: discord.Interaction):
-        """Show detailed system health status"""
-        await interaction.response.defer(ephemeral=True)
-        
-        try:
-            async with self._health_lock:
-                # Check if we have a recent health check
-                current_time = datetime.now()
-                if (
-                    self._last_health_check and
-                    (current_time - self._last_health_check).total_seconds() < HEALTH_METRICS_TTL
-                ):
-                    health_data = self._health_cache
-                else:
-                    health_data = await self.bot.health_check()
-                    self._health_cache = health_data
-                    self._last_health_check = current_time
-                
-                # Create health status embed
-                status = health_data['status']
-                color = {
-                    'healthy': discord.Color.green(),
-                    'degraded': discord.Color.orange(),
-                    'unhealthy': discord.Color.red()
-                }.get(status, discord.Color.greyple())
-                
-                embed = discord.Embed(
-                    title="🏥 System Health Status",
-                    description=(
-                        f"Overall Status: {status.title()}\n"
-                        f"{'✅' if status == 'healthy' else '⚠️' if status == 'degraded' else '❌'}"
-                    ),
-                    color=color
-                )
-                
-                # Add component status fields
-                for component, data in health_data['components'].items():
-                    healthy = data.get('healthy', False)
-                    field_value = [f"Status: {'✅' if healthy else '❌'}"]
-                    
-                    # Add component-specific metrics
-                    if component == 'discord':
-                        field_value.extend([
-                            f"Latency: {data['latency']}ms",
-                            f"Guilds: {data['guilds']}",
-                            f"Shards: {data['shards']}"
-                        ])
-                    elif component == 'blockfrost' and healthy:
-                        field_value.extend([
-                            f"Network: {data['network']}",
-                            f"Sync: {data['sync_progress']}%"
-                        ])
-                        if 'rate_limits' in data:
-                            field_value.append(
-                                f"Rate Limits: {data['rate_limits']['remaining']}/{data['rate_limits']['total']}"
-                            )
-                    elif component == 'database' and healthy:
-                        field_value.extend([
-                            f"Pool: {data['used_connections']}/{data['max_size']}",
-                            f"Min Size: {data['min_size']}"
-                        ])
-                    elif component == 'system':
-                        field_value.extend([
-                            f"CPU: {data['cpu_percent']}%",
-                            f"Memory: {data['memory_used_mb']:.1f}MB ({data['memory_percent']:.1f}%)",
-                            f"Threads: {data['threads']}"
-                        ])
-                    elif component == 'webhooks':
-                        field_value.extend([
-                            f"Queue: {data['queue_size']}/{data['queue_capacity']}",
-                            f"Processing: {'Yes' if data['processing'] else 'No'}"
-                        ])
-                    
-                    if not healthy and 'error' in data:
-                        field_value.append(f"Error: {data['error']}")
-                    
-                    embed.add_field(
-                        name=component.title(),
-                        value="\n".join(field_value),
-                        inline=True
-                    )
-                
-                # Add warnings if any component is unhealthy
-                if 'unhealthy_components' in health_data:
-                    embed.add_field(
-                        name="⚠️ Warnings",
-                        value="\n".join([
-                            f"• {comp} is not healthy"
-                            for comp in health_data['unhealthy_components']
-                        ]),
-                        inline=False
-                    )
-                
-                # Add timestamp
-                embed.set_footer(text=f"Last updated: {health_data['timestamp']}")
-                
-                await interaction.followup.send(embed=embed, ephemeral=True)
-                
-        except Exception as e:
-            logger.error(f"Health command failed: {e}", exc_info=True)
-            await interaction.followup.send(
-                "❌ Failed to get health status. Please try again later.",
                 ephemeral=True
             )
 
