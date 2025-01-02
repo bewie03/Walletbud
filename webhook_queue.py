@@ -11,7 +11,7 @@ import os
 import hmac
 import hashlib
 import re
-from typing import Dict, Any, Optional, List, Callable
+from typing import Dict, Any, Optional, List, Callable, Tuple, Union
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from collections import deque
@@ -335,12 +335,12 @@ class WebhookQueue:
         """Enforce memory limits by removing old events if necessary"""
         try:
             memory_mb = await self._check_memory_usage()
-            if memory_mb > WEBHOOK_CONFIG['MEMORY_LIMIT_MB']:
-                logger.warning(f"Memory usage ({memory_mb:.2f}MB) exceeds limit ({WEBHOOK_CONFIG['MEMORY_LIMIT_MB']}MB)")
+            if memory_mb > WEBHOOK_SECURITY['MEMORY_THRESHOLDS']['critical']:
+                logger.warning(f"Memory usage ({memory_mb:.2f}MB) exceeds limit ({WEBHOOK_SECURITY['MEMORY_THRESHOLDS']['critical']}MB)")
                 
                 # Remove oldest events until under limit
                 async with self.queue_lock:
-                    while memory_mb > WEBHOOK_CONFIG['MEMORY_LIMIT_MB'] and self.queue:
+                    while memory_mb > WEBHOOK_SECURITY['MEMORY_THRESHOLDS']['critical'] and self.queue:
                         event = self.queue.popleft()
                         self._add_error(
                             'memory_limit',
@@ -408,92 +408,108 @@ class WebhookQueue:
                     self.stats['total_failed'] += 1
                     logger.error(f"Webhook event {event.id} failed permanently. Error: {e}")
 
+    async def process_webhook(self, request: web.Request) -> web.Response:
+        """Process incoming webhook request"""
+        try:
+            # Get request body
+            body = await request.text()
+            
+            # Validate signature
+            if not self.validate_signature(request.headers, body):
+                return web.Response(text="Invalid signature", status=401)
+                
+            # Parse JSON body
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                return web.Response(text="Invalid JSON", status=400)
+                
+            # Verify required fields
+            if 'type' not in data or 'payload' not in data:
+                return web.Response(text="Missing required fields", status=400)
+                
+            # Add to queue
+            await self.queue.put(data)
+            logger.debug(f"Added {data['type']} webhook to queue")
+            
+            # Return success (must be 2xx as per Blockfrost docs)
+            return web.Response(text="OK", status=200)
+            
+        except Exception as e:
+            logger.error(f"Error processing webhook: {e}", exc_info=True)
+            return web.Response(text=str(e), status=500)
+
     def register_handler(self, event_type: str, handler: Callable):
         """Register handler for event type"""
         self.event_handlers[event_type] = handler
         
-    def validate_signature(self, signature_header: str, payload: bytes) -> bool:
-        """Validate Blockfrost webhook signature
-        
-        The signature header format is: t=<timestamp>,v1=<signature>
-        The signature is a hex-encoded HMAC-SHA256 hash of "<timestamp>.<payload>",
-        using the webhook auth token as the key.
-        
-        Args:
-            signature_header: Value of Blockfrost-Signature header
-            payload: Raw request body bytes
-            
-        Returns:
-            bool: True if signature is valid
-        """
-        if not self.secret:
-            logger.error("No webhook auth token configured")
-            return False
-            
-        if not signature_header:
-            logger.error("No signature header provided")
-            return False
-            
+    def validate_signature(self, headers: Dict[str, str], payload: Union[str, bytes]) -> bool:
+        """Validate Blockfrost webhook signature"""
         try:
-            # Parse header parts
-            header_parts = dict(part.split('=') for part in signature_header.split(','))
-            if 't' not in header_parts or 'v1' not in header_parts:
-                logger.error("Invalid signature header format")
+            # Get signature header (case-insensitive)
+            signature_header = next(
+                (v for k, v in headers.items() if k.lower() == 'blockfrost-signature'),
+                None
+            )
+            if not signature_header:
+                logger.warning("Missing Blockfrost-Signature header")
                 return False
-                
+
+            # Parse header parts
+            try:
+                header_parts = dict(part.split('=') for part in signature_header.split(','))
+            except ValueError:
+                logger.warning("Invalid signature header format")
+                return False
+
+            # Verify required parts
+            if not all(k in header_parts for k in ['t', 'v1']):
+                logger.warning("Missing required signature components")
+                return False
+
+            # Extract parts
             timestamp = header_parts['t']
-            received_sig = header_parts['v1']
-            
-            # Log parsed values
-            logger.debug(f"Timestamp: {timestamp}")
-            logger.debug(f"Received signature: {received_sig}")
-            
-            # Validate timestamp (within 10 minutes)
-            timestamp_int = int(timestamp)
+            signature = header_parts['v1']
+
+            # Validate timestamp format
+            try:
+                timestamp_int = int(timestamp)
+            except ValueError:
+                logger.warning("Invalid timestamp format")
+                return False
+
+            # Check timestamp is within window (600s default in Blockfrost)
             now = int(time.time())
             if abs(now - timestamp_int) > 600:
                 logger.warning(f"Webhook timestamp too old: {abs(now - timestamp_int)} seconds")
                 return False
-                
-            # Create signature payload
-            signature_payload = f"{timestamp}.{payload.decode('utf-8')}"
-            logger.debug(f"Signature payload: {signature_payload[:100]}...")
-            
-            # Calculate HMAC using SHA-256
-            expected_sig = hmac.new(
+
+            # Ensure payload is string
+            if isinstance(payload, bytes):
+                payload = payload.decode('utf-8')
+
+            # Create signature payload (timestamp.payload)
+            msg = f"{timestamp}.{payload}"
+
+            # Calculate expected signature
+            expected = hmac.new(
                 key=self.secret.encode('utf-8'),
-                msg=signature_payload.encode('utf-8'),
+                msg=msg.encode('utf-8'),
                 digestmod=hashlib.sha256
             ).hexdigest()
-            
-            # Log signatures for comparison
-            logger.debug(f"Expected signature: {expected_sig}")
-            
+
             # Use constant-time comparison
-            is_valid = hmac.compare_digest(received_sig.lower(), expected_sig.lower())
-            
-            if not is_valid:
-                logger.warning("Invalid webhook signature")
-                logger.debug("Signature comparison failed")
-                logger.debug(f"Auth token prefix: {self.secret[:8]}...")
-                
-            return is_valid
-            
+            return hmac.compare_digest(signature.lower(), expected.lower())
+
         except Exception as e:
             logger.error(f"Error validating signature: {e}", exc_info=True)
             return False
             
-    async def check_request(self, request_size: int, client_ip: str) -> tuple[bool, str]:
+    async def check_request(self, request_size: int, client_ip: str) -> Tuple[bool, str]:
         """Check if request passes security checks"""
         # Check request size
         if request_size > WEBHOOK_SECURITY['MAX_REQUEST_SIZE']:
             return False, "Request size exceeds limit"
-            
-        # Check IP whitelist if configured
-        allowed_ips = WEBHOOK_SECURITY.get('ALLOWED_IPS', [])
-        if allowed_ips and client_ip not in allowed_ips:
-            self.stats['total_blocked_ips'] += 1
-            return False, "IP not whitelisted"
             
         # Check rate limits
         if not await self.global_limiter.is_allowed("global"):

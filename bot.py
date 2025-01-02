@@ -1387,8 +1387,9 @@ class WalletBudBot(commands.Bot):
             # Add cleanup callback
             app.on_cleanup.append(self.close)
             
-            # Get port from environment
+            # Get port from environment, default to $PORT for Heroku
             port = int(os.getenv('PORT', 8080))
+            logger.info(f"Using port {port} for webhook server")
             
             # Start webhook server
             runner = web.AppRunner(app)
@@ -1404,78 +1405,4 @@ class WalletBudBot(commands.Bot):
 
     async def handle_webhook(self, request: web.Request) -> web.Response:
         """Handle incoming webhook request from Blockfrost"""
-        request_id = str(uuid.uuid4())
-        logger.info(f"Received webhook request {request_id}")
-        
-        try:
-            # Get client IP
-            client_ip = request.remote
-            logger.debug(f"Client IP: {client_ip}")
-            
-            # Check request size
-            content_length = request.content_length
-            if content_length is None:
-                return web.Response(status=411, text="Length Required")
-                
-            # Perform security checks
-            is_allowed, error_msg = await self.webhook_queue.check_request(content_length, client_ip)
-            if not is_allowed:
-                logger.warning(f"Request {request_id} blocked: {error_msg}")
-                return web.Response(status=403, text=error_msg)
-            
-            # Log headers (excluding sensitive ones)
-            logger.debug("Request headers:")
-            for name, value in request.headers.items():
-                if name.lower() not in ['authorization', 'cookie']:
-                    logger.debug(f"{name}: {value}")
-            
-            # Get signature from header
-            signature = request.headers.get('Blockfrost-Signature')
-            if not signature:
-                logger.warning(f"Missing Blockfrost-Signature header for request {request_id}")
-                return web.Response(status=401, text="Missing signature header")
-                
-            # Read raw request body
-            try:
-                payload = await request.read()
-                logger.debug(f"Raw payload ({len(payload)} bytes): {payload[:100]!r}...")
-            except Exception as e:
-                logger.error(f"Error reading request body: {e}", exc_info=True)
-                return web.Response(status=400, text="Invalid request body")
-                
-            # Validate signature
-            if not self.webhook_queue.validate_signature(signature, payload):
-                logger.warning(f"Invalid signature for webhook request {request_id}")
-                return web.Response(status=401, text="Invalid signature")
-                
-            # Parse JSON payload
-            try:
-                data = json.loads(payload)
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON payload: {e}")
-                return web.Response(status=400, text="Invalid JSON payload")
-                
-            # Queue webhook event
-            event_type = data.get('type')
-            if not event_type:
-                logger.warning("Missing event type in payload")
-                return web.Response(status=400, text="Missing event type")
-                
-            # Add CORS headers if needed
-            response = web.Response(status=200)
-            if 'Origin' in request.headers:
-                origin = request.headers['Origin']
-                if origin in WEBHOOK_SECURITY['CORS']['allowed_origins']:
-                    response.headers['Access-Control-Allow-Origin'] = origin
-                    response.headers['Access-Control-Allow-Methods'] = ','.join(WEBHOOK_SECURITY['CORS']['allowed_methods'])
-                    response.headers['Access-Control-Allow-Headers'] = ','.join(WEBHOOK_SECURITY['CORS']['allowed_headers'])
-                    response.headers['Access-Control-Max-Age'] = str(WEBHOOK_SECURITY['CORS']['max_age'])
-            
-            # Queue the event
-            await self.webhook_queue.add_event(request_id, event_type, data, dict(request.headers))
-            logger.info(f"Successfully queued {event_type} webhook event {request_id}")
-            return response
-            
-        except Exception as e:
-            logger.error(f"Error handling webhook: {e}", exc_info=True)
-            return web.Response(status=500, text="Internal server error")
+        return await self.webhook_queue.process_webhook(request)
