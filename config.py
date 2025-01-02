@@ -623,6 +623,7 @@ HEALTH_METRICS_TTL = int(os.getenv('HEALTH_METRICS_TTL', '300'))  # 5 minutes
 # Database configuration
 MAX_RETRIES = int(os.getenv('DB_MAX_RETRIES', '3'))  # Maximum number of retries
 RETRY_DELAY_BASE = int(os.getenv('DB_RETRY_DELAY_BASE', '2'))  # Base for exponential backoff
+BATCH_SIZE = int(os.getenv('BATCH_SIZE', '100'))  # Default batch size for database operations
 
 DB_CONFIG = {
     'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '2')),
