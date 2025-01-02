@@ -69,7 +69,8 @@ async def init_app():
 
 def get_app():
     """Get the web application instance"""
-    return init_app()
+    # Explicitly mark this as an aiohttp application factory
+    return init_app
 
 if __name__ == '__main__':
     # Register signal handlers
@@ -77,4 +78,4 @@ if __name__ == '__main__':
         signal.signal(sig, lambda s, f: signal_handler())
     
     # Run the application
-    web.run_app(init_app(), port=int(os.getenv('PORT', 8080)))
+    web.run_app(get_app(), port=int(os.getenv('PORT', 8080)))
