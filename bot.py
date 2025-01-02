@@ -1343,3 +1343,39 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to start webhook server: {e}")
             raise
+
+    async def handle_webhook(self, request: web.Request) -> web.Response:
+        """Handle incoming webhook requests from Blockfrost"""
+        try:
+            # Process webhook through queue
+            response = await self.webhook_queue.process_webhook(request)
+            
+            # Update health metrics
+            self.update_health_metrics('last_webhook', datetime.now().isoformat())
+            if response.status == 200:
+                self.health_metrics['webhook_success'] += 1
+            else:
+                self.health_metrics['webhook_failure'] += 1
+                
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error handling webhook: {e}", exc_info=True)
+            self.health_metrics['webhook_failure'] += 1
+            return web.Response(text=str(e), status=500)
+
+    async def start_webhook(self):
+        """Initialize webhook handling"""
+        try:
+            # Register webhook handler
+            self.webhook_queue.register_handler('transaction', self._handle_transaction_webhook)
+            self.webhook_queue.register_handler('delegation', self._handle_delegation_webhook)
+            self.webhook_queue.register_handler('asset', self._handle_asset_webhook)
+            
+            # Start webhook queue processor
+            await self.webhook_queue.start()
+            logger.info("Webhook handling initialized")
+            
+        except Exception as e:
+            logger.error(f"Error starting webhook handler: {e}", exc_info=True)
+            raise

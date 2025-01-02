@@ -498,75 +498,64 @@ class WebhookQueue:
             # Get request body
             try:
                 body = await request.text()
+                payload = json.loads(body)
             except Exception as e:
-                logger.error(f"Error reading request body: {e}", exc_info=True)
-                return web.Response(text="Error reading request body", status=400)
-            
-            # Verify signature
-            if not self.validate_signature(dict(request.headers), body):
-                self.stats['total_signature_failures'] += 1
-                logger.warning(f"Invalid webhook signature from {request.remote}")
-                return web.Response(text="Invalid signature", status=401)
-            
-            # Parse JSON data
-            try:
-                data = json.loads(body)
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON in webhook request: {e}", exc_info=True)
-                return web.Response(text=f"Invalid JSON: {str(e)}", status=400)
-            
-            # Check security limits
-            is_allowed, error_msg = await self.check_request(len(body), request.remote)
-            if not is_allowed:
-                logger.warning(f"Request blocked: {error_msg} from {request.remote}")
-                return web.Response(text=error_msg, status=429)
-                
-            # Verify required fields
-            if not isinstance(data, list):
-                data = [data]  # Convert single event to list
-                
-            processed_events = 0
-            errors = []
-            
-            for event in data:
-                try:
-                    if 'type' not in event or 'payload' not in event:
-                        errors.append("Missing required fields 'type' or 'payload'")
-                        continue
+                self._add_error('validation', f'Failed to parse request body: {e}')
+                return web.Response(text=str(e), status=400)
 
-                    event_id = event.get('id', str(uuid.uuid4()))
-                    
-                    # Add to queue
-                    success = await self.add_event(
-                        event_id=event_id,
-                        event_type=event['type'],
-                        payload=event['payload'],
-                        headers=dict(request.headers)
-                    )
-                    
-                    if success:
-                        processed_events += 1
-                    else:
-                        errors.append(f"Failed to queue event {event_id}")
-                        
-                except Exception as e:
-                    logger.error(f"Error processing event: {e}", exc_info=True)
-                    errors.append(f"Error processing event: {str(e)}")
-            
-            # Log processing summary
-            logger.info(f"Processed {processed_events}/{len(data)} events from {request.remote}")
-            if errors:
-                logger.warning(f"Errors processing webhook: {'; '.join(errors)}")
-            
-            # Return success if at least one event was processed
-            if processed_events > 0:
-                return web.Response(text="OK", status=200)
-            else:
-                return web.Response(text="; ".join(errors), status=400)
-            
+            # Validate signature if required
+            if WEBHOOK_CONFIG['SIGNATURE_REQUIRED']:
+                if not self.validate_signature(dict(request.headers), body):
+                    self.stats['total_signature_failures'] += 1
+                    self._add_error('security', 'Invalid webhook signature')
+                    return web.Response(text='Invalid signature', status=401)
+
+            # Check request size
+            if request.content_length > WEBHOOK_SECURITY['MAX_PAYLOAD_SIZE']:
+                self.stats['total_oversized'] += 1
+                self._add_error('security', 'Request payload too large')
+                return web.Response(text='Payload too large', status=413)
+
+            # Check rate limits
+            allowed, error = await self.check_request(
+                request.content_length,
+                request.remote
+            )
+            if not allowed:
+                self.stats['total_rate_limited'] += 1
+                self._add_error('security', f'Rate limit exceeded: {error}')
+                return web.Response(text=error, status=429)
+
+            # Extract event type from payload
+            event_type = payload.get('type')
+            if not event_type:
+                self._add_error('validation', 'Missing event type in payload')
+                return web.Response(text='Missing event type', status=400)
+
+            # Validate event payload
+            if not self._validate_event(event_type, payload):
+                self.stats['total_invalid'] += 1
+                return web.Response(text='Invalid event payload', status=400)
+
+            # Create and queue event
+            event = WebhookEvent(
+                id=str(uuid.uuid4()),
+                event_type=event_type,
+                payload=payload,
+                headers=dict(request.headers),
+                created_at=datetime.now()
+            )
+
+            # Add event to queue
+            await self.add_event(event.id, event.event_type, event.payload, event.headers)
+            self.stats['total_received'] += 1
+
+            return web.Response(status=200)
+
         except Exception as e:
-            logger.error(f"Unhandled error processing webhook: {e}", exc_info=True)
-            return web.Response(text="Internal server error", status=500)
+            logger.error(f"Error processing webhook: {e}", exc_info=True)
+            self._add_error('system', f'Webhook processing error: {e}')
+            return web.Response(text=str(e), status=500)
 
     def register_handler(self, event_type: str, handler: Callable):
         """Register handler for event type"""

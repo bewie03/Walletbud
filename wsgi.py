@@ -61,6 +61,11 @@ async def init_app():
             }
         )
         
+        # Register routes first
+        logger.info("Registering application routes...")
+        app.router.add_get('/health', health_check)
+        app.router.add_post('/webhook', lambda r: bot.handle_webhook(r) if bot else web.Response(status=503))
+        
         # Initialize bot if not already initialized
         if bot is None:
             logger.info("Initializing bot instance...")
@@ -105,6 +110,9 @@ async def init_app():
                     connector=connector,
                     json_serialize=json_dumps
                 )
+                
+                # Initialize bot's background tasks
+                await bot.setup_hook()
                 
                 # Add middleware for error handling
                 @web.middleware
@@ -169,13 +177,11 @@ async def init_app():
                     'errors': []  # Keep last few errors
                 }
                 
+                logger.info("Application initialization complete")
+                
             except Exception as e:
                 logger.error(f"Failed to initialize bot: {e}", exc_info=True)
                 raise
-        
-        # Add routes with error handling
-        app.router.add_get('/health', health_check)
-        app.router.add_post('/webhook', bot.handle_webhook)
         
         # Add cleanup callback
         app.on_cleanup.append(cleanup)
