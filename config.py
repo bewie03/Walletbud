@@ -74,6 +74,38 @@ RATE_LIMITS = {
     }
 }
 
+def validate_webhook_config(config: dict) -> None:
+    """Validate webhook configuration values"""
+    if not isinstance(config.get('MAX_QUEUE_SIZE'), int) or config['MAX_QUEUE_SIZE'] < 1:
+        raise ValueError("MAX_QUEUE_SIZE must be a positive integer")
+        
+    if not isinstance(config.get('BATCH_SIZE'), int) or config['BATCH_SIZE'] < 1:
+        raise ValueError("BATCH_SIZE must be a positive integer")
+        
+    if not isinstance(config.get('MAX_RETRIES'), int) or config['MAX_RETRIES'] < 0:
+        raise ValueError("MAX_RETRIES must be a non-negative integer")
+        
+    if not isinstance(config.get('RETRY_DELAY'), int) or config['RETRY_DELAY'] < 1:
+        raise ValueError("RETRY_DELAY must be a positive integer")
+        
+    if not isinstance(config.get('MAX_EVENT_AGE'), int) or config['MAX_EVENT_AGE'] < 1:
+        raise ValueError("MAX_EVENT_AGE must be a positive integer")
+        
+    if not isinstance(config.get('CLEANUP_INTERVAL'), int) or config['CLEANUP_INTERVAL'] < 1:
+        raise ValueError("CLEANUP_INTERVAL must be a positive integer")
+        
+    if not isinstance(config.get('RATE_LIMIT_WINDOW'), int) or config['RATE_LIMIT_WINDOW'] < 1:
+        raise ValueError("RATE_LIMIT_WINDOW must be a positive integer")
+        
+    if not isinstance(config.get('RATE_LIMIT_MAX_REQUESTS'), int) or config['RATE_LIMIT_MAX_REQUESTS'] < 1:
+        raise ValueError("RATE_LIMIT_MAX_REQUESTS must be a positive integer")
+        
+    if not isinstance(config.get('MAX_PAYLOAD_SIZE'), int) or config['MAX_PAYLOAD_SIZE'] < 1:
+        raise ValueError("MAX_PAYLOAD_SIZE must be a positive integer")
+        
+    if not isinstance(config.get('MAX_MEMORY_MB'), int) or config['MAX_MEMORY_MB'] < 1:
+        raise ValueError("MAX_MEMORY_MB must be a positive integer")
+
 # Webhook configuration
 WEBHOOK_CONFIG = {
     'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '500')),  # Reduced from 1000
@@ -94,20 +126,6 @@ try:
 except ValueError as e:
     logger.error(f"Invalid webhook configuration: {e}")
     raise
-
-# Rate limiting configuration
-RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '60'))  # Window in seconds
-RATE_LIMIT_MAX_REQUESTS = int(os.getenv('RATE_LIMIT_MAX_REQUESTS', '100'))  # Max requests per window
-
-# Wallet monitoring configuration
-WALLET_CHECK_INTERVAL = int(os.getenv('WALLET_CHECK_INTERVAL', '300'))  # Check wallets every 5 minutes
-MIN_ADA_BALANCE = float(os.getenv('MIN_ADA_BALANCE', '5.0'))  # Minimum ADA balance to maintain
-MAX_TX_PER_HOUR = int(os.getenv('MAX_TX_PER_HOUR', '100'))  # Maximum transactions per hour to process
-
-# YUMMI token configuration
-YUMMI_POLICY_ID = os.getenv('YUMMI_POLICY_ID')  # YUMMI token policy ID
-YUMMI_TOKEN_NAME = os.getenv('YUMMI_TOKEN_NAME')  # YUMMI token name
-ASSET_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}" if YUMMI_POLICY_ID and YUMMI_TOKEN_NAME else None
 
 # Blockfrost network configuration
 BLOCKFROST_NETWORKS = {
@@ -701,31 +719,19 @@ BALANCE_CHECK_INTERVAL = 300  # 5 minutes
 YUMMI_WARNING_THRESHOLD = 3   # Number of warnings before reset
 MINIMUM_YUMMI = 1000         # Minimum YUMMI tokens required
 
-def validate_webhook_config(config: dict) -> None:
-    """Validate webhook configuration values"""
-    if not isinstance(config.get('MAX_QUEUE_SIZE'), int) or config['MAX_QUEUE_SIZE'] < 1:
-        raise ValueError("WEBHOOK_MAX_QUEUE_SIZE must be a positive integer")
-    
-    if not isinstance(config.get('BATCH_SIZE'), int) or config['BATCH_SIZE'] < 1:
-        raise ValueError("WEBHOOK_BATCH_SIZE must be a positive integer")
-        
-    if not isinstance(config.get('MAX_RETRIES'), int) or config['MAX_RETRIES'] < 0:
-        raise ValueError("WEBHOOK_MAX_RETRIES must be a non-negative integer")
-        
-    if not isinstance(config.get('RETRY_DELAY'), int) or config['RETRY_DELAY'] < 1:
-        raise ValueError("WEBHOOK_RETRY_DELAY must be a positive integer")
-        
-    if not isinstance(config.get('MAX_EVENT_AGE'), int) or config['MAX_EVENT_AGE'] < 1:
-        raise ValueError("WEBHOOK_MAX_EVENT_AGE must be a positive integer")
-        
-    if not isinstance(config.get('CLEANUP_INTERVAL'), int) or config['CLEANUP_INTERVAL'] < 1:
-        raise ValueError("WEBHOOK_CLEANUP_INTERVAL must be a positive integer")
-        
-    if not isinstance(config.get('RATE_LIMIT_WINDOW'), int) or config['RATE_LIMIT_WINDOW'] < 1:
-        raise ValueError("WEBHOOK_RATE_LIMIT_WINDOW must be a positive integer")
-        
-    if not isinstance(config.get('RATE_LIMIT_MAX_REQUESTS'), int) or config['RATE_LIMIT_MAX_REQUESTS'] < 1:
-        raise ValueError("WEBHOOK_RATE_LIMIT_MAX_REQUESTS must be a positive integer")
+# Rate limiting configuration
+RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '60'))  # Window in seconds
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv('RATE_LIMIT_MAX_REQUESTS', '100'))  # Max requests per window
+
+# Wallet monitoring configuration
+WALLET_CHECK_INTERVAL = int(os.getenv('WALLET_CHECK_INTERVAL', '300'))  # Check wallets every 5 minutes
+MIN_ADA_BALANCE = float(os.getenv('MIN_ADA_BALANCE', '5.0'))  # Minimum ADA balance to maintain
+MAX_TX_PER_HOUR = int(os.getenv('MAX_TX_PER_HOUR', '100'))  # Maximum transactions per hour to process
+
+# YUMMI token configuration
+YUMMI_POLICY_ID = os.getenv('YUMMI_POLICY_ID')  # YUMMI token policy ID
+YUMMI_TOKEN_NAME = os.getenv('YUMMI_TOKEN_NAME')  # YUMMI token name
+ASSET_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}" if YUMMI_POLICY_ID and YUMMI_TOKEN_NAME else None
 
 # Validate entire configuration
 def validate_config():
