@@ -2117,7 +2117,7 @@ async def set_db_version(conn, version: int):
         raise
 
 # Current database version
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 
 # Database migrations
 MIGRATIONS = {
@@ -2138,7 +2138,6 @@ MIGRATIONS = {
             UNIQUE(user_id, address)
         );
         """,
-        
         """
         -- Create notification_settings table
         CREATE TABLE IF NOT EXISTS notification_settings (
@@ -2154,7 +2153,6 @@ MIGRATIONS = {
             failed_transactions BOOLEAN DEFAULT TRUE
         );
         """,
-        
         """
         -- Create transactions table
         CREATE TABLE IF NOT EXISTS transactions (
@@ -2167,7 +2165,6 @@ MIGRATIONS = {
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         ) PARTITION BY RANGE (created_at);
         """,
-        
         """
         -- Create partitions for transactions
         DO $$
@@ -2188,7 +2185,6 @@ MIGRATIONS = {
             END LOOP;
         END $$;
         """,
-        
         """
         -- Create failed_transactions table
         CREATE TABLE IF NOT EXISTS failed_transactions (
@@ -2200,7 +2196,6 @@ MIGRATIONS = {
             created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
         );
         """,
-        
         """
         -- Create asset_history table
         CREATE TABLE IF NOT EXISTS asset_history (
@@ -2216,7 +2211,6 @@ MIGRATIONS = {
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
         """,
-        
         """
         -- Create token_balances table
         CREATE TABLE IF NOT EXISTS token_balances (
@@ -2227,7 +2221,6 @@ MIGRATIONS = {
             last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
         );
         """,
-        
         """
         -- Create delegation_status table
         CREATE TABLE IF NOT EXISTS delegation_status (
@@ -2237,7 +2230,6 @@ MIGRATIONS = {
             last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
         );
         """,
-        
         """
         -- Create processed_rewards table
         CREATE TABLE IF NOT EXISTS processed_rewards (
@@ -2248,7 +2240,6 @@ MIGRATIONS = {
             processed_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
         );
         """,
-        
         """
         -- Create policy_expiry table
         CREATE TABLE IF NOT EXISTS policy_expiry (
@@ -2258,7 +2249,6 @@ MIGRATIONS = {
             last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
         );
         """,
-        
         """
         -- Create dapp_interactions table
         CREATE TABLE IF NOT EXISTS dapp_interactions (
@@ -2268,7 +2258,6 @@ MIGRATIONS = {
             created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()
         );
         """,
-        
         """
         -- Create stake_addresses table
         CREATE TABLE IF NOT EXISTS stake_addresses (
@@ -2277,7 +2266,6 @@ MIGRATIONS = {
             last_checked TIMESTAMP WITHOUT TIME ZONE
         );
         """,
-        
         # Step 2: Create indices for wallets
         """
         CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
@@ -2285,62 +2273,73 @@ MIGRATIONS = {
         CREATE INDEX IF NOT EXISTS idx_wallets_stake_address ON wallets(stake_address);
         CREATE INDEX IF NOT EXISTS idx_wallets_last_updated ON wallets(last_updated DESC);
         """,
-        
         # Step 3: Create indices for notification_settings
         """
         CREATE INDEX IF NOT EXISTS idx_notification_settings_user_id ON notification_settings(user_id);
         """,
-        
         # Step 4: Create indices for transactions (on parent table)
         """
         CREATE INDEX IF NOT EXISTS idx_transactions_wallet_tx ON transactions(wallet_id, tx_hash);
         CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at DESC);
         """,
-        
         # Step 5: Create indices for failed_transactions
         """
         CREATE INDEX IF NOT EXISTS idx_failed_transactions_wallet ON failed_transactions(wallet_id);
         CREATE INDEX IF NOT EXISTS idx_failed_transactions_created ON failed_transactions(created_at DESC);
         """,
-        
         # Step 6: Create indices for asset_history
         """
         CREATE INDEX IF NOT EXISTS idx_asset_history_wallet ON asset_history(wallet_id);
         CREATE INDEX IF NOT EXISTS idx_asset_history_asset ON asset_history(asset_id);
         CREATE INDEX IF NOT EXISTS idx_asset_history_created ON asset_history(created_at DESC);
         """,
-        
         # Token balances indices
         """
         CREATE INDEX IF NOT EXISTS idx_token_balances_address ON token_balances(address);
         CREATE INDEX IF NOT EXISTS idx_token_balances_token ON token_balances(token_id);
         """,
-        
         # Delegation status indices
         """
         CREATE INDEX IF NOT EXISTS idx_delegation_status_address ON delegation_status(address);
         """,
-        
         # Processed rewards indices
         """
         CREATE INDEX IF NOT EXISTS idx_processed_rewards_stake_address ON processed_rewards(stake_address);
         CREATE INDEX IF NOT EXISTS idx_processed_rewards_epoch ON processed_rewards(epoch);
         """,
-        
         # Policy expiry indices
         """
         CREATE INDEX IF NOT EXISTS idx_policy_expiry_policy_id ON policy_expiry(policy_id);
         """,
-        
         # DApp interactions indices
         """
         CREATE INDEX IF NOT EXISTS idx_dapp_interactions_address ON dapp_interactions(address);
         """,
-        
         # Stake addresses indices
         """
         CREATE INDEX IF NOT EXISTS idx_stake_addresses_stake_address ON stake_addresses(stake_address);
         """,
+    ],
+    # Version 2: Ensure stake_address column exists
+    2: [
+        """
+        DO $$
+        BEGIN
+            -- Check if stake_address column exists
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = 'wallets'
+                AND column_name = 'stake_address'
+            ) THEN
+                -- Add stake_address column if it doesn't exist
+                ALTER TABLE wallets ADD COLUMN stake_address TEXT;
+                
+                -- Log the change
+                RAISE NOTICE 'Added stake_address column to wallets table';
+            END IF;
+        END $$;
+        """
     ]
 }
 

@@ -497,11 +497,13 @@ class WalletBudBot(commands.Bot):
             if self.session:
                 await self.session.close()
                 self.session = None
-                logger.info("Session closed successfully")
+                
             if self.connector:
                 await self.connector.close()
                 self.connector = None
-                logger.info("Connector closed successfully")
+                
+            logger.info("HTTP session closed")
+            
         except Exception as e:
             logger.error(f"Error closing session: {e}")
             
