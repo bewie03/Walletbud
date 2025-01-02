@@ -288,8 +288,9 @@ class WalletBudBot(commands.Bot):
         self.interaction_timeouts = {}
         self.webhook_retries = {}
         
-        # Initialize YUMMI check task (every 6 hours)
+        # Create tasks (but don't start them yet)
         self.check_yummi_balances = tasks.loop(hours=6)(self._check_yummi_balances)
+        self.health_check_task = tasks.loop(minutes=5)(self.monitor_health)
         
         # Initialize SSL context with certificate verification enabled
         self.ssl_context = init_ssl_context()
@@ -306,8 +307,6 @@ class WalletBudBot(commands.Bot):
         self.webhook_rate_limits = {}
         
         # Initialize health check task
-        self.health_check_task = tasks.loop(minutes=5)(self.monitor_health)
-        # Task will be started in setup_hook
         self.health_lock = asyncio.Lock()
         
         # Initialize Discord rate limiting
@@ -459,8 +458,8 @@ class WalletBudBot(commands.Bot):
     async def setup_hook(self):
         """Set up the bot's background tasks and signal handlers"""
         try:
-            # Initialize database pool
-            await self.init_database()
+            # Initialize database
+            await init_db()
             
             # Initialize Blockfrost client
             await self.init_blockfrost()
@@ -479,17 +478,15 @@ class WalletBudBot(commands.Bot):
                 raise
             
             # Start background tasks
-            self.health_check_task.start()
             self.check_yummi_balances.start()
+            self.health_check_task.start()
             
-            # Start webhook server
-            await self.start_webhook()
+            # Set start time
+            self.health_metrics['start_time'] = datetime.utcnow()
             
-            # Set up signal handlers
-            loop = asyncio.get_running_loop()
-            self.shutdown_manager.setup_signal_handlers(loop)
-            
+            # Log successful setup
             logger.info("Bot setup completed successfully")
+            
         except Exception as e:
             logger.error(f"Error in setup_hook: {e}")
             raise
