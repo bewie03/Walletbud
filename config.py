@@ -621,14 +621,19 @@ RATE_LIMIT_COOLDOWN = int(os.getenv('RATE_LIMIT_COOLDOWN', '60'))
 HEALTH_METRICS_TTL = int(os.getenv('HEALTH_METRICS_TTL', '300'))  # 5 minutes
 
 # Database configuration
+MAX_RETRIES = int(os.getenv('DB_MAX_RETRIES', '3'))  # Maximum number of retries
+RETRY_DELAY_BASE = int(os.getenv('DB_RETRY_DELAY_BASE', '2'))  # Base for exponential backoff
+
 DB_CONFIG = {
-    'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '3')),
+    'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '2')),
     'MAX_POOL_SIZE': int(os.getenv('DB_MAX_POOL_SIZE', '10')),
-    'COMMAND_TIMEOUT': float(os.getenv('DB_COMMAND_TIMEOUT', '60.0')),
-    'CONNECTION_TIMEOUT': float(os.getenv('DB_CONNECTION_TIMEOUT', '30.0')),
-    'MAX_QUERIES': int(os.getenv('DB_MAX_QUERIES', '50000')),
-    'MAX_CACHED_STATEMENT_LIFETIME': int(os.getenv('DB_MAX_CACHED_STATEMENT_LIFETIME', '300')),
-    'MAX_CACHEABLE_STATEMENT_SIZE': int(os.getenv('DB_MAX_CACHEABLE_STATEMENT_SIZE', '10240')),
+    'MAX_INACTIVE_CONNECTION_LIFETIME': int(os.getenv('DB_MAX_INACTIVE_CONNECTION_LIFETIME', '300')),  # 5 minutes
+    'COMMAND_TIMEOUT': int(os.getenv('DB_COMMAND_TIMEOUT', '60')),  # 1 minute
+    'POOL_RECYCLE_INTERVAL': int(os.getenv('DB_POOL_RECYCLE_INTERVAL', '3600')),  # 1 hour
+    'MAX_QUERIES_PER_POOL': int(os.getenv('DB_MAX_QUERIES_PER_POOL', '50000')),  # Reset pool after 50k queries
+    'MAX_POOL_AGE': int(os.getenv('DB_MAX_POOL_AGE', '86400')),  # 24 hours
+    'RETRY_ATTEMPTS': int(os.getenv('DB_RETRY_ATTEMPTS', '3')),
+    'RETRY_DELAY': int(os.getenv('DB_RETRY_DELAY', '1')),  # 1 second
 }
 
 DATABASE_POOL_MIN_SIZE = 10
@@ -679,21 +684,6 @@ ASSET_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}" if YUMMI_POLICY_ID and YUMMI_T
 
 # SSL configuration
 SSL_CERT_FILE = certifi.where()
-
-# Database configuration
-DB_CONFIG = {
-    'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '2')),
-    'MAX_POOL_SIZE': int(os.getenv('DB_MAX_POOL_SIZE', '10')),
-    'MAX_INACTIVE_CONNECTION_LIFETIME': int(os.getenv('DB_MAX_INACTIVE_CONNECTION_LIFETIME', '300')),  # 5 minutes
-    'COMMAND_TIMEOUT': int(os.getenv('DB_COMMAND_TIMEOUT', '60')),  # 1 minute
-    'POOL_RECYCLE_INTERVAL': int(os.getenv('DB_POOL_RECYCLE_INTERVAL', '3600')),  # 1 hour
-    'MAX_QUERIES_PER_POOL': int(os.getenv('DB_MAX_QUERIES_PER_POOL', '50000')),  # Reset pool after 50k queries
-    'MAX_POOL_AGE': int(os.getenv('DB_MAX_POOL_AGE', '86400')),  # 24 hours
-    'RETRY_ATTEMPTS': int(os.getenv('DB_RETRY_ATTEMPTS', '3')),
-    'RETRY_DELAY': int(os.getenv('DB_RETRY_DELAY', '1')),  # 1 second
-    'MAX_RETRIES': int(os.getenv('DB_MAX_RETRIES', '3')),  # Maximum number of retries
-    'RETRY_DELAY_BASE': int(os.getenv('DB_RETRY_DELAY_BASE', '2')),  # Base for exponential backoff
-}
 
 # Blockfrost network configuration
 BLOCKFROST_NETWORKS = {
