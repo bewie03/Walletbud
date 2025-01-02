@@ -31,22 +31,30 @@ logger.info("Webhook route added")
 async def start_bot(app):
     """Start the bot when the app starts"""
     try:
-        logger.info("Starting bot...")
+        logger.info("Starting bot in startup handler...")
+        logger.info("Calling bot.start() with Discord token...")
         await bot.start(DISCORD_TOKEN)
-        logger.info("Bot started successfully")
+        logger.info("Bot started successfully in startup handler")
     except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
+        logger.error(f"Failed to start bot in startup handler: {str(e)}")
+        logger.error(f"Error type: {type(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
         raise
 
 # Cleanup on shutdown
 async def cleanup(app):
     """Clean up when the app shuts down"""
     try:
-        logger.info("Shutting down bot...")
+        logger.info("Starting cleanup in shutdown handler...")
         await bot.close()
-        logger.info("Bot shutdown complete")
+        logger.info("Bot shutdown complete in cleanup handler")
     except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
+        logger.error(f"Error during shutdown in cleanup handler: {str(e)}")
+        logger.error(f"Error type: {type(e)}")
+        if hasattr(e, '__dict__'):
+            logger.error(f"Error details: {e.__dict__}")
+        raise
 
 # Register startup and shutdown handlers
 logger.info("Registering startup and shutdown handlers...")

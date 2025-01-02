@@ -55,29 +55,19 @@ class DatabaseMaintenance:
         """Start the periodic maintenance task"""
         while True:
             try:
-                # Run maintenance at configured time
-                now = datetime.now()
-                next_run = now.replace(
-                    hour=MAINTENANCE_HOUR,
-                    minute=MAINTENANCE_MINUTE,
-                    second=0,
-                    microsecond=0
-                )
-                if now >= next_run:
-                    next_run = next_run + timedelta(days=1)
+                # Get current hour in UTC
+                current_hour = datetime.utcnow().hour
                 
-                # Sleep until next maintenance window
-                sleep_seconds = (next_run - now).total_seconds()
-                logger.info(
-                    f"Next maintenance scheduled at {next_run.strftime('%Y-%m-%d %H:%M:%S')} "
-                    f"(in {sleep_seconds/3600:.1f} hours)"
-                )
-                await asyncio.sleep(sleep_seconds)
-                
-                # Run maintenance
-                async with await self._ensure_lock():
+                # Only run maintenance between 2 AM and 4 AM UTC (low activity period)
+                if 2 <= current_hour <= 4:
+                    logger.info("Starting scheduled maintenance during low-activity period")
                     await self.run_maintenance()
-                
+                    # Sleep for 6 hours after maintenance
+                    await asyncio.sleep(6 * 3600)
+                else:
+                    # Check again in an hour
+                    await asyncio.sleep(3600)
+                    
             except Exception as e:
                 logger.error(f"Error in maintenance task: {str(e)}")
                 if hasattr(e, '__dict__'):

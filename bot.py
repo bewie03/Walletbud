@@ -119,48 +119,51 @@ logger = logging.getLogger(__name__)
 
 class RateLimiter:
     """Rate limiter with burst support and per-endpoint tracking"""
-    
     def __init__(self, max_requests: int, burst_limit: int, cooldown_seconds: int):
         self.max_requests = max_requests
         self.burst_limit = burst_limit
         self.cooldown_seconds = cooldown_seconds
-        self.endpoints = defaultdict(lambda: {
-            'tokens': self.max_requests,
-            'last_update': time.time(),
-            'lock': asyncio.Lock()
-        })
+        self._endpoints = {}
         logger.info(f"Initialized RateLimiter with: max_requests={max_requests}, burst_limit={burst_limit}, cooldown_seconds={cooldown_seconds}")
-
+    
+    async def _get_endpoint(self, endpoint: str):
+        """Get or create endpoint rate limit state"""
+        if endpoint not in self._endpoints:
+            self._endpoints[endpoint] = {
+                'tokens': self.max_requests,
+                'last_update': time.time(),
+                'lock': asyncio.Lock()
+            }
+        return self._endpoints[endpoint]
+    
     async def acquire(self, endpoint: str):
         """Acquire a rate limit token for the specified endpoint"""
-        async with self.endpoints[endpoint]['lock']:
-            # Refresh tokens if cooldown has passed
+        ep = await self._get_endpoint(endpoint)
+        async with ep['lock']:
             current_time = time.time()
-            time_passed = current_time - self.endpoints[endpoint]['last_update']
+            time_passed = current_time - ep['last_update']
             
-            if time_passed >= self.cooldown_seconds:
-                self.endpoints[endpoint]['tokens'] = self.max_requests
-                self.endpoints[endpoint]['last_update'] = current_time
+            # Replenish tokens based on time passed
+            tokens_to_add = time_passed * (self.max_requests / self.cooldown_seconds)
+            ep['tokens'] = min(ep['tokens'] + tokens_to_add, self.burst_limit)
+            ep['last_update'] = current_time
             
-            # Wait if no tokens available
-            while self.endpoints[endpoint]['tokens'] <= 0:
+            # Wait for token if needed
+            while ep['tokens'] < 1:
                 await asyncio.sleep(0.1)
-                
-                # Refresh tokens if cooldown has passed
                 current_time = time.time()
-                time_passed = current_time - self.endpoints[endpoint]['last_update']
-                
-                if time_passed >= self.cooldown_seconds:
-                    self.endpoints[endpoint]['tokens'] = self.max_requests
-                    self.endpoints[endpoint]['last_update'] = current_time
+                time_passed = current_time - ep['last_update']
+                tokens_to_add = time_passed * (self.max_requests / self.cooldown_seconds)
+                ep['tokens'] = min(ep['tokens'] + tokens_to_add, self.burst_limit)
+                ep['last_update'] = current_time
             
-            # Consume a token
-            self.endpoints[endpoint]['tokens'] -= 1
-
-    def release(self, endpoint: str):
+            ep['tokens'] -= 1
+    
+    async def release(self, endpoint: str):
         """Release a rate limit token back to the specified endpoint"""
-        if self.endpoints[endpoint]['tokens'] < self.burst_limit:
-            self.endpoints[endpoint]['tokens'] += 1
+        ep = await self._get_endpoint(endpoint)
+        async with ep['lock']:
+            ep['tokens'] = min(ep['tokens'] + 1, self.burst_limit)
 
 class WalletBudBot(commands.Bot):
     """WalletBud Discord bot"""
@@ -280,7 +283,7 @@ class WalletBudBot(commands.Bot):
         
         # Initialize monitoring state
         self.monitoring_paused = False
-        self.yummi_check_lock = asyncio.Lock()
+        self._yummi_check_lock = None
         self.processing_yummi = False
         
         # Pre-compile DApp metadata patterns
@@ -293,7 +296,7 @@ class WalletBudBot(commands.Bot):
         
         # Initialize interaction rate limiting
         self.interaction_cooldowns = {}
-        self.interaction_lock = asyncio.Lock()
+        self._interaction_lock = None
         self.active_interactions = {}
         self.interaction_timeouts = {}
         self.webhook_retries = {}
@@ -316,16 +319,41 @@ class WalletBudBot(commands.Bot):
         self.webhook_rate_limits = {}
         
         # Initialize Discord rate limiting
-        self.dm_rate_limits = defaultdict(lambda: {
-            'tokens': 5,  # 5 messages per 5 seconds per user
-            'last_update': time.time(),
-            'lock': asyncio.Lock()
-        })
-        self.global_dm_limit = {
+        self._dm_rate_limits = {}
+        self._global_dm_limit = {
             'tokens': 2,  # 2 messages per second globally
             'last_update': time.time(),
-            'lock': asyncio.Lock()
+            'lock': None
         }
+        logger.info("Rate limiting initialized")
+
+    async def _ensure_interaction_lock(self):
+        """Ensure interaction lock is created"""
+        if self._interaction_lock is None:
+            self._interaction_lock = asyncio.Lock()
+        return self._interaction_lock
+
+    async def _ensure_yummi_check_lock(self):
+        """Ensure yummi check lock is created"""
+        if self._yummi_check_lock is None:
+            self._yummi_check_lock = asyncio.Lock()
+        return self._yummi_check_lock
+
+    async def _get_dm_rate_limit(self, user_id: int):
+        """Get or create rate limit for user"""
+        if user_id not in self._dm_rate_limits:
+            self._dm_rate_limits[user_id] = {
+                'tokens': 5,  # 5 messages per 5 seconds per user
+                'last_update': time.time(),
+                'lock': asyncio.Lock()
+            }
+        return self._dm_rate_limits[user_id]
+
+    async def _ensure_global_dm_lock(self):
+        """Ensure global DM lock is created"""
+        if self._global_dm_limit['lock'] is None:
+            self._global_dm_limit['lock'] = asyncio.Lock()
+        return self._global_dm_limit['lock']
 
     def register_cleanup_handlers(self):
         """Register all cleanup handlers for graceful shutdown"""
@@ -468,43 +496,67 @@ class WalletBudBot(commands.Bot):
             
             # Initialize database
             logger.info("Initializing database...")
-            await init_db()
-            logger.info("Database initialized")
+            try:
+                await init_db()
+                logger.info("Database initialized successfully")
+            except Exception as e:
+                logger.error(f"Database initialization failed: {str(e)}")
+                raise
             
             # Initialize Blockfrost client
             logger.info("Initializing Blockfrost client...")
-            await self.init_blockfrost()
-            logger.info("Blockfrost client initialized")
+            try:
+                await self.init_blockfrost()
+                logger.info("Blockfrost client initialized successfully")
+            except Exception as e:
+                logger.error(f"Blockfrost initialization failed: {str(e)}")
+                raise
             
             # Load cogs
             logger.info("Loading cogs...")
-            await self.load_extension("cogs.system_commands")
-            await self.load_extension("cogs.wallet_commands")
-            logger.info("Loaded all cogs")
+            try:
+                await self.load_extension("cogs.system_commands")
+                logger.info("Loaded system_commands cog")
+                await self.load_extension("cogs.wallet_commands")
+                logger.info("Loaded wallet_commands cog")
+                logger.info("All cogs loaded successfully")
+            except Exception as e:
+                logger.error(f"Failed to load cogs: {str(e)}")
+                raise
             
             # Sync command tree with Discord
             try:
-                logger.info("Syncing command tree...")
+                logger.info("Starting command tree sync...")
                 await self.tree.sync()
-                logger.info("Synced command tree with Discord")
+                logger.info("Command tree synced successfully")
             except Exception as e:
-                logger.error(f"Failed to sync command tree: {e}")
+                logger.error(f"Failed to sync command tree: {str(e)}")
+                logger.error(f"Error type: {type(e)}")
+                if hasattr(e, '__dict__'):
+                    logger.error(f"Error details: {e.__dict__}")
                 raise
             
             # Start background tasks
             logger.info("Starting background tasks...")
-            self.check_yummi_balances.start()
-            self.health_check_task.start()
-            logger.info("Background tasks started")
+            try:
+                self.check_yummi_balances.start()
+                logger.info("Started yummi balance check task")
+                self.health_check_task.start()
+                logger.info("Started health check task")
+                logger.info("All background tasks started successfully")
+            except Exception as e:
+                logger.error(f"Failed to start background tasks: {str(e)}")
+                raise
             
             # Set start time
             self.health_metrics['start_time'] = datetime.utcnow()
-            
-            # Log successful setup
             logger.info("Bot setup completed successfully")
             
         except Exception as e:
-            logger.error(f"Error in setup_hook: {e}")
+            logger.error(f"Error in setup_hook: {str(e)}")
+            logger.error(f"Error type: {type(e)}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
             raise
             
     async def on_error(self, event_method: str, *args, **kwargs):
@@ -532,108 +584,71 @@ class WalletBudBot(commands.Bot):
         interaction_id = str(interaction.id)
         
         try:
-            # Check if interaction is already being processed
-            if interaction_id in self.active_interactions:
-                logger.warning(f"Duplicate interaction received: {interaction_id}")
-                return
-                
-            # Add to active interactions
-            self.active_interactions[interaction_id] = True
-            
-            try:
-                # Defer response immediately to prevent timeout
-                await interaction.response.defer(ephemeral=ephemeral)
-                
-                # Get command name
-                command_name = interaction.command.name if interaction.command else "unknown"
-                
-                # Check cooldown
-                if not await self._check_command_cooldown(interaction.user.id, command_name):
-                    await interaction.followup.send(
-                        "Please wait before using this command again.",
-                        ephemeral=True
-                    )
+            # Lock to prevent concurrent processing of same interaction
+            async with await self._ensure_interaction_lock():
+                # Check if interaction is already being processed
+                if interaction_id in self.active_interactions:
+                    logger.warning(f"Interaction {interaction_id} is already being processed")
                     return
-                    
-                # Get command handler
-                handler = self._get_command_handler(command_name)
-                if not handler:
-                    logger.error(f"No handler found for command: {command_name}")
-                    await interaction.followup.send(
-                        "This command is not currently available.",
-                        ephemeral=True
-                    )
-                    return
-                    
-                # Execute command with timeout
+                
+                # Mark interaction as active
+                self.active_interactions[interaction_id] = {
+                    'start_time': time.time(),
+                    'status': 'processing'
+                }
+                
                 try:
-                    async with asyncio.timeout(30):  # 30 second timeout
-                        await handler(interaction)
-                        
-                except asyncio.TimeoutError:
-                    logger.error(f"Command timed out: {command_name}")
-                    await interaction.followup.send(
-                        "The command took too long to process. Please try again.",
-                        ephemeral=True
-                    )
+                    # Defer response immediately to prevent timeout
+                    await interaction.response.defer(ephemeral=ephemeral)
                     
-            except discord.errors.InteractionResponded:
-                logger.debug(f"Interaction {interaction_id} already responded to")
-                
-            except discord.errors.HTTPException as e:
-                logger.error(f"Discord HTTP error: {e}")
-                await self._handle_discord_error(interaction, e)
-                
-            except Exception as e:
-                logger.error(f"Error processing command {command_name}: {e}")
-                await self._handle_command_error(interaction, e)
-                
+                    # Get command name
+                    command_name = interaction.command.name if interaction.command else "unknown"
+                    
+                    # Check cooldown
+                    if not await self._check_command_cooldown(interaction.user.id, command_name):
+                        await interaction.followup.send(
+                            "Please wait before using this command again.",
+                            ephemeral=True
+                        )
+                        return
+                        
+                    # Get command handler
+                    handler = self._get_command_handler(command_name)
+                    if not handler:
+                        logger.error(f"No handler found for command: {command_name}")
+                        await interaction.followup.send(
+                            "This command is not currently available.",
+                            ephemeral=True
+                        )
+                        return
+                        
+                    # Execute command with timeout
+                    try:
+                        async with asyncio.timeout(30):  # 30 second timeout
+                            await handler(interaction)
+                            
+                    except asyncio.TimeoutError:
+                        logger.error(f"Command timed out: {command_name}")
+                        await interaction.followup.send(
+                            "The command took too long to process. Please try again.",
+                            ephemeral=True
+                        )
+                        
+                except discord.errors.InteractionResponded:
+                    logger.debug(f"Interaction {interaction_id} already responded to")
+                    
+                except discord.errors.HTTPException as e:
+                    logger.error(f"Discord HTTP error: {e}")
+                    await self._handle_discord_error(interaction, e)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing command {command_name}: {e}")
+                    await self._handle_command_error(interaction, e)
+                    
         finally:
             # Clean up
             self.active_interactions.pop(interaction_id, None)
             
-    async def _check_command_cooldown(self, user_id: int, command: str) -> bool:
-        """Check if user is on cooldown for command"""
-        async with self.interaction_lock:
-            now = time.time()
-            key = f"{user_id}:{command}"
-            
-            # Clean up old cooldowns
-            self._cleanup_cooldowns()
-            
-            # Check if on cooldown
-            if key in self.interaction_cooldowns:
-                last_use = self.interaction_cooldowns[key]
-                if now - last_use < COMMAND_COOLDOWN:
-                    return False
-                    
-            # Update cooldown
-            self.interaction_cooldowns[key] = now
-            return True
-            
-    def _cleanup_cooldowns(self):
-        """Clean up expired cooldowns"""
-        now = time.time()
-        expired = [
-            k for k, v in self.interaction_cooldowns.items()
-            if now - v >= COMMAND_COOLDOWN
-        ]
-        for k in expired:
-            del self.interaction_cooldowns[k]
-            
-    def _get_command_handler(self, command_name: str):
-        """Get the appropriate command handler function"""
-        handlers = {
-            'balance': self._handle_balance_command,
-            'stake': self._handle_stake_command,
-            'rewards': self._handle_rewards_command,
-            'transactions': self._handle_transactions_command,
-            'settings': self._handle_settings_command,
-            'help': self._handle_help_command,
-            'health': self.health
-        }
-        return handlers.get(command_name)
-
     async def safe_send(self, interaction: discord.Interaction, content: str, *, ephemeral: bool = True) -> bool:
         """Safely send a message through interaction, handling rate limits and errors"""
         interaction_id = str(interaction.id)
@@ -692,44 +707,44 @@ class WalletBudBot(commands.Bot):
         """Send a direct message to a user with rate limiting"""
         try:
             # Check global rate limit
-            async with self.global_dm_limit['lock']:
+            async with await self._ensure_global_dm_lock():
                 current_time = time.time()
-                time_passed = current_time - self.global_dm_limit['last_update']
+                time_passed = current_time - self._global_dm_limit['last_update']
                 
                 if time_passed >= 1:  # 1 second cooldown
-                    self.global_dm_limit['tokens'] = 2
-                    self.global_dm_limit['last_update'] = current_time
+                    self._global_dm_limit['tokens'] = 2
+                    self._global_dm_limit['last_update'] = current_time
                 
-                while self.global_dm_limit['tokens'] <= 0:
+                while self._global_dm_limit['tokens'] <= 0:
                     await asyncio.sleep(0.1)
                     current_time = time.time()
-                    time_passed = current_time - self.global_dm_limit['last_update']
+                    time_passed = current_time - self._global_dm_limit['last_update']
                     
                     if time_passed >= 1:
-                        self.global_dm_limit['tokens'] = 2
-                        self.global_dm_limit['last_update'] = current_time
+                        self._global_dm_limit['tokens'] = 2
+                        self._global_dm_limit['last_update'] = current_time
                 
-                self.global_dm_limit['tokens'] -= 1
+                self._global_dm_limit['tokens'] -= 1
             
             # Check per-user rate limit
-            async with self.dm_rate_limits[user_id]['lock']:
+            async with (await self._get_dm_rate_limit(user_id))['lock']:
                 current_time = time.time()
-                time_passed = current_time - self.dm_rate_limits[user_id]['last_update']
+                time_passed = (await self._get_dm_rate_limit(user_id))['last_update'] - current_time
                 
                 if time_passed >= 5:  # 5 second cooldown
-                    self.dm_rate_limits[user_id]['tokens'] = 5
-                    self.dm_rate_limits[user_id]['last_update'] = current_time
+                    (await self._get_dm_rate_limit(user_id))['tokens'] = 5
+                    (await self._get_dm_rate_limit(user_id))['last_update'] = current_time
                 
-                while self.dm_rate_limits[user_id]['tokens'] <= 0:
+                while (await self._get_dm_rate_limit(user_id))['tokens'] <= 0:
                     await asyncio.sleep(0.1)
                     current_time = time.time()
-                    time_passed = current_time - self.dm_rate_limits[user_id]['last_update']
+                    time_passed = (await self._get_dm_rate_limit(user_id))['last_update'] - current_time
                     
                     if time_passed >= 5:
-                        self.dm_rate_limits[user_id]['tokens'] = 5
-                        self.dm_rate_limits[user_id]['last_update'] = current_time
+                        (await self._get_dm_rate_limit(user_id))['tokens'] = 5
+                        (await self._get_dm_rate_limit(user_id))['last_update'] = current_time
                 
-                self.dm_rate_limits[user_id]['tokens'] -= 1
+                (await self._get_dm_rate_limit(user_id))['tokens'] -= 1
             
             # Send the DM
             user = await self.fetch_user(user_id)
@@ -744,7 +759,7 @@ class WalletBudBot(commands.Bot):
     async def health_check(self) -> Dict[str, Any]:
         """Comprehensive health check of all system components"""
         try:
-            async with self.health_lock:
+            async with await self._ensure_interaction_lock():
                 # Check Discord connection
                 if not self.is_ready():
                     logger.warning("Bot is not connected to Discord")
@@ -1373,7 +1388,7 @@ class WalletBudBot(commands.Bot):
     async def _check_yummi_balances(self):
         """Check YUMMI token balances for all wallets"""
         try:
-            async with self.yummi_check_lock:
+            async with await self._ensure_yummi_check_lock():
                 if self.processing_yummi:
                     logger.info("YUMMI balance check already in progress")
                     return
