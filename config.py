@@ -10,6 +10,13 @@ from ipaddress import ip_network
 import json
 from dotenv import load_dotenv
 
+# Initialize logger first
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('walletbud.config')
+
 # Load environment variables
 load_dotenv()
 
@@ -185,16 +192,11 @@ def validate_blockfrost_webhook_secret(value: str, name: str) -> str:
     if not value:
         raise ValueError(f"{name} cannot be empty")
         
-    if len(value) < 32:
-        raise ValueError(f"{name} must be at least 32 characters long")
+    # Validate UUID v4 format
+    uuid_pattern = r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    if not re.match(uuid_pattern, value.lower()):
+        raise ValueError(f"{name} must be a valid UUID v4")
         
-    # Check for common patterns that might indicate a test/default value
-    common_patterns = ['test', 'secret', '1234', 'abcd', 'webhook']
-    if any(pattern in value.lower() for pattern in common_patterns):
-        raise ValueError(f"{name} appears to be a test value")
-        
-    # Log validation success but not the actual secret
-    logger.info(f"Successfully validated {name}")
     return value
 
 def validate_ip_ranges(value: str, name: str) -> list:
@@ -700,15 +702,44 @@ YUMMI_TOKEN_NAME = os.getenv('YUMMI_TOKEN_NAME')  # YUMMI token name
 ASSET_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}" if YUMMI_POLICY_ID and YUMMI_TOKEN_NAME else None
 
 # Webhook configuration with validation
+WEBHOOK_SECURITY = {
+    'MAX_REQUEST_SIZE': 1024 * 1024,  # 1MB limit
+    'ALLOWED_IPS': [
+        '52.19.143.237',  # Blockfrost IP 1
+        '52.19.140.219',  # Blockfrost IP 2
+        '52.19.250.245'   # Blockfrost IP 3
+    ],
+    'MEMORY_THRESHOLDS': {
+        'warning': 75,    # 75% of memory limit
+        'critical': 90    # 90% of memory limit
+    },
+    'RATE_LIMITS': {
+        'global': {
+            'requests_per_second': 10,
+            'burst': 20
+        },
+        'per_ip': {
+            'requests_per_second': 5,
+            'burst': 10
+        }
+    },
+    'CORS': {
+        'allowed_origins': ['https://blockfrost.io'],
+        'allowed_methods': ['POST'],
+        'allowed_headers': ['Content-Type', 'Blockfrost-Signature'],
+        'max_age': 3600
+    }
+}
+
 WEBHOOK_CONFIG = {
     'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '500')),
     'BATCH_SIZE': int(os.getenv('WEBHOOK_BATCH_SIZE', '10')),
     'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
     'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '3600')),
     'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),
-    'MAX_PAYLOAD_SIZE': int(os.getenv('WEBHOOK_MAX_PAYLOAD_SIZE', '100000')),
-    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '60')),
-    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '100')),
+    'MAX_PAYLOAD_SIZE': int(os.getenv('WEBHOOK_MAX_PAYLOAD_SIZE', '1048576')),  # 1MB
+    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '1')),      # 1 second window
+    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '10')), # 10 req/sec
     'MEMORY_LIMIT_MB': int(os.getenv('WEBHOOK_MEMORY_LIMIT_MB', '100')),
     'IDENTIFIER': os.getenv('WEBHOOK_IDENTIFIER', 'WalletBud')
 }
@@ -767,14 +798,6 @@ database_url = os.getenv('DATABASE_URL')
 if database_url and database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
     os.environ['DATABASE_URL'] = database_url
-
-# Set up logging
-log_level = os.getenv('LOG_LEVEL', 'DEBUG').upper()
-logging.basicConfig(
-    level=getattr(logging, log_level, logging.DEBUG),
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 # Database configuration
 DB_CONFIG = {

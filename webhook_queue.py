@@ -19,7 +19,8 @@ import sys
 
 from config import (
     WEBHOOK_CONFIG,
-    WEBHOOK_SECRETS
+    WEBHOOK_SECRETS,
+    WEBHOOK_SECURITY
 )
 
 # Get port from Heroku environment, default to 8080 for local development
@@ -111,116 +112,73 @@ class WebhookEvent:
             error=data.get('error')
         )
 
-class RateLimiter:
-    """Rate limiter for webhook requests with burst support"""
+class IPRateLimiter:
+    """Rate limiter with token bucket algorithm per IP"""
     
-    def __init__(self, window: int = 60, max_requests: int = 100):
-        self.window = window
-        self.max_requests = max_requests
-        self._requests: Dict[str, List[datetime]] = {}
+    def __init__(self, requests_per_second: int, burst: int):
+        self.rate = requests_per_second
+        self.burst = burst
+        self.buckets: Dict[str, Dict[str, float]] = {}
         self.lock = asyncio.Lock()
-        self.last_cleanup = datetime.now()
-        self._total_memory = 0  # Track memory usage
         
     async def is_allowed(self, ip: str) -> bool:
-        """Check if request is allowed for IP with burst handling"""
+        """Check if request is allowed using token bucket algorithm"""
         async with self.lock:
-            now = datetime.now()
+            now = time.time()
             
-            # Clean up old entries if needed
-            await self.cleanup()
+            if ip not in self.buckets:
+                self.buckets[ip] = {
+                    'tokens': self.burst,
+                    'last_update': now
+                }
             
-            # Get or initialize request history
-            if ip not in self._requests:
-                self._requests[ip] = []
+            bucket = self.buckets[ip]
+            time_passed = now - bucket['last_update']
+            bucket['tokens'] = min(
+                self.burst,
+                bucket['tokens'] + time_passed * self.rate
+            )
+            
+            if bucket['tokens'] < 1:
+                return False
                 
-            # Remove requests outside window
-            window_start = now - timedelta(seconds=self.window)
-            self._requests[ip] = [
-                ts for ts in self._requests[ip]
-                if ts > window_start
+            bucket['tokens'] -= 1
+            bucket['last_update'] = now
+            return True
+            
+    async def cleanup(self):
+        """Remove old bucket entries"""
+        async with self.lock:
+            now = time.time()
+            expired = [
+                ip for ip, bucket in self.buckets.items()
+                if now - bucket['last_update'] > 3600  # 1 hour
             ]
-            
-            # Check if under limit
-            if len(self._requests[ip]) < self.max_requests:
-                self._requests[ip].append(now)
-                return True
-                
-            return False
-            
-    async def cleanup(self, force: bool = False) -> None:
-        """Remove old rate limit data"""
-        now = datetime.now()
-        
-        # Only clean up every minute unless forced
-        if not force and (now - self.last_cleanup).total_seconds() < 60:
-            return
-            
-        self.last_cleanup = now
-        window_start = now - timedelta(seconds=self.window)
-        
-        # Remove old timestamps and empty IPs
-        async with self.lock:
-            for ip in list(self._requests.keys()):
-                self._requests[ip] = [
-                    ts for ts in self._requests[ip]
-                    if ts > window_start
-                ]
-                if not self._requests[ip]:
-                    del self._requests[ip]
-                    
-            # Update memory usage estimate
-            self._update_memory_usage()
-            
-    def _update_memory_usage(self) -> None:
-        """Update memory usage estimate"""
-        try:
-            # Rough estimate: 
-            # - Each IP is ~32 bytes
-            # - Each timestamp is ~24 bytes
-            # - Dict overhead ~48 bytes per entry
-            memory = 0
-            for ip, timestamps in self._requests.items():
-                memory += 32  # IP string
-                memory += 24 * len(timestamps)  # Timestamps
-                memory += 48  # Dict entry overhead
-                
-            self._total_memory = memory
-            
-            # Log warning if memory usage is high
-            memory_mb = memory / (1024 * 1024)
-            if memory_mb > 100:  # Warning at 100MB
-                logger.warning(f"Rate limiter memory usage high: {memory_mb:.2f}MB")
-                
-        except Exception as e:
-            logger.error(f"Error updating memory usage: {e}")
-            
+            for ip in expired:
+                del self.buckets[ip]
+
 class WebhookQueue:
     """Queue for processing webhooks with rate limiting and retries"""
     
     def __init__(self, secret: str = None, max_queue_size: int = None,
-                 batch_size: int = None, max_retries: int = None, 
-                 max_event_age: int = None, cleanup_interval: int = None):
-        """Initialize webhook queue
-        
-        Args:
-            secret: Webhook auth token for signature validation
-            max_queue_size: Maximum size of the queue
-            batch_size: Number of events to process in a batch
-            max_retries: Maximum number of retries per event
-            max_event_age: Maximum age of events in seconds
-            cleanup_interval: Interval for cleaning up old events
-        """
+                 batch_size: int = None, max_retries: int = None):
+        """Initialize webhook queue"""
         self.secret = secret
         self.queue = deque(maxlen=max_queue_size or WEBHOOK_CONFIG['MAX_QUEUE_SIZE'])
         self.processing = False
         self.process_lock = asyncio.Lock()
         self.queue_lock = asyncio.Lock()
-        self.rate_limiter = RateLimiter(
-            window=WEBHOOK_CONFIG['RATE_LIMIT_WINDOW'],
-            max_requests=WEBHOOK_CONFIG['RATE_LIMIT_MAX_REQUESTS']
+        
+        # Initialize rate limiters
+        self.global_limiter = IPRateLimiter(
+            WEBHOOK_SECURITY['RATE_LIMITS']['global']['requests_per_second'],
+            WEBHOOK_SECURITY['RATE_LIMITS']['global']['burst']
         )
-        self.errors = deque(maxlen=max_queue_size or WEBHOOK_CONFIG['MAX_QUEUE_SIZE'])
+        self.ip_limiter = IPRateLimiter(
+            WEBHOOK_SECURITY['RATE_LIMITS']['per_ip']['requests_per_second'],
+            WEBHOOK_SECURITY['RATE_LIMITS']['per_ip']['burst']
+        )
+        
         self.stats = {
             'total_received': 0,
             'total_processed': 0,
@@ -229,19 +187,9 @@ class WebhookQueue:
             'total_oversized': 0,
             'total_invalid': 0,
             'total_rate_limited': 0,
-            'current_queue_size': 0,
-            'last_process_time': None,
-            'processing_time_avg': 0.0,
-            'retry_success_rate': 0.0,
+            'total_blocked_ips': 0,
             'memory_usage_mb': 0.0
         }
-        self.event_handlers = {}
-        self._shutdown = False
-        self._cleanup_task = None
-        self.batch_size = batch_size or WEBHOOK_CONFIG['BATCH_SIZE']
-        self.max_retries = max_retries or WEBHOOK_CONFIG['MAX_RETRIES']
-        self.max_event_age = max_event_age or WEBHOOK_CONFIG['MAX_EVENT_AGE']
-        self.cleanup_interval = cleanup_interval or WEBHOOK_CONFIG['CLEANUP_INTERVAL']
         
     async def start(self):
         """Start the webhook queue processor"""
@@ -300,14 +248,14 @@ class WebhookQueue:
                 current_time = datetime.now()
                 old_events = [
                     event for event in self.queue
-                    if (current_time - event.created_at).total_seconds() > self.max_event_age
+                    if (current_time - event.created_at).total_seconds() > WEBHOOK_CONFIG['MAX_EVENT_AGE']
                 ]
                 
                 for event in old_events:
                     self.queue.remove(event)
                     self._add_error(
                         'event_expired',
-                        f'Event {event.id} expired after {self.max_event_age} seconds',
+                        f'Event {event.id} expired after {WEBHOOK_CONFIG["MAX_EVENT_AGE"]} seconds',
                         event.id,
                         {'age': (current_time - event.created_at).total_seconds()}
                     )
@@ -433,7 +381,7 @@ class WebhookQueue:
                     # Process events in batches
                     batch = []
                     async with self.queue_lock:
-                        while len(batch) < self.batch_size and self.queue:
+                        while len(batch) < WEBHOOK_CONFIG['BATCH_SIZE'] and self.queue:
                             event = self.queue.popleft()
                             if event.should_retry():
                                 batch.append(event)
@@ -460,7 +408,7 @@ class WebhookQueue:
                             event.error = str(e)
                             event.last_retry = datetime.now()
                             
-                            if event.retries < self.max_retries:
+                            if event.retries < WEBHOOK_CONFIG['MAX_RETRIES']:
                                 self.stats['total_retried'] += 1
                                 async with self.queue_lock:
                                     self.queue.append(event)
@@ -485,14 +433,15 @@ class WebhookQueue:
         """Register handler for event type"""
         self.event_handlers[event_type] = handler
         
-    def validate_signature(self, signature: str, payload: bytes) -> bool:
+    def validate_signature(self, signature_header: str, payload: bytes) -> bool:
         """Validate Blockfrost webhook signature
         
-        The signature is a hex-encoded HMAC-SHA512 hash of the raw request body,
+        The signature header format is: t=<timestamp>,v1=<signature>
+        The signature is a hex-encoded HMAC-SHA256 hash of "<timestamp>.<payload>",
         using the webhook auth token as the key.
         
         Args:
-            signature: Hex-encoded HMAC signature from Blockfrost-Signature-1 header
+            signature_header: Value of Blockfrost-Signature header
             payload: Raw request body bytes
             
         Returns:
@@ -502,35 +451,52 @@ class WebhookQueue:
             logger.error("No webhook auth token configured")
             return False
             
-        if not signature:
-            logger.error("No signature provided")
+        if not signature_header:
+            logger.error("No signature header provided")
             return False
             
         try:
-            # Log key information
-            logger.debug(f"Auth token length: {len(self.secret)}")
-            logger.debug(f"Payload length: {len(payload)} bytes")
-            logger.debug(f"Signature length: {len(signature)}")
+            # Parse header parts
+            header_parts = dict(part.split('=') for part in signature_header.split(','))
+            if 't' not in header_parts or 'v1' not in header_parts:
+                logger.error("Invalid signature header format")
+                return False
+                
+            timestamp = header_parts['t']
+            received_sig = header_parts['v1']
             
-            # Calculate HMAC using SHA-512 of raw request body
-            expected = hmac.new(
+            # Log parsed values
+            logger.debug(f"Timestamp: {timestamp}")
+            logger.debug(f"Received signature: {received_sig}")
+            
+            # Validate timestamp (within 10 minutes)
+            timestamp_int = int(timestamp)
+            now = int(time.time())
+            if abs(now - timestamp_int) > 600:
+                logger.warning(f"Webhook timestamp too old: {abs(now - timestamp_int)} seconds")
+                return False
+                
+            # Create signature payload
+            signature_payload = f"{timestamp}.{payload.decode('utf-8')}"
+            logger.debug(f"Signature payload: {signature_payload[:100]}...")
+            
+            # Calculate HMAC using SHA-256
+            expected_sig = hmac.new(
                 key=self.secret.encode('utf-8'),
-                msg=payload,
-                digestmod=hashlib.sha512
+                msg=signature_payload.encode('utf-8'),
+                digestmod=hashlib.sha256
             ).hexdigest()
             
             # Log signatures for comparison
-            logger.debug(f"Received signature: {signature}")
-            logger.debug(f"Expected signature: {expected}")
+            logger.debug(f"Expected signature: {expected_sig}")
             
-            # Use constant-time comparison (both lowercase to match Blockfrost behavior)
-            is_valid = hmac.compare_digest(signature.lower(), expected.lower())
+            # Use constant-time comparison
+            is_valid = hmac.compare_digest(received_sig.lower(), expected_sig.lower())
             
             if not is_valid:
                 logger.warning("Invalid webhook signature")
                 logger.debug("Signature comparison failed")
                 logger.debug(f"Auth token prefix: {self.secret[:8]}...")
-                logger.debug(f"Payload prefix: {payload[:32]!r}")
                 
             return is_valid
             
@@ -538,6 +504,33 @@ class WebhookQueue:
             logger.error(f"Error validating signature: {e}", exc_info=True)
             return False
             
+    async def check_request(self, request_size: int, client_ip: str) -> tuple[bool, str]:
+        """Check if request passes security checks"""
+        # Check request size
+        if request_size > WEBHOOK_SECURITY['MAX_REQUEST_SIZE']:
+            return False, "Request size exceeds limit"
+            
+        # Check IP whitelist
+        if client_ip not in WEBHOOK_SECURITY['ALLOWED_IPS']:
+            self.stats['total_blocked_ips'] += 1
+            return False, "IP not whitelisted"
+            
+        # Check rate limits
+        if not await self.global_limiter.is_allowed("global"):
+            self.stats['total_rate_limited'] += 1
+            return False, "Global rate limit exceeded"
+            
+        if not await self.ip_limiter.is_allowed(client_ip):
+            self.stats['total_rate_limited'] += 1
+            return False, "IP rate limit exceeded"
+            
+        # Check memory usage
+        memory_usage = await self._check_memory_usage()
+        if memory_usage > WEBHOOK_SECURITY['MEMORY_THRESHOLDS']['critical']:
+            return False, "Server under high memory pressure"
+            
+        return True, ""
+        
     async def _validate_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
         """Validate event payload with comprehensive checks"""
         try:
