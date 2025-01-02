@@ -585,7 +585,7 @@ ENV_VARS = {
     'MINIMUM_YUMMI': EnvVar(
         name='MINIMUM_YUMMI',
         description="Minimum YUMMI tokens required",
-        default="1000",
+        default="25000",
         validator=validate_positive_int,
         required=False
     ),
@@ -717,7 +717,7 @@ COMMAND_COOLDOWN = 3
 # Balance check configuration
 BALANCE_CHECK_INTERVAL = 300  # 5 minutes
 YUMMI_WARNING_THRESHOLD = 3   # Number of warnings before reset
-MINIMUM_YUMMI = 1000         # Minimum YUMMI tokens required
+MINIMUM_YUMMI = 25000        # Minimum YUMMI tokens required per wallet
 
 # Rate limiting configuration
 RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '60'))  # Window in seconds
