@@ -280,15 +280,16 @@ def signal_handler():
         asyncio.create_task(cleanup(app))
 
 # This is the entry point that Gunicorn calls
-def get_app():
+async def app_factory():
     """
-    Get the application factory.
-    This is a sync function that returns an async function,
-    which is what Gunicorn expects.
+    Application factory for Gunicorn.
+    This is an async function that returns an Application instance,
+    which is what aiohttp.GunicornWebWorker expects.
     """
-    async def app_factory():
-        return await init_app()
-    return app_factory
+    return await init_app()
+
+# For Gunicorn
+app_factory = app_factory
 
 if __name__ == '__main__':
     # Register signal handlers
@@ -297,7 +298,7 @@ if __name__ == '__main__':
     
     # Run the application with optimized settings
     web.run_app(
-        get_app(),
+        init_app(),  # For local development
         port=int(os.getenv('PORT', 8080)),
         ssl_context=bot.ssl_context if bot else None,
         keepalive_timeout=75.0,
