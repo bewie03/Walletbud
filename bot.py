@@ -1452,6 +1452,55 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error processing delegation webhook: {e}")
             raise
 
+    async def _check_yummi_balances(self):
+        """Check YUMMI token balances for all wallets"""
+        try:
+            async with await self._ensure_yummi_check_lock():
+                if self.processing_yummi:
+                    logger.info("YUMMI balance check already in progress")
+                    return
+                    
+                self.processing_yummi = True
+                
+            try:
+                # Get all wallets
+                pool = await get_pool()
+                wallets = await pool.fetch("SELECT * FROM wallets")
+                
+                for wallet in wallets:
+                    try:
+                        # Skip if notifications disabled
+                        if not await self.should_notify(wallet['user_id'], 'token_changes'):
+                            continue
+                            
+                        # Get token balances
+                        address = wallet['address']
+                        token_balances = await self.blockfrost_request(f'/addresses/{address}/utxos')
+                        
+                        # Process token balances
+                        for utxo in token_balances:
+                            for amount in utxo['amount']:
+                                if amount['unit'] != 'lovelace':  # Skip ADA
+                                    # Check if it's a YUMMI token
+                                    policy_id = amount['unit'][:56]
+                                    if policy_id == os.getenv('YUMMI_POLICY_ID'):
+                                        # Send notification
+                                        message = f" YUMMI Token Update!\n"
+                                        message += f"Address: `{address}`\n"
+                                        message += f"Balance: {amount['quantity']} YUMMI\n"
+                                        
+                                        await self.send_dm(wallet['user_id'], message)
+                                        
+                    except Exception as e:
+                        logger.error(f"Error checking YUMMI balance for wallet {wallet['address']}: {e}")
+                        continue
+                        
+            finally:
+                self.processing_yummi = False
+                
+        except Exception as e:
+            logger.error(f"Error in YUMMI balance check: {e}")
+
 async def main(app):
     """Main entry point for the bot when running locally"""
     try:
