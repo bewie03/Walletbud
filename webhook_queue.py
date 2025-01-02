@@ -237,12 +237,12 @@ class WebhookQueue:
                     events = []
                     while not self.queue.empty():
                         event = self.queue.get_nowait()
-                        if (now - event.created_at).total_seconds() <= WEBHOOK_CONFIG['MAX_EVENT_AGE']:
+                        if (now - event.created_at).total_seconds() <= WEBHOOK_CONFIG["MAX_EVENT_AGE"]:
                             events.append(event)
                         else:
                             self._add_error(
                                 'event_expired',
-                                f'Event {event.id} expired after {WEBHOOK_CONFIG['MAX_EVENT_AGE']} seconds',
+                                f"Event {event.id} expired after {WEBHOOK_CONFIG['MAX_EVENT_AGE']} seconds",
                                 event.id,
                                 {'age': (now - event.created_at).total_seconds()}
                             )
@@ -269,7 +269,7 @@ class WebhookQueue:
                 old_events = []
                 while not self.queue.empty():
                     event = self.queue.get_nowait()
-                    if (current_time - event.created_at).total_seconds() > WEBHOOK_CONFIG['MAX_EVENT_AGE']:
+                    if (current_time - event.created_at).total_seconds() > WEBHOOK_CONFIG["MAX_EVENT_AGE"]:
                         old_events.append(event)
                     else:
                         self.queue.put_nowait(event)
@@ -277,7 +277,7 @@ class WebhookQueue:
                 for event in old_events:
                     self._add_error(
                         'event_expired',
-                        f'Event {event.id} expired after {WEBHOOK_CONFIG["MAX_EVENT_AGE"]} seconds',
+                        f"Event {event.id} expired after {WEBHOOK_CONFIG['MAX_EVENT_AGE']} seconds",
                         event.id,
                         {'age': (current_time - event.created_at).total_seconds()}
                     )
