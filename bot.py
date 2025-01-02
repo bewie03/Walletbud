@@ -833,7 +833,7 @@ class WalletBudBot(commands.Bot):
                     'healthy': True,
                     'cpu_percent': process.cpu_percent(),
                     'memory_percent': process.memory_percent(),
-                    'uptime': str(datetime.utcnow() - self.health_metrics['start_time']) if self.health_metrics.get('start_time') else 'unknown'
+                    'uptime': str(datetime.utcnow() - self.health_metrics.get('start_time', datetime.utcnow())) if self.health_metrics.get('start_time') else 'unknown'
                 }
                 
                 # Set degraded if high resource usage
@@ -1089,14 +1089,18 @@ class WalletBudBot(commands.Bot):
                 if self.session is None:
                     self.session = aiohttp.ClientSession(connector=self.connector)
                 
-                # Initialize Blockfrost session
+                # Initialize Blockfrost session with project ID in headers
+                if not BLOCKFROST_PROJECT_ID:
+                    raise ValueError("BLOCKFROST_PROJECT_ID environment variable not set")
+                    
                 self.blockfrost_session = aiohttp.ClientSession(
+                    base_url=BLOCKFROST_BASE_URL,
                     headers={'project_id': BLOCKFROST_PROJECT_ID},
                     connector=self.connector
                 )
                 
-                # Test connection using the full URL
-                async with self.blockfrost_session.get(f"{BLOCKFROST_BASE_URL}/health") as response:
+                # Test connection
+                async with self.blockfrost_session.get('/health') as response:
                     if response.status != 200:
                         raise Exception(f"Blockfrost API health check failed: {response.status}")
                         
@@ -1107,12 +1111,7 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Blockfrost initialization failed: {e}")
             raise
 
-    async def blockfrost_request(
-                self, 
-                endpoint: str,
-                method: str = 'GET',
-                **kwargs
-            ):
+    async def blockfrost_request(self, endpoint: str, method: str = 'GET', **kwargs):
         """Make a request to Blockfrost API with rate limiting and error handling
         
         Args:
@@ -1131,13 +1130,11 @@ class WalletBudBot(commands.Bot):
             if not endpoint.startswith('/'):
                 endpoint = '/' + endpoint
                 
-            # Construct full URL
-            url = f"{BLOCKFROST_BASE_URL}{endpoint}"
-            
             # Acquire rate limit token
             await self.rate_limiter.acquire('blockfrost')
             try:
-                async with self.blockfrost_session.request(method, url, **kwargs) as response:
+                # Make request using base_url from session
+                async with self.blockfrost_session.request(method, endpoint, **kwargs) as response:
                     if response.status == 200:
                         return await response.json()
                     else:
@@ -1151,9 +1148,9 @@ class WalletBudBot(commands.Bot):
                     logger.error(f"Error releasing rate limit token: {e}", exc_info=True)
                     
         except Exception as e:
-            logger.error(f"Error in Blockfrost request: {e}", exc_info=True)
+            logger.error(f"Error in Blockfrost request: {e}")
             raise
-            
+
     async def on_resumed(self):
         """Called when the bot resumes a session"""
         logger.info("Session resumed")
@@ -1267,8 +1264,12 @@ class WalletBudBot(commands.Bot):
             # Get port from environment
             port = int(os.getenv('PORT', 8080))
             
+            # Create aiohttp app and add routes
+            app = web.Application()
+            app.router.add_post('/webhook', self.handle_webhook)
+            
             # Initialize webhook components
-            self.runner = web.AppRunner(app)  # Use global app
+            self.runner = web.AppRunner(app)
             await self.runner.setup()
             
             # Create site and start it
@@ -1276,9 +1277,11 @@ class WalletBudBot(commands.Bot):
             await self.site.start()
             
             logger.info(f"Webhook server started on port {port}")
+            await self.update_health_metrics('webhook_server', 'started')
             
         except Exception as e:
             logger.error(f"Failed to start webhook server: {e}")
+            await self.update_health_metrics('webhook_server', 'failed')
             raise
 
     async def handle_webhook(self, request: web.Request) -> web.Response:
