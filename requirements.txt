@@ -22,4 +22,3 @@ PyNaCl==1.5.0  # For voice support
 certifi==2023.11.17  # For SSL certificate validation
 tenacity==8.2.3  # For retry logic
 aiofiles==23.2.1  # For async file operations
-cchardet==2.1.7  # Faster character encoding detection
