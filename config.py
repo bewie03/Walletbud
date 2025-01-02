@@ -722,14 +722,13 @@ SSL_CERT_FILE = certifi.where()
 
 # Database configuration
 DB_CONFIG = {
-    'min_size': int(os.getenv('DB_MIN_CONNECTIONS', '1')),
-    'max_size': int(os.getenv('DB_MAX_CONNECTIONS', '10')),
-    'max_queries': int(os.getenv('DB_MAX_QUERIES', '50000')),
-    'timeout': float(os.getenv('DB_TIMEOUT', '60')),
-    'command_timeout': float(os.getenv('DB_COMMAND_TIMEOUT', '60')),
-    'host': os.getenv('DB_HOST', 'localhost'),
-    'port': int(os.getenv('DB_PORT', '5432')),
-    'ssl': SSL_CONFIG if os.getenv('DB_SSL', 'true').lower() == 'true' else None
+    'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '3')),
+    'MAX_POOL_SIZE': int(os.getenv('DB_MAX_POOL_SIZE', '10')),
+    'COMMAND_TIMEOUT': float(os.getenv('DB_COMMAND_TIMEOUT', '60.0')),
+    'CONNECTION_TIMEOUT': float(os.getenv('DB_CONNECTION_TIMEOUT', '30.0')),
+    'MAX_QUERIES': int(os.getenv('DB_MAX_QUERIES', '50000')),
+    'MAX_CACHED_STATEMENT_LIFETIME': int(os.getenv('DB_MAX_CACHED_STATEMENT_LIFETIME', '300')),
+    'MAX_CACHEABLE_STATEMENT_SIZE': int(os.getenv('DB_MAX_CACHEABLE_STATEMENT_SIZE', '10240')),
 }
 
 DATABASE_POOL_MIN_SIZE = 10

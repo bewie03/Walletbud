@@ -84,13 +84,13 @@ async def get_pool():
                 logger.info("Creating new database pool")
                 _pool = await asyncpg.create_pool(
                     get_database_url(),
-                    min_size=DB_CONFIG['min_connections'],
-                    max_size=DB_CONFIG['max_connections'],
-                    command_timeout=DB_CONFIG.get('command_timeout', 60.0),
-                    timeout=DB_CONFIG.get('connection_timeout', 30.0),
-                    max_queries=DB_CONFIG.get('max_queries', 50000),
-                    max_cached_statement_lifetime=DB_CONFIG.get('max_cached_statement_lifetime', 300),
-                    max_cacheable_statement_size=DB_CONFIG.get('max_cacheable_statement_size', 1024 * 10),
+                    min_size=DB_CONFIG['MIN_POOL_SIZE'],
+                    max_size=DB_CONFIG['MAX_POOL_SIZE'],
+                    command_timeout=DB_CONFIG.get('COMMAND_TIMEOUT', 60.0),
+                    timeout=DB_CONFIG.get('CONNECTION_TIMEOUT', 30.0),
+                    max_queries=DB_CONFIG.get('MAX_QUERIES', 50000),
+                    max_cached_statement_lifetime=DB_CONFIG.get('MAX_CACHED_STATEMENT_LIFETIME', 300),
+                    max_cacheable_statement_size=DB_CONFIG.get('MAX_CACHEABLE_STATEMENT_SIZE', 1024 * 10),
                     ssl='require'
                 )
                 _pool_creation_time = current_time
@@ -1782,6 +1782,7 @@ async def initialize_notification_settings(user_id: str):
         logger.error(f"Error initializing notification settings: {e}")
         if hasattr(e, '__dict__'):
             logger.error(f"Error details: {e.__dict__}")
+        return None
 
 async def get_user_id_for_stake_address(stake_address: str) -> Optional[str]:
     """Get the user ID associated with a stake address
