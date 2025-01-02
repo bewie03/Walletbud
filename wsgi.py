@@ -286,7 +286,9 @@ def get_app():
     This is a sync function that returns an async function,
     which is what Gunicorn expects.
     """
-    return init_app
+    async def app_factory():
+        return await init_app()
+    return app_factory
 
 if __name__ == '__main__':
     # Register signal handlers
@@ -295,7 +297,7 @@ if __name__ == '__main__':
     
     # Run the application with optimized settings
     web.run_app(
-        init_app(),
+        get_app(),
         port=int(os.getenv('PORT', 8080)),
         ssl_context=bot.ssl_context if bot else None,
         keepalive_timeout=75.0,
