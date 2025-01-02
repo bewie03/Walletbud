@@ -1111,13 +1111,12 @@ class WalletBudBot(commands.Bot):
             
             # Initialize Blockfrost session
             self.blockfrost_session = aiohttp.ClientSession(
-                base_url=BLOCKFROST_BASE_URL,
                 headers={'project_id': BLOCKFROST_PROJECT_ID},
                 connector=self.connector
             )
             
-            # Test connection
-            async with self.blockfrost_session.get('/health') as response:
+            # Test connection using the full URL
+            async with self.blockfrost_session.get(f"{BLOCKFROST_BASE_URL}/health") as response:
                 if response.status != 200:
                     raise Exception(f"Blockfrost API health check failed: {response.status}")
                     
@@ -1134,11 +1133,11 @@ class WalletBudBot(commands.Bot):
             raise
 
     async def blockfrost_request(
-            self, 
-            endpoint: str,
-            method: str = 'GET',
-            **kwargs
-        ):
+                self, 
+                endpoint: str,
+                method: str = 'GET',
+                **kwargs
+            ):
         """Make a request to Blockfrost API with rate limiting and error handling
         
         Args:
@@ -1152,26 +1151,29 @@ class WalletBudBot(commands.Bot):
         Raises:
             Exception: If API request fails
         """
-        if not hasattr(self, 'blockfrost_session') or not self.blockfrost_session:
-            raise Exception("Blockfrost session not initialized")
-            
         try:
-            async with self.blockfrost_session.request(method, endpoint, **kwargs) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    
-                    # Update health metrics
-                    self.update_health_metrics('last_api_call', datetime.now().isoformat())
-                    
-                    return result
-                else:
-                    error = await response.json()
-                    raise Exception(f"Blockfrost API request failed: {error}")
+            # Ensure endpoint starts with /
+            if not endpoint.startswith('/'):
+                endpoint = '/' + endpoint
+                
+            # Construct full URL
+            url = f"{BLOCKFROST_BASE_URL}{endpoint}"
             
+            # Acquire rate limit token
+            await self.rate_limiter.acquire('blockfrost')
+            try:
+                async with self.blockfrost_session.request(method, url, **kwargs) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"Blockfrost API request failed: {response.status} - {error_text}")
+            finally:
+                # Release rate limit token
+                self.rate_limiter.release('blockfrost')
+                
         except Exception as e:
-            logger.error(f"Blockfrost API request failed: {e}")
-            if self.admin_channel:
-                await self.admin_channel.send(f"Error: Blockfrost API request failed: {e}")
+            logger.error(f"Error in Blockfrost request: {e}")
             raise
             
     async def on_resumed(self):
