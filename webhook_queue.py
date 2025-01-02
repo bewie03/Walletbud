@@ -19,10 +19,7 @@ import sys
 from aiohttp import web
 import uuid
 
-from config import (
-    WEBHOOK_CONFIG,
-    WEBHOOK_SECURITY
-)
+from config import WEBHOOK_SECURITY, WEBHOOK_CONFIG
 
 # Get port from Heroku environment, default to 8080 for local development
 PORT = int(os.environ.get('PORT', 8080))
@@ -245,7 +242,7 @@ class WebhookQueue:
                         else:
                             self._add_error(
                                 'event_expired',
-                                f'Event {event.id} expired after {WEBHOOK_CONFIG["MAX_EVENT_AGE"]} seconds',
+                                f'Event {event.id} expired after {WEBHOOK_CONFIG['MAX_EVENT_AGE']} seconds',
                                 event.id,
                                 {'age': (now - event.created_at).total_seconds()}
                             )

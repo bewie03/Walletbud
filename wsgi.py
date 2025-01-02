@@ -6,6 +6,8 @@ import logging
 import aiohttp
 from aiohttp import web, TCPConnector
 from bot import WalletBudBot
+from shutdown_manager import ShutdownManager
+from database_maintenance import DatabaseMaintenance
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any
 import orjson

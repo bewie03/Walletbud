@@ -2,16 +2,28 @@ import os
 import sys
 import ssl
 import json
+import time
+import uuid
 import logging
 import asyncio
 import aiohttp
 import discord
 import certifi
+import random
+import functools
+import asyncpg
+import requests
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from typing import Dict, Any, Optional, List, Union
 from aiohttp import TCPConnector
 from discord.ext import commands, tasks
+from cachetools import TTLCache
+from functools import wraps
+from tenacity import retry, stop_after_attempt, wait_exponential
+from blockfrost import BlockFrostApi, ApiUrls
+from blockfrost.api.cardano.network import network
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 from config import (
     DISCORD_TOKEN,
@@ -19,33 +31,21 @@ from config import (
     ADMIN_CHANNEL_ID,
     BLOCKFROST_PROJECT_ID,
     DATABASE_URL,
-    WEBHOOK_SECRET,
     MAX_REQUESTS_PER_SECOND,
     BURST_LIMIT,
     RATE_LIMIT_COOLDOWN,
-    YUMMI_POLICY_ID,
     HEALTH_METRICS_TTL,
     WEBHOOK_CONFIG,
-    WEBHOOK_SECURITY,
-    BLOCKFROST_NETWORKS,
-    validate_config
+    WEBHOOK_SECURITY
 )
 
 from database import Database
 from webhook_queue import WebhookQueue
+from shutdown_manager import ShutdownManager
+from database_maintenance import DatabaseMaintenance
 
-import random
-import functools
-from functools import wraps
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-# Third-party imports
-import asyncpg
-import requests
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-from blockfrost import BlockFrostApi, ApiUrls
-from blockfrost.api.cardano.network import network
-from urllib3.exceptions import InsecureRequestWarning
+# Suppress only the single InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
 def get_request_id() -> str:
     """Generate a unique request ID for logging"""
@@ -57,9 +57,6 @@ def init_ssl_context() -> ssl.SSLContext:
     ssl_context.verify_mode = ssl.CERT_REQUIRED
     ssl_context.check_hostname = True
     return ssl_context
-
-# Suppress only the single InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
 def setup_logging():
     """Configure logging for the bot."""
@@ -129,36 +126,6 @@ class RateLimiter:
         ep = await self._get_endpoint(endpoint)
         async with ep['lock']:
             ep['tokens'] = min(ep['tokens'] + 1, self.burst_limit)
-
-class ShutdownManager:
-    """Manages graceful shutdown of bot components"""
-    def __init__(self):
-        self._handlers = []
-        self._is_shutting_down = False
-        
-    def add_handler(self, handler):
-        """Add a cleanup handler to be called during shutdown"""
-        self._handlers.append(handler)
-        
-    def remove_handler(self, handler):
-        """Remove a cleanup handler"""
-        if handler in self._handlers:
-            self._handlers.remove(handler)
-            
-    async def shutdown(self):
-        """Execute all cleanup handlers in reverse order"""
-        if self._is_shutting_down:
-            return
-            
-        self._is_shutting_down = True
-        for handler in reversed(self._handlers):
-            try:
-                if asyncio.iscoroutinefunction(handler):
-                    await handler()
-                else:
-                    handler()
-            except Exception as e:
-                logger.error(f"Error during shutdown handler execution: {e}")
 
 class WalletBudBot(commands.Bot):
     """WalletBud Discord bot"""

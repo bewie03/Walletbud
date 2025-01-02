@@ -614,36 +614,11 @@ HEALTH_METRICS_TTL = ENV_VARS['HEALTH_METRICS_TTL'].get_value()
 
 # Rate limiting configuration
 MAX_REQUESTS_PER_SECOND = int(os.getenv('MAX_REQUESTS_PER_SECOND', '10'))
-BURST_LIMIT = int(os.getenv('BURST_LIMIT', '50'))
+BURST_LIMIT = int(os.getenv('BURST_LIMIT', '20'))
 RATE_LIMIT_COOLDOWN = int(os.getenv('RATE_LIMIT_COOLDOWN', '60'))
 
-# Database maintenance configuration
-ARCHIVE_AFTER_DAYS = int(os.getenv('ARCHIVE_AFTER_DAYS', '30'))
-DELETE_AFTER_DAYS = int(os.getenv('DELETE_AFTER_DAYS', '90'))
-MAINTENANCE_BATCH_SIZE = int(os.getenv('MAINTENANCE_BATCH_SIZE', '1000'))
-MAINTENANCE_MAX_RETRIES = int(os.getenv('MAINTENANCE_MAX_RETRIES', '3'))
-MAINTENANCE_HOUR = int(os.getenv('MAINTENANCE_HOUR', '3'))
-MAINTENANCE_MINUTE = int(os.getenv('MAINTENANCE_MINUTE', '0'))
-
-# Command rate limiting
-COMMAND_COOLDOWN = int(os.getenv('COMMAND_COOLDOWN', '5'))
-RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '60'))
-RATE_LIMIT_MAX_REQUESTS = int(os.getenv('RATE_LIMIT_MAX_REQUESTS', '100'))
-
-# Webhook queue configuration
-MAX_QUEUE_SIZE = int(os.getenv('MAX_QUEUE_SIZE', '1000'))
-MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))
-MAX_EVENT_AGE = int(os.getenv('MAX_EVENT_AGE', '3600'))
-BATCH_SIZE = int(os.getenv('BATCH_SIZE', '100'))
-
-# YUMMI token configuration
-MINIMUM_YUMMI = ENV_VARS['MINIMUM_YUMMI'].get_value()
-YUMMI_POLICY_ID = ENV_VARS['YUMMI_POLICY_ID'].get_value()
-YUMMI_TOKEN_NAME = ENV_VARS['YUMMI_TOKEN_NAME'].get_value()
-ASSET_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}" if YUMMI_POLICY_ID and YUMMI_TOKEN_NAME else None
-
-# SSL configuration
-SSL_CERT_FILE = certifi.where()
+# Health metrics configuration
+HEALTH_METRICS_TTL = int(os.getenv('HEALTH_METRICS_TTL', '300'))  # 5 minutes
 
 # Database configuration
 DB_CONFIG = {
@@ -663,12 +638,12 @@ DATABASE_CONNECTION_TIMEOUT = 30
 DATABASE_COMMAND_TIMEOUT = 60
 
 # Database maintenance configuration
-ARCHIVE_AFTER_DAYS = ENV_VARS['ARCHIVE_AFTER_DAYS'].get_value()
-DELETE_AFTER_DAYS = ENV_VARS['DELETE_AFTER_DAYS'].get_value()
-MAINTENANCE_BATCH_SIZE = ENV_VARS['MAINTENANCE_BATCH_SIZE'].get_value()
-MAINTENANCE_MAX_RETRIES = ENV_VARS['MAINTENANCE_MAX_RETRIES'].get_value()
-MAINTENANCE_HOUR = ENV_VARS['MAINTENANCE_HOUR'].get_value()
-MAINTENANCE_MINUTE = ENV_VARS['MAINTENANCE_MINUTE'].get_value()
+ARCHIVE_AFTER_DAYS = int(os.getenv('ARCHIVE_AFTER_DAYS', '30'))  # Archive transactions after 30 days
+DELETE_AFTER_DAYS = int(os.getenv('DELETE_AFTER_DAYS', '90'))    # Delete archived transactions after 90 days
+MAINTENANCE_BATCH_SIZE = int(os.getenv('MAINTENANCE_BATCH_SIZE', '1000'))  # Process 1000 records at a time
+MAINTENANCE_MAX_RETRIES = int(os.getenv('MAINTENANCE_MAX_RETRIES', '3'))   # Retry failed operations 3 times
+MAINTENANCE_HOUR = int(os.getenv('MAINTENANCE_HOUR', '3'))       # Run maintenance at 3 AM
+MAINTENANCE_MINUTE = int(os.getenv('MAINTENANCE_MINUTE', '0'))   # Run maintenance at minute 0
 
 # Discord embed limits
 EMBED_CHAR_LIMIT = 4096
@@ -697,50 +672,28 @@ MIN_ADA_BALANCE = float(os.getenv('MIN_ADA_BALANCE', '5.0'))  # Minimum ADA bala
 MAX_TX_PER_HOUR = int(os.getenv('MAX_TX_PER_HOUR', '100'))  # Maximum transactions per hour to process
 
 # YUMMI token configuration
-YUMMI_POLICY_ID = os.getenv('YUMMI_POLICY_ID')  # YUMMI token policy ID
-YUMMI_TOKEN_NAME = os.getenv('YUMMI_TOKEN_NAME')  # YUMMI token name
+MINIMUM_YUMMI = ENV_VARS['MINIMUM_YUMMI'].get_value()
+YUMMI_POLICY_ID = ENV_VARS['YUMMI_POLICY_ID'].get_value()
+YUMMI_TOKEN_NAME = ENV_VARS['YUMMI_TOKEN_NAME'].get_value()
 ASSET_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}" if YUMMI_POLICY_ID and YUMMI_TOKEN_NAME else None
 
-# Webhook configuration with validation
-WEBHOOK_SECURITY = {
-    'MAX_REQUEST_SIZE': 1024 * 1024,  # 1MB limit
-    'MEMORY_THRESHOLDS': {
-        'warning': 75,    # 75% of memory limit
-        'critical': 90    # 90% of memory limit
-    },
-    'RATE_LIMITS': {
-        'global': {
-            'requests_per_second': 10,
-            'burst': 20
-        },
-        'per_ip': {
-            'requests_per_second': 5,
-            'burst': 10
-        }
-    },
-    'CORS': {
-        'allowed_origins': ['https://blockfrost.io'],
-        'allowed_methods': ['POST'],
-        'allowed_headers': ['Content-Type', 'Blockfrost-Signature'],
-        'max_age': 3600
-    },
-}
+# SSL configuration
+SSL_CERT_FILE = certifi.where()
 
-WEBHOOK_CONFIG = {
-    'MAX_QUEUE_SIZE': 1000,
-    'BATCH_SIZE': 10,
-    'MAX_RETRIES': 3,
-    'MAX_EVENT_AGE': 3600,  # 1 hour
-    'CLEANUP_INTERVAL': 300,  # 5 minutes
-    'MAX_PAYLOAD_SIZE': 1024 * 1024,  # 1MB
-    'RATE_LIMIT_WINDOW': 60,  # 1 minute
-    'RATE_LIMIT_MAX_REQUESTS': 60,  # 60 requests per minute
-    'MEMORY_LIMIT_MB': 512,  # 512MB
-    'RETRY_DELAY': 60  # 1 minute between retries
+# Database configuration
+DB_CONFIG = {
+    'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '2')),
+    'MAX_POOL_SIZE': int(os.getenv('DB_MAX_POOL_SIZE', '10')),
+    'MAX_INACTIVE_CONNECTION_LIFETIME': int(os.getenv('DB_MAX_INACTIVE_CONNECTION_LIFETIME', '300')),  # 5 minutes
+    'COMMAND_TIMEOUT': int(os.getenv('DB_COMMAND_TIMEOUT', '60')),  # 1 minute
+    'POOL_RECYCLE_INTERVAL': int(os.getenv('DB_POOL_RECYCLE_INTERVAL', '3600')),  # 1 hour
+    'MAX_QUERIES_PER_POOL': int(os.getenv('DB_MAX_QUERIES_PER_POOL', '50000')),  # Reset pool after 50k queries
+    'MAX_POOL_AGE': int(os.getenv('DB_MAX_POOL_AGE', '86400')),  # 24 hours
+    'RETRY_ATTEMPTS': int(os.getenv('DB_RETRY_ATTEMPTS', '3')),
+    'RETRY_DELAY': int(os.getenv('DB_RETRY_DELAY', '1')),  # 1 second
+    'MAX_RETRIES': int(os.getenv('DB_MAX_RETRIES', '3')),  # Maximum number of retries
+    'RETRY_DELAY_BASE': int(os.getenv('DB_RETRY_DELAY_BASE', '2')),  # Base for exponential backoff
 }
-
-# Validate webhook configuration
-validate_webhook_config(WEBHOOK_CONFIG)
 
 # Blockfrost network configuration
 BLOCKFROST_NETWORKS = {
@@ -794,17 +747,43 @@ if database_url and database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
     os.environ['DATABASE_URL'] = database_url
 
-# Database configuration
-DB_CONFIG = {
-    'MIN_POOL_SIZE': int(os.getenv('DB_MIN_POOL_SIZE', '2')),
-    'MAX_POOL_SIZE': int(os.getenv('DB_MAX_POOL_SIZE', '10')),
-    'MAX_INACTIVE_CONNECTION_LIFETIME': int(os.getenv('DB_MAX_INACTIVE_CONNECTION_LIFETIME', '300')),  # 5 minutes
-    'COMMAND_TIMEOUT': int(os.getenv('DB_COMMAND_TIMEOUT', '60')),  # 1 minute
-    'POOL_RECYCLE_INTERVAL': int(os.getenv('DB_POOL_RECYCLE_INTERVAL', '3600')),  # 1 hour
-    'MAX_QUERIES_PER_POOL': int(os.getenv('DB_MAX_QUERIES_PER_POOL', '50000')),  # Reset pool after 50k queries
-    'MAX_POOL_AGE': int(os.getenv('DB_MAX_POOL_AGE', '86400')),  # 24 hours
-    'RETRY_ATTEMPTS': int(os.getenv('DB_RETRY_ATTEMPTS', '3')),
-    'RETRY_DELAY': int(os.getenv('DB_RETRY_DELAY', '1')),  # 1 second
-    'MAX_RETRIES': int(os.getenv('DB_MAX_RETRIES', '3')),  # Maximum number of retries
-    'RETRY_DELAY_BASE': int(os.getenv('DB_RETRY_DELAY_BASE', '2')),  # Base for exponential backoff
+# Webhook configuration with validation
+WEBHOOK_SECURITY = {
+    'MAX_REQUEST_SIZE': 1024 * 1024,  # 1MB limit
+    'MEMORY_THRESHOLDS': {
+        'warning': 75,    # 75% of memory limit
+        'critical': 90    # 90% of memory limit
+    },
+    'RATE_LIMITS': {
+        'global': {
+            'requests_per_second': 10,
+            'burst': 20
+        },
+        'per_ip': {
+            'requests_per_second': 5,
+            'burst': 10
+        }
+    },
+    'CORS': {
+        'allowed_origins': ['https://blockfrost.io'],
+        'allowed_methods': ['POST'],
+        'allowed_headers': ['Content-Type', 'Blockfrost-Signature'],
+        'max_age': 3600
+    },
 }
+
+WEBHOOK_CONFIG = {
+    'MAX_QUEUE_SIZE': 1000,
+    'BATCH_SIZE': 10,
+    'MAX_RETRIES': 3,
+    'MAX_EVENT_AGE': 3600,  # 1 hour
+    'CLEANUP_INTERVAL': 300,  # 5 minutes
+    'MAX_PAYLOAD_SIZE': 1024 * 1024,  # 1MB
+    'RATE_LIMIT_WINDOW': 60,  # 1 minute
+    'RATE_LIMIT_MAX_REQUESTS': 60,  # 60 requests per minute
+    'MEMORY_LIMIT_MB': 512,  # 512MB
+    'RETRY_DELAY': 60  # 1 minute between retries
+}
+
+# Validate webhook configuration
+validate_webhook_config(WEBHOOK_CONFIG)
