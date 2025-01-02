@@ -1163,13 +1163,16 @@ class WalletBudBot(commands.Bot):
             url = f"{self.blockfrost_base_url}/{endpoint.lstrip('/')}"
             
             # Make request with rate limiting
-            async with self.rate_limiter.acquire('blockfrost'):
+            try:
+                await self.rate_limiter.acquire('blockfrost')
                 async with self.blockfrost_session.request(method, url, **kwargs) as response:
                     if response.status == 403:
                         logger.error("Blockfrost API returned 403 - check project ID")
                         raise Exception("Invalid Blockfrost project ID")
                     response.raise_for_status()
                     return await response.json()
+            finally:
+                await self.rate_limiter.release('blockfrost')
                     
         except Exception as e:
             logger.error(f"Error in Blockfrost request: {endpoint} - {str(e)}")
