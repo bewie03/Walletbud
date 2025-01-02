@@ -916,7 +916,7 @@ class WalletBudBot(commands.Bot):
             
         except Exception as e:
             logger.error(f"Health monitoring failed: {e}", exc_info=True)
-            
+
     async def on_ready(self):
         """Called when the bot is ready and connected to Discord"""
         try:
@@ -1109,7 +1109,6 @@ class WalletBudBot(commands.Bot):
             # Create session with proper timeout and headers
             timeout = aiohttp.ClientTimeout(total=30, connect=10)
             self.blockfrost_session = aiohttp.ClientSession(
-                base_url=os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0'),
                 headers={
                     'project_id': project_id,
                     'Content-Type': 'application/json'
@@ -1118,6 +1117,9 @@ class WalletBudBot(commands.Bot):
                 connector=connector,
                 raise_for_status=True
             )
+            
+            # Store base URL
+            self.blockfrost_base_url = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0').rstrip('/')
             
             # Test the connection
             await self.blockfrost_request('/health')
@@ -1158,8 +1160,7 @@ class WalletBudBot(commands.Bot):
             kwargs['headers'] = headers
             
             # Ensure URL is properly formed
-            base_url = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0').rstrip('/')
-            url = f"{base_url}/{endpoint.lstrip('/')}"
+            url = f"{self.blockfrost_base_url}/{endpoint.lstrip('/')}"
             
             # Make request with rate limiting
             async with self.rate_limiter.acquire('blockfrost'):
