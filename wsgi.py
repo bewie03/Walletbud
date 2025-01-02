@@ -3,8 +3,8 @@ import ssl
 import signal
 import asyncio
 import logging
-import uvloop
-from aiohttp import web, ClientTimeout, TCPConnector, ClientError
+import aiohttp
+from aiohttp import web, TCPConnector
 from bot import WalletBudBot
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any
@@ -41,9 +41,6 @@ load_dotenv()
 bot: Optional[WalletBudBot] = None
 app: Optional[web.Application] = None
 
-# Use uvloop for better performance
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-
 async def init_app():
     """Initialize the web application"""
     global app, bot
@@ -67,7 +64,7 @@ async def init_app():
             bot = WalletBudBot()
             
             # Configure bot's client session with optimized settings
-            timeout = ClientTimeout(total=30, connect=10)
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
             connector = TCPConnector(
                 limit=100,  # Connection pool size
                 ttl_dns_cache=300,  # DNS cache TTL
@@ -79,7 +76,7 @@ async def init_app():
             # Use orjson for faster serialization
             json_dumps = partial(orjson.dumps, option=orjson.OPT_SERIALIZE_NUMPY)
             
-            bot.session = web.ClientSession(
+            bot.session = aiohttp.ClientSession(
                 timeout=timeout,
                 connector=connector,
                 json_serialize=json_dumps
@@ -92,7 +89,7 @@ async def init_app():
                     return await handler(request)
                 except web.HTTPException:
                     raise
-                except ClientError as e:
+                except aiohttp.ClientError as e:
                     logger.error(f"Client error: {e}", exc_info=True)
                     return web.json_response(
                         {"error": "Service temporarily unavailable"},

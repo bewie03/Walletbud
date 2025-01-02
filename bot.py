@@ -12,7 +12,7 @@ import logging
 import certifi
 import discord
 import aiohttp
-from aiohttp import web
+from aiohttp import web, ClientSession
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Callable, Coroutine
 from discord.ext import commands, tasks
