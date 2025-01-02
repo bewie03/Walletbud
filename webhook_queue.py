@@ -19,7 +19,6 @@ import sys
 
 from config import (
     WEBHOOK_CONFIG,
-    WEBHOOK_SECRETS,
     WEBHOOK_SECURITY
 )
 
