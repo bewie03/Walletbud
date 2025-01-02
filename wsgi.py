@@ -14,10 +14,24 @@ from datetime import datetime
 import psutil
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+def setup_logging():
+    """Configure logging for the application."""
+    logging.basicConfig(
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        level=logging.WARNING,  # Set base level to WARNING
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Only show INFO and above for our app's logger
+    logger = logging.getLogger('walletbud')
+    logger.setLevel(logging.INFO)
+    
+    # Set third-party loggers to WARNING or higher
+    for logger_name in ['aiohttp', 'discord', 'websockets', 'asyncio']:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+setup_logging()
+
 logger = logging.getLogger(__name__)
 
 # Load environment variables

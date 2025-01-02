@@ -107,15 +107,23 @@ def init_ssl_context() -> ssl.SSLContext:
 # Suppress only the single InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG for more detailed logs
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+def setup_logging():
+    """Configure logging for the bot."""
+    logging.basicConfig(
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        level=logging.WARNING,  # Set base level to WARNING
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Only show INFO and above for our app's logger
+    logger = logging.getLogger('walletbud')
+    logger.setLevel(logging.INFO)
+    
+    # Set third-party loggers to WARNING or higher
+    for logger_name in ['aiohttp', 'discord', 'websockets', 'asyncio']:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+setup_logging()
 
 class RateLimiter:
     """Rate limiter with burst support and per-endpoint tracking"""
