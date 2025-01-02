@@ -16,17 +16,17 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Initialize bot instance
-bot = WalletBudBot()
+# Global bot instance
+bot = None
 
 async def health_check(request):
     """Health check endpoint to monitor application status"""
     try:
         health_data = {
             "status": "healthy",
-            "bot_latency": round(bot.latency * 1000, 2) if bot.is_ready() else None,
-            "connected": bot.is_ready(),
-            "guilds": len(bot.guilds) if bot.is_ready() else 0
+            "bot_latency": round(bot.latency * 1000, 2) if bot and bot.is_ready() else None,
+            "connected": bot and bot.is_ready(),
+            "guilds": len(bot.guilds) if bot and bot.is_ready() else 0
         }
         return web.json_response(health_data)
     except Exception as e:
@@ -35,6 +35,7 @@ async def health_check(request):
 
 async def start_bot():
     """Start the Discord bot"""
+    global bot
     try:
         await bot.start(os.getenv('DISCORD_TOKEN'))
     except Exception as e:
@@ -43,8 +44,10 @@ async def start_bot():
 
 async def cleanup(app):
     """Cleanup function to handle graceful shutdown"""
-    logger.info("Shutting down bot and web server...")
-    await bot.close()
+    global bot
+    if bot:
+        logger.info("Shutting down bot and web server...")
+        await bot.close()
     for task in asyncio.all_tasks():
         if task is not asyncio.current_task():
             task.cancel()
@@ -56,6 +59,13 @@ def signal_handler():
 
 async def init_app():
     """Initialize the web application"""
+    global bot
+    
+    # Only initialize bot if it doesn't exist
+    if not bot:
+        logger.info("Initializing bot instance...")
+        bot = WalletBudBot()
+    
     app = web.Application()
     app.router.add_get('/health', health_check)
     
@@ -69,8 +79,7 @@ async def init_app():
 
 def get_app():
     """Get the web application instance"""
-    # Explicitly mark this as an aiohttp application factory
-    return init_app
+    return init_app()
 
 if __name__ == '__main__':
     # Register signal handlers
@@ -78,4 +87,4 @@ if __name__ == '__main__':
         signal.signal(sig, lambda s, f: signal_handler())
     
     # Run the application
-    web.run_app(get_app(), port=int(os.getenv('PORT', 8080)))
+    web.run_app(init_app(), port=int(os.getenv('PORT', 8080)))
