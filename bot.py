@@ -566,7 +566,7 @@ class WalletBudBot(commands.Bot):
             logger.info("HTTP session closed")
             
         except Exception as e:
-            logger.error(f"Error cleaning up HTTP session: {e}")
+            logger.error(f"Error closing session: {e}")
             
     async def _cleanup_database(self):
         """Cleanup database connections"""
@@ -1318,18 +1318,31 @@ class WalletBudBot(commands.Bot):
             port = int(os.getenv('PORT', 8080))
             logger.info(f"Using port {port} for webhook server")
             
-            # Create webhook runner
-            runner = web.AppRunner(web.Application())
-            await runner.setup()
+            # Create webhook queue
+            self.webhook_queue = WebhookQueue(
+                secret=os.getenv('WEBHOOK_SECRET'),
+                max_queue_size=1000,
+                batch_size=10,
+                max_retries=3
+            )
             
-            # Create site
-            site = web.TCPSite(runner, '0.0.0.0', port)
-            await site.start()
+            # Register webhook handlers
+            self.webhook_queue.register_handler('tx', self.handle_transaction_webhook)
+            self.webhook_queue.register_handler('block', self.handle_block_webhook)
+            self.webhook_queue.register_handler('delegation', self.handle_delegation_webhook)
+            
+            # Add webhook route to app
+            if hasattr(self, 'app') and self.app is not None:
+                self.app.router.add_post('/webhook', self.webhook_queue.process_webhook)
+                logger.info("Added webhook route to existing app")
+            else:
+                logger.error("App not initialized, cannot add webhook route")
+                raise RuntimeError("App not initialized")
+            
+            # Start webhook queue processor
+            await self.webhook_queue.start()
+            logger.info("Started webhook queue processor")
             
         except Exception as e:
             logger.error(f"Failed to start webhook server: {e}")
             raise
-
-    async def handle_webhook(self, request: web.Request) -> web.Response:
-        """Handle incoming webhook request from Blockfrost"""
-        return await self.webhook_queue.process_webhook(request)

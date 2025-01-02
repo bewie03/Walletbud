@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from collections import deque, defaultdict
 import sys
 from aiohttp import web
+import uuid
 
 from config import (
     WEBHOOK_CONFIG,
@@ -172,6 +173,9 @@ class WebhookQueue:
         self.queue_lock = asyncio.Lock()
         self.processing = False
         self.stop_event = asyncio.Event()
+        
+        # Initialize event handlers
+        self.event_handlers: Dict[str, Callable] = {}
         
         # Initialize metrics
         self.processed_count = 0
@@ -439,34 +443,38 @@ class WebhookQueue:
             # Get request body
             body = await request.text()
             
-            # Validate signature
-            if not self.validate_signature(request.headers, body):
+            # Verify signature
+            if not self.validate_signature(dict(request.headers), body):
                 return web.Response(text="Invalid signature", status=401)
-                
-            # Parse JSON body
-            try:
-                data = json.loads(body)
-            except json.JSONDecodeError:
-                return web.Response(text="Invalid JSON", status=400)
+            
+            # Parse JSON data
+            data = json.loads(body)
+            
+            # Check security limits
+            if not await self.check_request(len(body), request.remote):
+                return web.Response(text="Rate limit exceeded", status=429)
                 
             # Verify required fields
-            if 'type' not in data or 'payload' not in data:
-                return web.Response(text="Missing required fields", status=400)
+            if not isinstance(data, list):
+                data = [data]  # Convert single event to list
                 
-            # Add to queue
-            event = WebhookEvent(
-                id=data['type'],
-                event_type=data['type'],
-                payload=data['payload'],
-                headers=dict(request.headers),
-                created_at=datetime.now()
-            )
-            await self.queue.put(event)
-            logger.debug(f"Added {data['type']} webhook to queue")
+            for event in data:
+                if 'type' not in event or 'payload' not in event:
+                    return web.Response(text="Missing required fields", status=400)
+                    
+                # Add to queue
+                await self.add_event(
+                    event_id=event.get('id', str(uuid.uuid4())),
+                    event_type=event['type'],
+                    payload=event['payload'],
+                    headers=dict(request.headers)
+                )
             
             # Return success (must be 2xx as per Blockfrost docs)
             return web.Response(text="OK", status=200)
             
+        except json.JSONDecodeError:
+            return web.Response(text="Invalid JSON", status=400)
         except Exception as e:
             logger.error(f"Error processing webhook: {e}")
             return web.Response(text=str(e), status=500)

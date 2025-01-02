@@ -2423,3 +2423,117 @@ async def migrate_database(conn) -> bool:
     except Exception as e:
         logger.error(f"Database migration failed: {e}")
         raise DatabaseError(f"Failed to migrate database: {e}")
+
+class Database:
+    """Database wrapper class for managing database connections and operations"""
+    
+    def __init__(self):
+        """Initialize database connection"""
+        self.pool = None
+        self.url = get_database_url()
+        
+    async def connect(self):
+        """Connect to database and initialize schema"""
+        try:
+            # Get connection pool
+            self.pool = await get_pool()
+            
+            # Initialize database schema
+            await init_db()
+            
+            logger.info("Database initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            raise
+            
+    async def close(self):
+        """Close database connection"""
+        if self.pool:
+            await self.pool.close()
+            
+    async def execute(self, query: str, *args):
+        """Execute a database query"""
+        return await execute_query(query, *args)
+        
+    async def fetch_one(self, query: str, *args):
+        """Fetch a single row"""
+        return await fetch_one(query, *args)
+        
+    async def fetch_all(self, query: str, *args):
+        """Fetch all rows"""
+        return await fetch_all(query, *args)
+        
+    async def execute_many(self, query: str, args_list: list):
+        """Execute query with multiple parameter sets"""
+        return await execute_many(query, args_list)
+        
+    async def execute_transaction(self, queries: List[tuple[str, tuple]]):
+        """Execute queries in a transaction"""
+        return await execute_transaction(queries)
+
+    # Wallet management methods
+    async def add_wallet(self, user_id: str, address: str, stake_address: str = None):
+        """Add a new wallet"""
+        return await add_wallet(user_id, address, stake_address)
+        
+    async def get_wallet_for_user(self, user_id: str, address: str):
+        """Get wallet details for a user"""
+        return await get_wallet_for_user(user_id, address)
+        
+    async def get_user_wallets(self, user_id: str):
+        """Get all wallets for a user"""
+        return await get_user_wallets(user_id)
+        
+    async def update_wallet_state(self, address: str, updates: Dict[str, Any]):
+        """Update wallet state"""
+        return await update_wallet_state(address, updates)
+        
+    async def check_ada_balance(self, address: str):
+        """Check ADA balance"""
+        return await check_ada_balance(address)
+        
+    async def update_ada_balance(self, address: str, balance: float):
+        """Update ADA balance"""
+        return await update_ada_balance(address, balance)
+        
+    async def update_token_balances(self, address: str, token_balances: dict):
+        """Update token balances"""
+        return await update_token_balances(address, token_balances)
+        
+    async def get_wallet_balance(self, address: str):
+        """Get wallet balance"""
+        return await get_wallet_balance(address)
+        
+    async def update_utxo_state(self, address: str, utxo_state: dict):
+        """Update UTxO state"""
+        return await update_utxo_state(address, utxo_state)
+        
+    async def get_stake_address(self, address: str):
+        """Get stake address"""
+        return await get_stake_address(address)
+        
+    async def update_stake_address(self, address: str, stake_address: str):
+        """Update stake address"""
+        return await update_stake_address(address, stake_address)
+        
+    async def remove_wallet_for_user(self, user_id: str, address: str):
+        """Remove wallet"""
+        return await remove_wallet_for_user(user_id, address)
+
+    # Notification methods
+    async def get_notification_settings(self, user_id: str):
+        """Get notification settings"""
+        return await get_notification_settings(user_id)
+        
+    async def update_notification_setting(self, user_id: str, setting: str, enabled: bool):
+        """Update notification setting"""
+        return await update_notification_setting(user_id, setting, enabled)
+        
+    async def initialize_notification_settings(self, user_id: str):
+        """Initialize notification settings"""
+        return await initialize_notification_settings(user_id)
+        
+    async def should_notify(self, user_id: str, notification_type: str):
+        """Check if should notify"""
+        return await should_notify(user_id, notification_type)
