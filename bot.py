@@ -25,7 +25,7 @@ from config import (
     DISCORD_TOKEN, APPLICATION_ID, ADMIN_CHANNEL_ID,
     BLOCKFROST_PROJECT_ID, BLOCKFROST_BASE_URL, DATABASE_URL, WEBHOOK_SECRET,
     MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_COOLDOWN,
-    YUMMI_POLICY_ID,
+    YUMMI_POLICY_ID, HEALTH_METRICS_TTL,
     validate_config
 )
 from shutdown_manager import ShutdownManager
@@ -273,6 +273,9 @@ class WalletBudBot(commands.Bot):
         self.db_maintenance = DatabaseMaintenance()
         logger.info("DatabaseMaintenance initialized")
         
+        # Initialize database pool
+        self.pool = None  # Will be initialized in setup_hook
+        
         self.blockfrost_session = None
         self.session = None
         self.connector = None
@@ -290,6 +293,8 @@ class WalletBudBot(commands.Bot):
             'webhook_failure': 0,
             'errors': []
         }
+        # Initialize health cache
+        self._health_cache = TTLCache(maxsize=1, ttl=HEALTH_METRICS_TTL)
         logger.info("Health metrics initialized")
         
         # Initialize monitoring state
@@ -891,60 +896,39 @@ class WalletBudBot(commands.Bot):
             health_data = await self.health_check()
             
             # Update metrics
-            self.update_health_metrics('last_health_check', datetime.utcnow())
-            self.update_health_metrics('is_healthy', health_data['status'] == 'healthy')
+            await self.update_health_metrics('last_health_check', datetime.utcnow())
+            await self.update_health_metrics('is_healthy', health_data['status'] == 'healthy')
             
             # Log status and alert if needed
             if health_data['status'] == 'healthy':
-                logger.info("Health check passed: All systems operational")
+                logger.debug("Health check passed")
             else:
-                # Format error message
-                unhealthy_components = [
-                    name for name, data in health_data['components'].items() 
-                    if not data.get('healthy', False)
-                ]
+                logger.warning(f"Health check reported status: {health_data['status']}")
                 
-                if health_data['status'] == 'degraded':
-                    logger.warning(f"Health check warning: System degraded. Components: {unhealthy_components}")
-                else:
-                    logger.error(f"Health check failed: System unhealthy. Components: {unhealthy_components}")
-                
-                # Alert admin channel if available
+                # Alert admin channel if configured
                 if self.admin_channel:
+                    # Create embed for health alert
                     embed = discord.Embed(
-                        title="🚨 Health Alert",
-                        description=f"Status: {health_data['status'].upper()}",
-                        color=discord.Color.red() if health_data['status'] == 'unhealthy' else discord.Color.orange()
+                        title=" System Health Alert",
+                        description=f"Status: {health_data['status']}",
+                        color=discord.Color.red()
                     )
                     
                     # Add component statuses
-                    for name, data in health_data['components'].items():
-                        status = "✅" if data.get('healthy', False) else "❌"
-                        value = f"Status: {status}\n"
-                        
-                        if 'error' in data:
-                            value += f"Error: {data['error']}\n"
-                        if 'warning' in data:
-                            value += f"Warning: {data['warning']}\n"
-                            
-                        # Add component-specific details
-                        if name == 'discord' and 'latency' in data:
-                            value += f"Latency: {data['latency']}ms\n"
-                        elif name == 'database' and 'used_connections' in data:
-                            value += f"Connections: {data['used_connections']}/{data['max_size']}\n"
-                        elif name == 'blockfrost' and 'rate_limits' in data:
-                            value += f"API Calls Remaining: {data['rate_limits']['remaining']}\n"
-                        elif name == 'system' and 'cpu_percent' in data:
-                            value += f"CPU: {data['cpu_percent']}%\nMemory: {data['memory_percent']}%\n"
-                            
-                        embed.add_field(name=name.title(), value=value, inline=True)
+                    for component, data in health_data['components'].items():
+                        if not data.get('healthy', False):
+                            embed.add_field(
+                                name=f"{component} Status",
+                                value=data.get('error', 'No error details'),
+                                inline=False
+                            )
                     
                     # Add recent errors if any
-                    if health_data.get('recent_errors'):
-                        error_list = "\n".join(f"• {err}" for err in health_data['recent_errors'])
+                    if 'recent_errors' in health_data:
+                        error_list = '\n'.join(health_data['recent_errors'][-3:])  # Show last 3 errors
                         embed.add_field(
                             name="Recent Errors",
-                            value=f"```\n{error_list}\n```",
+                            value=error_list or "None",
                             inline=False
                         )
                     
@@ -961,7 +945,7 @@ class WalletBudBot(commands.Bot):
             logger.info(f"Connected to {len(self.guilds)} guilds")
             
             # Log connection details
-            self.update_health_metrics('discord_connection', {
+            await self.update_health_metrics('discord_connection', {
                 'connected_at': datetime.utcnow().isoformat(),
                 'guild_count': len(self.guilds),
                 'latency': round(self.latency * 1000, 2)  # in ms
@@ -988,11 +972,38 @@ class WalletBudBot(commands.Bot):
             if hasattr(e, '__dict__'):
                 logger.error(f"Error details: {e.__dict__}")
 
+    async def setup_admin_channel(self):
+        """Set up the admin channel for bot notifications"""
+        try:
+            if not self.admin_channel_id:
+                logger.warning("No admin channel ID configured")
+                return
+
+            # Try to fetch the channel
+            channel = self.get_channel(int(self.admin_channel_id))
+            if not channel:
+                logger.error(f"Could not find admin channel with ID {self.admin_channel_id}")
+                return
+
+            self.admin_channel = channel
+            logger.info(f"Admin channel set up successfully: {channel.name}")
+            
+            # Update health metrics
+            await self.update_health_metrics('admin_channel', {
+                'id': self.admin_channel_id,
+                'name': channel.name,
+                'guild': channel.guild.name if channel.guild else None
+            })
+            
+        except Exception as e:
+            logger.error(f"Error setting up admin channel: {e}", exc_info=True)
+            self.admin_channel = None
+
     async def on_connect(self):
         """Called when the bot connects to Discord"""
         try:
             logger.info("Bot connected to Discord")
-            self.update_health_metrics('discord_status', 'connected')
+            await self.update_health_metrics('discord_status', 'connected')
             
             # Check all connections on connect
             await self.check_connections()
@@ -1004,7 +1015,7 @@ class WalletBudBot(commands.Bot):
         """Called when the bot disconnects from Discord"""
         try:
             logger.warning("Bot disconnected from Discord")
-            self.update_health_metrics('discord_status', 'disconnected')
+            await self.update_health_metrics('discord_status', 'disconnected')
             
             # Log disconnect to admin channel
             if self.admin_channel:
@@ -1047,7 +1058,7 @@ class WalletBudBot(commands.Bot):
             logger.info(f"Blockfrost Status: {bf_status}")
             
             # Update health metrics
-            self.update_health_metrics('connections', {
+            await self.update_health_metrics('connections', {
                 'discord': discord_status,
                 'database': db_status,
                 'blockfrost': bf_status,
@@ -1521,7 +1532,7 @@ class WalletBudBot(commands.Bot):
                                     policy_id = amount['unit'][:56]
                                     if policy_id == os.getenv('YUMMI_POLICY_ID'):
                                         # Send notification
-                                        message = f"🍬 YUMMI Token Update!\n"
+                                        message = f" YUMMI Token Update!\n"
                                         message += f"Address: `{address}`\n"
                                         message += f"Balance: {amount['quantity']} YUMMI\n"
                                         

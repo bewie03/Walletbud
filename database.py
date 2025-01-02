@@ -65,60 +65,65 @@ def should_recreate_pool(current_time):
 async def get_pool():
     """Get database connection pool with proper PostgreSQL configuration"""
     global _pool, _pool_creation_time, _last_error_time, _error_count
-
+    
     async with _pool_lock:
+        current_time = datetime.now()
+        
         try:
-            current_time = datetime.now()
-            
-            if should_recreate_pool(current_time):
-                logger.info("Creating/recreating database connection pool")
-                
-                # Clean up old pool if it exists
-                if _pool:
-                    try:
-                        await _pool.close()
-                    except Exception as e:
-                        logger.warning(f"Error closing old pool: {e}")
-                
-                # Get database URL with proper configuration
-                db_url = get_database_url()
-                
-                # Create new pool with proper configuration
-                _pool = await asyncpg.create_pool(
-                    db_url,
-                    min_size=DB_CONFIG['MIN_POOL_SIZE'],
-                    max_size=DB_CONFIG['MAX_POOL_SIZE'],
-                    max_inactive_connection_lifetime=DB_CONFIG['MAX_INACTIVE_CONNECTION_LIFETIME'],
-                    command_timeout=DB_CONFIG['COMMAND_TIMEOUT'],
-                    server_settings={
-                        'application_name': 'walletbud',
-                        'statement_timeout': str(DB_CONFIG['COMMAND_TIMEOUT'] * 1000),
-                        'idle_in_transaction_session_timeout': '300000',  # 5 minutes
-                        'client_encoding': 'UTF8'
-                    }
-                )
+            # Check if we need to recreate the pool
+            if _pool is None or should_recreate_pool(current_time):
+                if _pool is not None:
+                    logger.info("Closing existing database pool")
+                    await _pool.close()
                 
                 # Reset error tracking
-                _pool_creation_time = current_time
                 _last_error_time = None
                 _error_count = 0
                 
-                logger.info("Successfully created new connection pool")
+                # Create new pool with timeouts and proper SSL
+                logger.info("Creating new database pool")
+                _pool = await asyncpg.create_pool(
+                    get_database_url(),
+                    min_size=DB_CONFIG['min_connections'],
+                    max_size=DB_CONFIG['max_connections'],
+                    command_timeout=DB_CONFIG.get('command_timeout', 60.0),
+                    timeout=DB_CONFIG.get('connection_timeout', 30.0),
+                    max_queries=DB_CONFIG.get('max_queries', 50000),
+                    max_cached_statement_lifetime=DB_CONFIG.get('max_cached_statement_lifetime', 300),
+                    max_cacheable_statement_size=DB_CONFIG.get('max_cacheable_statement_size', 1024 * 10),
+                    ssl='require'
+                )
+                _pool_creation_time = current_time
+                
+                # Test the connection
+                async with _pool.acquire() as conn:
+                    await conn.execute('SELECT 1')
+                
+                logger.info("Database pool created successfully")
             
             return _pool
             
-        except Exception as e:
-            # Handle connection errors
-            _error_count += 1
+        except (asyncpg.PostgresError, asyncpg.exceptions.TooManyConnectionsError) as e:
+            # Track error
+            if _last_error_time is None or (current_time - _last_error_time) > _error_threshold:
+                _error_count = 1
+            else:
+                _error_count += 1
             _last_error_time = current_time
             
-            logger.error(f"Error in get_pool: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
+            # Log detailed error
+            logger.error(
+                f"Database connection error (attempt {_error_count}): {str(e)}",
+                exc_info=True
+            )
             
-            # Force pool recreation on next attempt
-            _pool = None
-            raise
+            # Force pool recreation if too many errors
+            if _error_count >= _max_errors:
+                logger.warning("Too many database errors, forcing pool recreation")
+                _pool = None
+                _pool_creation_time = None
+            
+            raise ConnectionError(f"Failed to get database connection: {str(e)}")
 
 def get_database_url():
     """Get and validate database URL with proper Heroku postgres:// to postgresql:// conversion"""
