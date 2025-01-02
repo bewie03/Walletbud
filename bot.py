@@ -325,9 +325,7 @@ class WalletBudBot(commands.Bot):
             secret=webhook_auth,
             max_queue_size=WEBHOOK_CONFIG['MAX_QUEUE_SIZE'],
             batch_size=WEBHOOK_CONFIG['BATCH_SIZE'],
-            max_retries=WEBHOOK_CONFIG['MAX_RETRIES'],
-            max_event_age=WEBHOOK_CONFIG['MAX_EVENT_AGE'],
-            cleanup_interval=WEBHOOK_CONFIG['CLEANUP_INTERVAL']
+            max_retries=WEBHOOK_CONFIG['MAX_RETRIES']
         )
         logger.info("Webhook queue initialized with auth token")
         
