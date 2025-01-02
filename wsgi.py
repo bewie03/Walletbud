@@ -64,6 +64,7 @@ async def init_app():
             logger.info("Initializing bot instance...")
             try:
                 bot = WalletBudBot()
+                bot.app = app  # Pass app instance to bot
                 
                 # Configure bot's client session with optimized settings
                 timeout = aiohttp.ClientTimeout(total=30, connect=10)

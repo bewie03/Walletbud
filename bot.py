@@ -1261,26 +1261,17 @@ class WalletBudBot(commands.Bot):
     async def start_webhook(self):
         """Start the webhook server"""
         try:
-            # Get port from environment
-            port = int(os.getenv('PORT', 8080))
-            
-            # Create aiohttp app and add routes
-            app = web.Application()
-            app.router.add_post('/webhook', self.handle_webhook)
-            
-            # Initialize webhook components
-            self.runner = web.AppRunner(app)
-            await self.runner.setup()
-            
-            # Create site and start it
-            self.site = web.TCPSite(self.runner, '0.0.0.0', port)
-            await self.site.start()
-            
-            logger.info(f"Webhook server started on port {port}")
-            await self.update_health_metrics('webhook_server', 'started')
-            
+            # In production (Heroku), we use the web app from wsgi.py
+            # This method only needs to register the route
+            if hasattr(self, 'app'):
+                self.app.router.add_post('/webhook', self.handle_webhook)
+                logger.info("Webhook route registered")
+                await self.update_health_metrics('webhook_server', 'started')
+            else:
+                logger.warning("No app instance available for webhook registration")
+                
         except Exception as e:
-            logger.error(f"Failed to start webhook server: {e}")
+            logger.error(f"Failed to register webhook route: {e}")
             await self.update_health_metrics('webhook_server', 'failed')
             raise
 
