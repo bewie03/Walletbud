@@ -1082,37 +1082,56 @@ class WalletBudBot(commands.Bot):
     async def init_blockfrost(self):
         """Initialize Blockfrost API client with proper error handling"""
         try:
-            if self.blockfrost_session is None:
-                # Initialize connector and session
-                if self.connector is None:
-                    self.connector = aiohttp.TCPConnector(ssl=self.ssl_context, limit=100)
-                if self.session is None:
-                    self.session = aiohttp.ClientSession(connector=self.connector)
-                
-                # Initialize Blockfrost session with project ID in headers
-                if not BLOCKFROST_PROJECT_ID:
-                    raise ValueError("BLOCKFROST_PROJECT_ID environment variable not set")
-                    
-                self.blockfrost_session = aiohttp.ClientSession(
-                    base_url=BLOCKFROST_BASE_URL,
-                    headers={'project_id': BLOCKFROST_PROJECT_ID},
-                    connector=self.connector
-                )
-                
-                # Test connection
-                async with self.blockfrost_session.get('/health') as response:
-                    if response.status != 200:
-                        raise Exception(f"Blockfrost API health check failed: {response.status}")
-                        
-                logger.info("Blockfrost API initialized successfully")
-                await self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
+            # Check if we already have a session
+            if self.blockfrost_session:
+                try:
+                    # Test the session
+                    await self.blockfrost_request('/health')
+                    logger.info("Reusing existing Blockfrost session")
+                    return
+                except Exception:
+                    # Session is invalid, close it
+                    await self._cleanup_blockfrost()
+            
+            # Get project ID from environment
+            project_id = os.getenv('BLOCKFROST_PROJECT_ID')
+            if not project_id:
+                raise Exception("BLOCKFROST_PROJECT_ID not set")
+            
+            # Create connector with proper SSL context
+            connector = aiohttp.TCPConnector(
+                limit=100,  # Connection pool size
+                ttl_dns_cache=300,  # DNS cache TTL
+                use_dns_cache=True,
+                ssl=self.ssl_context
+            )
+            
+            # Create session with proper timeout and headers
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            self.blockfrost_session = aiohttp.ClientSession(
+                base_url=os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0'),
+                headers={
+                    'project_id': project_id,
+                    'Content-Type': 'application/json'
+                },
+                timeout=timeout,
+                connector=connector,
+                raise_for_status=True
+            )
+            
+            # Test the connection
+            await self.blockfrost_request('/health')
+            logger.info("Blockfrost session initialized successfully")
+            await self.update_health_metrics('blockfrost_init', True)
             
         except Exception as e:
-            logger.error(f"Blockfrost initialization failed: {e}")
+            logger.error(f"Failed to initialize Blockfrost: {e}", exc_info=True)
+            await self.update_health_metrics('blockfrost_init', False)
             raise
 
     async def blockfrost_request(self, endpoint: str, method: str = 'GET', **kwargs):
-        """Make a request to Blockfrost API with rate limiting and error handling
+        """
+        Make a request to Blockfrost API with rate limiting and error handling
         
         Args:
             endpoint: API endpoint to call (e.g. '/health')
@@ -1126,29 +1145,33 @@ class WalletBudBot(commands.Bot):
             Exception: If API request fails
         """
         try:
-            # Ensure endpoint starts with /
-            if not endpoint.startswith('/'):
-                endpoint = '/' + endpoint
-                
-            # Acquire rate limit token
-            await self.rate_limiter.acquire('blockfrost')
-            try:
-                # Make request using base_url from session
-                async with self.blockfrost_session.request(method, endpoint, **kwargs) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        error_text = await response.text()
-                        raise Exception(f"Blockfrost API request failed: {response.status} - {error_text}")
-            finally:
-                try:
-                    # Release rate limit token
-                    await self.rate_limiter.release('blockfrost')
-                except Exception as e:
-                    logger.error(f"Error releasing rate limit token: {e}", exc_info=True)
+            # Initialize session if needed
+            if not self.blockfrost_session:
+                await self.init_blockfrost()
+                if not self.blockfrost_session:
+                    raise Exception("Failed to initialize Blockfrost session")
+            
+            # Add project ID to headers if not already present
+            headers = kwargs.get('headers', {})
+            if 'project_id' not in headers:
+                headers['project_id'] = os.getenv('BLOCKFROST_PROJECT_ID')
+            kwargs['headers'] = headers
+            
+            # Ensure URL is properly formed
+            base_url = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0').rstrip('/')
+            url = f"{base_url}/{endpoint.lstrip('/')}"
+            
+            # Make request with rate limiting
+            async with self.rate_limiter.acquire('blockfrost'):
+                async with self.blockfrost_session.request(method, url, **kwargs) as response:
+                    if response.status == 403:
+                        logger.error("Blockfrost API returned 403 - check project ID")
+                        raise Exception("Invalid Blockfrost project ID")
+                    response.raise_for_status()
+                    return await response.json()
                     
         except Exception as e:
-            logger.error(f"Error in Blockfrost request: {e}")
+            logger.error(f"Error in Blockfrost request: {endpoint} - {str(e)}")
             raise
 
     async def on_resumed(self):
