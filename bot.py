@@ -1403,106 +1403,34 @@ class WalletBudBot(commands.Bot):
             raise
 
     async def handle_webhook(self, request: web.Request) -> web.Response:
-        """Handle incoming webhook request"""
+        """Handle incoming webhook request from Blockfrost"""
+        request_id = str(uuid.uuid4())
+        logger.info(f"Received webhook request {request_id}")
+        
         try:
-            # Validate request method
-            if request.method != 'POST':
-                logger.warning(f"Invalid request method: {request.method}")
-                return web.Response(status=405)
-                
-            # Validate content type
-            content_type = request.headers.get('Content-Type', '')
-            if not content_type.startswith('application/json'):
-                logger.warning(f"Invalid content type: {content_type}")
-                return web.Response(status=415)
-                
-            # Get webhook signature
+            # Log headers
+            logger.debug("Request headers:")
+            for name, value in request.headers.items():
+                # Skip logging sensitive headers
+                if name.lower() not in ['authorization', 'cookie']:
+                    logger.debug(f"{name}: {value}")
+            
+            # Get signature from header
             signature = request.headers.get('Blockfrost-Signature-1')
             if not signature:
-                logger.warning("Missing Blockfrost-Signature-1 header")
-                return web.Response(status=401)
+                logger.warning(f"Missing Blockfrost-Signature-1 header for request {request_id}")
+                return web.Response(status=401, text="Missing signature header")
                 
-            # Get payload size
-            content_length = request.content_length
-            if content_length is None:
-                logger.warning("Missing Content-Length header")
-                return web.Response(status=411)
-                
-            if content_length > WEBHOOK_CONFIG['MAX_PAYLOAD_SIZE']:
-                logger.warning(f"Payload too large: {content_length} bytes")
-                return web.Response(status=413)
-                
-            # Read raw payload bytes for signature validation
+            # Read raw request body
             try:
-                payload_bytes = await request.read()
-                if not payload_bytes:
-                    logger.warning("Empty request body")
-                    return web.Response(status=400)
+                payload = await request.read()
+                logger.debug(f"Raw payload ({len(payload)} bytes): {payload[:100]!r}...")
             except Exception as e:
-                logger.error(f"Error reading payload: {e}")
-                return web.Response(status=400)
+                logger.error(f"Error reading request body: {e}", exc_info=True)
+                return web.Response(status=400, text="Invalid request body")
                 
-            # Validate signature using raw bytes
-            if not self.webhook_queue.validate_signature(signature, payload_bytes):
-                logger.warning("Invalid webhook signature")
-                return web.Response(status=401)
-                
-            # Parse JSON payload
-            try:
-                data = json.loads(payload_bytes)
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON payload: {e}")
-                return web.Response(status=400)
-                
-            # Queue webhook event
-            event_type = data.get('type')
-            if not event_type:
-                logger.warning("Missing event type in payload")
-                return web.Response(status=400)
-                
-            await self.webhook_queue.add_event(event_type, data)
-            logger.info(f"Queued {event_type} webhook event")
-            return web.Response(status=200)
-            
-        except Exception as e:
-            logger.error(f"Error handling webhook: {e}", exc_info=True)
-            return web.Response(status=500)
-
-async def main(app):
-    """Main entry point for the bot when running locally"""
-    global bot
-    try:
-        # Initialize the bot
-        bot = WalletBudBot()
-        await bot.start(os.getenv('DISCORD_TOKEN'))
-    except Exception as e:
-        logger.error(f"Failed to start bot: {str(e)}")
-        raise
-    finally:
-        if not bot.is_closed():
-            await bot.close()
-
-if __name__ == "__main__":
-    # Create aiohttp app for local development
-    app = web.Application()
-    
-    # Initialize bot instance
-    bot = WalletBudBot()
-    
-    # Add webhook route and health check
-    app.router.add_post('/webhook', bot.handle_webhook)
-    app.router.add_get('/health', bot.health_check)
-    
-    # Add cleanup callback
-    app.on_cleanup.append(bot.close)
-    
-    # Run the application
-    try:
-        web.run_app(
-            app,
-            port=int(os.getenv('PORT', 8080)),
-            ssl_context=bot.ssl_context
-        )
-    except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
-        sys.exit(1)
+            # Validate signature
+            if not self.webhook_queue.validate_signature(signature, payload):
+                logger.warning(f"Invalid signature for webhook request {request_id}")
+                return web.Response(status=401, text="Invalid signature")
+{{ ... }}

@@ -507,6 +507,11 @@ class WebhookQueue:
             return False
             
         try:
+            # Log key information
+            logger.debug(f"Auth token length: {len(self.secret)}")
+            logger.debug(f"Payload length: {len(payload)} bytes")
+            logger.debug(f"Signature length: {len(signature)}")
+            
             # Calculate HMAC using SHA-512 of raw request body
             expected = hmac.new(
                 key=self.secret.encode('utf-8'),
@@ -514,13 +519,18 @@ class WebhookQueue:
                 digestmod=hashlib.sha512
             ).hexdigest()
             
+            # Log signatures for comparison
+            logger.debug(f"Received signature: {signature}")
+            logger.debug(f"Expected signature: {expected}")
+            
             # Use constant-time comparison (both lowercase to match Blockfrost behavior)
             is_valid = hmac.compare_digest(signature.lower(), expected.lower())
             
             if not is_valid:
                 logger.warning("Invalid webhook signature")
-                logger.debug(f"Expected: {expected[:32]}...")
-                logger.debug(f"Received: {signature[:32]}...")
+                logger.debug("Signature comparison failed")
+                logger.debug(f"Auth token prefix: {self.secret[:8]}...")
+                logger.debug(f"Payload prefix: {payload[:32]!r}")
                 
             return is_valid
             
