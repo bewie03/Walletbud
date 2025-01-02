@@ -75,16 +75,25 @@ RATE_LIMITS = {
 }
 
 # Webhook configuration
-WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')  # Secret for validating webhook signatures
-MAX_WEBHOOK_SIZE = int(os.getenv('MAX_WEBHOOK_SIZE', '1048576'))  # 1MB max payload size
-MAX_QUEUE_SIZE = int(os.getenv('MAX_QUEUE_SIZE', '10000'))  # Maximum number of events in queue
-MAX_EVENT_AGE = int(os.getenv('MAX_EVENT_AGE', '86400'))  # Maximum age of events in seconds (24 hours)
-BATCH_SIZE = int(os.getenv('BATCH_SIZE', '100'))  # Number of events to process in a batch
-MAX_RETRIES = int(os.getenv('MAX_RETRIES', '3'))  # Maximum number of retry attempts
-WEBHOOK_RATE_LIMIT = int(os.getenv('WEBHOOK_RATE_LIMIT', '100'))  # Max webhook requests per minute
-PROCESS_INTERVAL = int(os.getenv('PROCESS_INTERVAL', '5'))  # Webhook processing interval in seconds
-MAX_ERROR_HISTORY = int(os.getenv('MAX_ERROR_HISTORY', '1000'))  # Maximum number of errors to keep in history
-WEBHOOK_IDENTIFIER = os.getenv('WEBHOOK_IDENTIFIER', 'WalletBud')  # Identifier for webhook requests
+WEBHOOK_CONFIG = {
+    'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '500')),  # Reduced from 1000
+    'BATCH_SIZE': int(os.getenv('WEBHOOK_BATCH_SIZE', '10')),  # Process webhooks in smaller batches
+    'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
+    'RETRY_DELAY': int(os.getenv('WEBHOOK_RETRY_DELAY', '5')),  # 5 seconds
+    'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '86400')),  # 24 hours
+    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),  # 5 minutes
+    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '60')),  # 1 minute
+    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '100')),  # 100 requests per minute
+    'MAX_PAYLOAD_SIZE': int(os.getenv('WEBHOOK_MAX_PAYLOAD_SIZE', '1048576')),  # 1MB
+    'MAX_MEMORY_MB': int(os.getenv('WEBHOOK_MAX_MEMORY_MB', '512')),  # 512MB max memory usage
+}
+
+# Validate webhook config
+try:
+    validate_webhook_config(WEBHOOK_CONFIG)
+except ValueError as e:
+    logger.error(f"Invalid webhook configuration: {e}")
+    raise
 
 # Rate limiting configuration
 RATE_LIMIT_WINDOW = int(os.getenv('RATE_LIMIT_WINDOW', '60'))  # Window in seconds
@@ -371,10 +380,10 @@ ENV_VARS = {
         default="https://cardano-mainnet.blockfrost.io/api/v0"
     ),
     'WEBHOOK_SECRET': EnvVar(
-        name='WEBHOOK_SECRET',
-        description="Webhook verification secret",
-        required=False,
-        default="default_webhook_secret",
+        name='BLOCKFROST_WEBHOOK_SECRET',  # Changed to match Blockfrost's environment variable
+        description="Blockfrost webhook verification secret",
+        required=True,
+        validator=validate_blockfrost_webhook_secret,
         sensitive=True
     ),
     'APPLICATION_ID': EnvVar(
@@ -692,19 +701,6 @@ BALANCE_CHECK_INTERVAL = 300  # 5 minutes
 YUMMI_WARNING_THRESHOLD = 3   # Number of warnings before reset
 MINIMUM_YUMMI = 1000         # Minimum YUMMI tokens required
 
-# Webhook Queue Configuration
-WEBHOOK_CONFIG = {
-    'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '500')),  # Reduced from 1000
-    'BATCH_SIZE': int(os.getenv('WEBHOOK_BATCH_SIZE', '10')),  # Process webhooks in smaller batches
-    'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
-    'RETRY_DELAY': int(os.getenv('WEBHOOK_RETRY_DELAY', '5')),  # 5 seconds
-    'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '3600')),  # 1 hour
-    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),  # 5 minutes
-    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '60')),  # 1 minute
-    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '100')),  # per window
-    'MEMORY_LIMIT_MB': int(os.getenv('WEBHOOK_MEMORY_LIMIT_MB', '500')),  # 500MB memory limit
-}
-
 def validate_webhook_config(config: dict) -> None:
     """Validate webhook configuration values"""
     if not isinstance(config.get('MAX_QUEUE_SIZE'), int) or config['MAX_QUEUE_SIZE'] < 1:
@@ -730,13 +726,6 @@ def validate_webhook_config(config: dict) -> None:
         
     if not isinstance(config.get('RATE_LIMIT_MAX_REQUESTS'), int) or config['RATE_LIMIT_MAX_REQUESTS'] < 1:
         raise ValueError("WEBHOOK_RATE_LIMIT_MAX_REQUESTS must be a positive integer")
-
-# Validate webhook config
-try:
-    validate_webhook_config(WEBHOOK_CONFIG)
-except ValueError as e:
-    logging.error(f"Webhook configuration validation failed: {e}")
-    raise
 
 # Validate entire configuration
 def validate_config():

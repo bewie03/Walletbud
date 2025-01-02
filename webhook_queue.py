@@ -496,20 +496,26 @@ class WebhookQueue:
             bool: True if signature is valid
         """
         if not self.secret:
-            logger.warning("No webhook secret configured - skipping signature validation")
-            return True
-            
-        if not validate_webhook_secret(self.secret):
-            logger.error("Invalid webhook secret configuration")
+            logger.error("Webhook secret not configured")
             return False
             
         try:
-            expected = hmac.new(
-                self.secret.encode(),
-                payload.encode(),
-                hashlib.sha256
+            # Convert payload to bytes if it's a string
+            if isinstance(payload, str):
+                payload_bytes = payload.encode('utf-8')
+            else:
+                payload_bytes = payload
+
+            # Calculate HMAC using SHA-512
+            expected_signature = hmac.new(
+                self.secret.encode('utf-8'),
+                payload_bytes,
+                hashlib.sha512
             ).hexdigest()
-            return hmac.compare_digest(signature, expected)
+            
+            # Use constant-time comparison
+            return hmac.compare_digest(signature, expected_signature)
+            
         except Exception as e:
             logger.error(f"Error validating signature: {e}")
             return False
