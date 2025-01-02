@@ -3,6 +3,7 @@ from aiohttp import web
 from bot import WalletBudBot
 from config import DISCORD_TOKEN
 import logging
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -63,3 +64,9 @@ app.on_cleanup.append(cleanup)
 logger.info("Handlers registered")
 
 logger.info("wsgi.py initialization complete")
+
+# Run the application
+if __name__ == "__main__":
+    logger.info("Starting aiohttp application...")
+    web.run_app(app, port=int(os.environ.get("PORT", 8080)))
+    logger.info("Application started")
