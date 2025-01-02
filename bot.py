@@ -1318,7 +1318,7 @@ class WalletBudBot(commands.Bot):
                 return web.Response(status=500, text="Error verifying signature")
 
             # Process webhook based on type
-            webhook_type = webhook_data.get('webhook_type')
+            webhook_type = webhook_data['payload'].get('type')
             if webhook_type == 'transaction':
                 await self._handle_transaction_webhook(webhook_data['payload'])
             elif webhook_type == 'delegation':
@@ -1336,26 +1336,28 @@ class WalletBudBot(commands.Bot):
 
     def _validate_webhook_structure(self, webhook_data: dict):
         """Validate webhook data structure"""
-        required_fields = ['webhook_id', 'webhook_type', 'created_at', 'payload']
-        for field in required_fields:
-            if field not in webhook_data:
-                raise ValueError(f"Missing required field: {field}")
-                
-        # Validate webhook ID
-        webhook_id = webhook_data['webhook_id']
-        tx_webhook_id = os.getenv('BLOCKFROST_TX_WEBHOOK_ID')
-        del_webhook_id = os.getenv('BLOCKFROST_DEL_WEBHOOK_ID')
-        
-        if webhook_id not in [tx_webhook_id, del_webhook_id]:
-            raise ValueError(f"Invalid webhook ID: {webhook_id}")
+        # Validate basic structure
+        if not isinstance(webhook_data, dict):
+            raise ValueError("Invalid webhook data: must be a dictionary")
+            
+        # Validate payload
+        if 'payload' not in webhook_data:
+            raise ValueError("Missing required field: payload")
+            
+        payload = webhook_data['payload']
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid payload: must be a dictionary")
+            
+        # Get webhook type from payload
+        webhook_type = payload.get('type')
+        if not webhook_type:
+            raise ValueError("Missing required field: type in payload")
             
         # Validate webhook type
-        webhook_type = webhook_data['webhook_type']
         if webhook_type not in ['transaction', 'delegation']:
             raise ValueError(f"Invalid webhook type: {webhook_type}")
             
         # Validate payload structure based on type
-        payload = webhook_data['payload']
         if webhook_type == 'transaction':
             required_tx_fields = ['tx', 'block', 'confirmations']
             for field in required_tx_fields:
@@ -1449,55 +1451,6 @@ class WalletBudBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error processing delegation webhook: {e}")
             raise
-
-    async def _check_yummi_balances(self):
-        """Check YUMMI token balances for all wallets"""
-        try:
-            async with await self._ensure_yummi_check_lock():
-                if self.processing_yummi:
-                    logger.info("YUMMI balance check already in progress")
-                    return
-                    
-                self.processing_yummi = True
-                
-            try:
-                # Get all wallets
-                pool = await get_pool()
-                wallets = await pool.fetch("SELECT * FROM wallets")
-                
-                for wallet in wallets:
-                    try:
-                        # Skip if notifications disabled
-                        if not await self.should_notify(wallet['user_id'], 'token_changes'):
-                            continue
-                            
-                        # Get token balances
-                        address = wallet['address']
-                        token_balances = await self.blockfrost_request(f'/addresses/{address}/utxos')
-                        
-                        # Process token balances
-                        for utxo in token_balances:
-                            for amount in utxo['amount']:
-                                if amount['unit'] != 'lovelace':  # Skip ADA
-                                    # Check if it's a YUMMI token
-                                    policy_id = amount['unit'][:56]
-                                    if policy_id == os.getenv('YUMMI_POLICY_ID'):
-                                        # Send notification
-                                        message = f" YUMMI Token Update!\n"
-                                        message += f"Address: `{address}`\n"
-                                        message += f"Balance: {amount['quantity']} YUMMI\n"
-                                        
-                                        await self.send_dm(wallet['user_id'], message)
-                                        
-                    except Exception as e:
-                        logger.error(f"Error checking YUMMI balance for wallet {wallet['address']}: {e}")
-                        continue
-                        
-            finally:
-                self.processing_yummi = False
-                
-        except Exception as e:
-            logger.error(f"Error in YUMMI balance check: {e}")
 
 async def main(app):
     """Main entry point for the bot when running locally"""
