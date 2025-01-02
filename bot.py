@@ -731,86 +731,52 @@ class WalletBudBot(commands.Bot):
     async def health_check(self) -> Dict[str, Any]:
         """Comprehensive health check of all system components"""
         try:
-            current_time = datetime.utcnow()
-            health_data = {
-                'status': 'healthy',
-                'components': {},
-                'last_check': current_time.isoformat(),
-                'uptime': (current_time - self.health_metrics['start_time']).total_seconds() if self.health_metrics['start_time'] else 0
-            }
-
-            # Check Discord connection
-            health_data['components']['discord'] = {
-                'status': 'connected' if self.is_ready() else 'disconnected',
-                'latency': round(self.latency * 1000, 2)  # Convert to ms
-            }
-
-            # Check database connection
-            try:
-                pool = await get_pool()
-                async with pool.acquire() as conn:
-                    await conn.fetchval('SELECT 1')
-                health_data['components']['database'] = {
-                    'status': 'connected',
-                    'last_query': self.health_metrics['last_db_query'].isoformat() if self.health_metrics['last_db_query'] else None
-                }
-            except Exception as e:
-                logger.error(f"Database health check failed: {e}")
-                health_data['components']['database'] = {
-                    'status': 'error',
-                    'error': str(e)
-                }
-                health_data['status'] = 'degraded'
-
-            # Check Blockfrost API
-            try:
-                if self.blockfrost_session:
-                    async with self.blockfrost_session.get('/health') as response:
-                        if response.status == 200:
-                            health = await response.json()
-                            if health.get('is_healthy'):
-                                health_data['components']['blockfrost'] = {
-                                    'status': 'connected',
-                                    'last_call': self.health_metrics['last_api_call'].isoformat() if self.health_metrics['last_api_call'] else None
-                                }
-                            else:
-                                raise Exception(f"Blockfrost API is not healthy: {health}")
-                        else:
-                            raise Exception(f"Health check failed with status {response.status}")
-                else:
-                    health_data['components']['blockfrost'] = {'status': 'not_initialized'}
-                    health_data['status'] = 'degraded'
-            except Exception as e:
-                logger.error(f"Blockfrost health check failed: {e}")
-                health_data['components']['blockfrost'] = {
-                    'status': 'error',
-                    'error': str(e)
-                }
-                health_data['status'] = 'degraded'
-
-            # Check system resources
-            process = psutil.Process()
-            health_data['components']['system'] = {
-                'cpu_percent': process.cpu_percent(),
-                'memory_percent': process.memory_percent(),
-                'threads': process.num_threads()
-            }
-
-            # Log health status
-            if health_data['status'] != 'healthy':
-                logger.warning(f"Health check returned degraded status: {json.dumps(health_data, indent=2)}")
-            else:
-                logger.info("Health check passed successfully")
-
-            return health_data
-
+            async with self.health_lock:
+                # Check Discord connection
+                if not self.is_ready():
+                    logger.warning("Bot is not connected to Discord")
+                    return False
+                    
+                # Check database connection
+                try:
+                    pool = await get_pool()
+                    async with pool.acquire() as conn:
+                        await conn.execute("SELECT 1")
+                except Exception as e:
+                    logger.error(f"Database health check failed: {e}")
+                    return False
+                    
+                # Check Blockfrost API
+                try:
+                    await self.blockfrost_request('/health')
+                except Exception as e:
+                    logger.error(f"Blockfrost API health check failed: {e}")
+                    return False
+                    
+                return True
+                
         except Exception as e:
-            logger.error(f"Health check failed: {e}\n{traceback.format_exc()}")
-            return {
-                'status': 'error',
-                'error': str(e),
-                'timestamp': datetime.utcnow().isoformat()
-            }
+            logger.error(f"Health check failed: {e}")
+            return False
+            
+    async def monitor_health(self):
+        """Monitor bot health status"""
+        try:
+            # Perform health check
+            is_healthy = await self.health_check()
+            
+            # Update metrics
+            self.update_health_metrics('last_health_check', datetime.now())
+            self.update_health_metrics('is_healthy', is_healthy)
+            
+            # Log status
+            if is_healthy:
+                logger.info("Health check passed")
+            else:
+                logger.warning("Health check failed")
+                
+        except Exception as e:
+            logger.error(f"Health monitoring failed: {e}")
 
     @app_commands.command(name="health")
     @app_commands.checks.has_permissions(administrator=True)
@@ -823,42 +789,25 @@ class WalletBudBot(commands.Bot):
             # Create embed
             embed = discord.Embed(
                 title=" Bot Health Status",
-                color=discord.Color.green() if health['status'] == 'healthy'
-                else discord.Color.orange() if health['status'] == 'degraded'
-                else discord.Color.red()
+                color=discord.Color.green() if health else discord.Color.red()
             )
             
             # Components
             components = []
-            for name, info in health['components'].items():
-                status_emoji = "✅" if info['status'] in ['healthy', 'connected', 'running'] else "⚠️" if info['status'] == 'degraded' else "❌"
-                components.append(f"{status_emoji} **{name.title()}**: {info['status']}")
+            if health:
+                components.append("✅ **Discord**: Connected")
+                components.append("✅ **Database**: Connected")
+                components.append("✅ **Blockfrost**: Connected")
+            else:
+                components.append("❌ **Discord**: Disconnected")
+                components.append("❌ **Database**: Disconnected")
+                components.append("❌ **Blockfrost**: Disconnected")
             embed.add_field(
                 name="Components",
                 value="\n".join(components),
                 inline=False
             )
             
-            # Metrics
-            metrics = []
-            for name, value in health['metrics'].items():
-                if isinstance(value, float):
-                    value = f"{value:.2f}"
-                metrics.append(f"**{name.replace('_', ' ').title()}**: {value}")
-            embed.add_field(
-                name="Metrics",
-                value="\n".join(metrics),
-                inline=False
-            )
-            
-            # Errors
-            if health['errors']:
-                embed.add_field(
-                    name="⚠️ Errors",
-                    value="\n".join(f"- {error}" for error in health['errors'][-5:]),  # Show last 5 errors
-                    inline=False
-                )
-                
             await interaction.response.send_message(embed=embed, ephemeral=True)
             
         except Exception as e:
