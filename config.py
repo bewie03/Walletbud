@@ -96,7 +96,6 @@ MIN_ADA_BALANCE = float(os.getenv('MIN_ADA_BALANCE', '5.0'))  # Minimum ADA bala
 MAX_TX_PER_HOUR = int(os.getenv('MAX_TX_PER_HOUR', '100'))  # Maximum transactions per hour to process
 
 # YUMMI token configuration
-MINIMUM_YUMMI = int(os.getenv('MINIMUM_YUMMI', '1000000'))  # Minimum YUMMI tokens to hold
 YUMMI_POLICY_ID = os.getenv('YUMMI_POLICY_ID')  # YUMMI token policy ID
 YUMMI_TOKEN_NAME = os.getenv('YUMMI_TOKEN_NAME')  # YUMMI token name
 ASSET_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}" if YUMMI_POLICY_ID and YUMMI_TOKEN_NAME else None
@@ -556,6 +555,40 @@ ENV_VARS = {
         default="300",  # 5 minutes default
         validator=validate_positive_int,
     ),
+    'MINIMUM_YUMMI': EnvVar(
+        name='MINIMUM_YUMMI',
+        description="Minimum YUMMI tokens required",
+        default="1000",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'YUMMI_POLICY_ID': EnvVar(
+        name='YUMMI_POLICY_ID',
+        description="Policy ID for YUMMI tokens",
+        validator=validate_policy_id,
+        required=True
+    ),
+    'YUMMI_TOKEN_NAME': EnvVar(
+        name='YUMMI_TOKEN_NAME',
+        description="YUMMI Token Name (hex)",
+        validator=validate_token_name,
+        required=False,
+        default=None
+    ),
+    'COMMAND_COOLDOWN': EnvVar(
+        name='COMMAND_COOLDOWN',
+        description="Cooldown between command uses (seconds)",
+        default="3",
+        validator=validate_positive_int,
+        required=False
+    ),
+    'HEALTH_METRICS_TTL': EnvVar(
+        name='HEALTH_METRICS_TTL',
+        description="Time-to-live in seconds for health metrics cache",
+        default="300",  # 5 minutes default
+        validator=validate_positive_int,
+        required=False
+    )
 }
 
 # Notification settings
