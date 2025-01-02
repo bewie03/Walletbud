@@ -653,6 +653,12 @@ ENV_VARS = {
         validator=validate_minute,
         required=False
     ),
+    'HEALTH_METRICS_TTL': EnvVar(
+        name='HEALTH_METRICS_TTL',
+        description="Time-to-live in seconds for health metrics cache",
+        default="300",  # 5 minutes default
+        validator=validate_positive_int,
+    ),
 }
 
 # Notification settings
@@ -679,6 +685,7 @@ BLOCKFROST_PROJECT_ID = ENV_VARS['BLOCKFROST_PROJECT_ID'].get_value()
 BLOCKFROST_BASE_URL = ENV_VARS['BLOCKFROST_BASE_URL'].get_value()
 DATABASE_URL = ENV_VARS['DATABASE_URL'].get_value()
 WEBHOOK_SECRET = ENV_VARS['WEBHOOK_SECRET'].get_value()
+HEALTH_METRICS_TTL = ENV_VARS['HEALTH_METRICS_TTL'].get_value()
 
 # Rate limiting configuration
 MAX_REQUESTS_PER_SECOND = int(os.getenv('MAX_REQUESTS_PER_SECOND', '10'))
@@ -745,7 +752,7 @@ EMBED_FIELD_LIMIT = 25
 
 # Health check configuration
 HEALTH_CHECK_INTERVAL = 60  # seconds
-HEALTH_METRICS_TTL = 30     # seconds
+HEALTH_METRICS_TTL = ENV_VARS['HEALTH_METRICS_TTL'].get_value()     # seconds
 EMBED_CHAR_LIMIT = 1024     # Discord embed character limit
 
 # Command cooldowns (in seconds)
