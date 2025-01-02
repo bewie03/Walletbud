@@ -101,14 +101,17 @@ def validate_webhook_config(config: dict) -> None:
     if not isinstance(config.get('MAX_PAYLOAD_SIZE'), int) or config['MAX_PAYLOAD_SIZE'] < 1:
         raise ValueError("MAX_PAYLOAD_SIZE must be a positive integer")
         
+    if not isinstance(config.get('MAX_MEMORY_MB'), int) or config['MAX_MEMORY_MB'] < 1:
+        raise ValueError("MAX_MEMORY_MB must be a positive integer")
+        
     if not isinstance(config.get('RATE_LIMIT_WINDOW'), int) or config['RATE_LIMIT_WINDOW'] < 1:
         raise ValueError("RATE_LIMIT_WINDOW must be a positive integer")
         
     if not isinstance(config.get('RATE_LIMIT_MAX_REQUESTS'), int) or config['RATE_LIMIT_MAX_REQUESTS'] < 1:
         raise ValueError("RATE_LIMIT_MAX_REQUESTS must be a positive integer")
         
-    if not isinstance(config.get('MEMORY_LIMIT_MB'), int) or config['MEMORY_LIMIT_MB'] < 1:
-        raise ValueError("MEMORY_LIMIT_MB must be a positive integer")
+    if not isinstance(config.get('RETRY_DELAY'), int) or config['RETRY_DELAY'] < 1:
+        raise ValueError("RETRY_DELAY must be a positive integer")
 
 def validate_positive_int(value: str, name: str) -> int:
     """Validate and convert to positive integer"""
@@ -763,7 +766,10 @@ WEBHOOK_CONFIG = {
     'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '3600')),  # 1 hour
     'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),  # 5 minutes
     'MAX_MEMORY_MB': int(os.getenv('WEBHOOK_MAX_MEMORY_MB', '512')),  # 512MB memory limit
-    'MAX_PAYLOAD_SIZE': WEBHOOK_SECURITY['MAX_PAYLOAD_SIZE']  # Use same limit from security config
+    'MAX_PAYLOAD_SIZE': WEBHOOK_SECURITY['MAX_PAYLOAD_SIZE'],  # Use same limit from security config
+    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '60')),  # 1 minute window
+    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '60')),  # 60 requests per window
+    'RETRY_DELAY': int(os.getenv('WEBHOOK_RETRY_DELAY', '60'))  # 1 minute between retries
 }
 
 # Validate webhook configuration
