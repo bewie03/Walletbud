@@ -489,8 +489,9 @@ class WebhookQueue:
         if request_size > WEBHOOK_SECURITY['MAX_REQUEST_SIZE']:
             return False, "Request size exceeds limit"
             
-        # Check IP whitelist
-        if client_ip not in WEBHOOK_SECURITY['ALLOWED_IPS']:
+        # Check IP whitelist if configured
+        allowed_ips = WEBHOOK_SECURITY.get('ALLOWED_IPS', [])
+        if allowed_ips and client_ip not in allowed_ips:
             self.stats['total_blocked_ips'] += 1
             return False, "IP not whitelisted"
             

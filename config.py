@@ -723,7 +723,8 @@ WEBHOOK_SECURITY = {
         'allowed_methods': ['POST'],
         'allowed_headers': ['Content-Type', 'Blockfrost-Signature'],
         'max_age': 3600
-    }
+    },
+    'ALLOWED_IPS': ['137.184.191.15']  # Blockfrost webhook IP
 }
 
 WEBHOOK_CONFIG = {
