@@ -18,7 +18,6 @@ bot = WalletBudBot()
 app.router.add_post('/webhook', bot.handle_webhook)
 
 # Start the bot
-@app.on_startup
 async def start_bot(app):
     """Start the bot when the app starts"""
     try:
@@ -29,7 +28,6 @@ async def start_bot(app):
         raise
 
 # Cleanup on shutdown
-@app.on_shutdown
 async def cleanup(app):
     """Clean up when the app shuts down"""
     try:
@@ -37,3 +35,7 @@ async def cleanup(app):
         await bot.close()
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
+
+# Register startup and shutdown handlers
+app.on_startup.append(start_bot)
+app.on_cleanup.append(cleanup)
