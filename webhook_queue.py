@@ -19,7 +19,7 @@ import sys
 
 from config import (
     WEBHOOK_CONFIG,
-    WEBHOOK_SECRET
+    WEBHOOK_SECRETS
 )
 
 # Get port from Heroku environment, default to 8080 for local development
@@ -198,13 +198,13 @@ class RateLimiter:
 class WebhookQueue:
     """Queue for processing webhooks with rate limiting and retries"""
     
-    def __init__(self, secret: Optional[str] = None, max_queue_size: int = None,
+    def __init__(self, secret: str = None, max_queue_size: int = None,
                  batch_size: int = None, max_retries: int = None, 
                  max_event_age: int = None, cleanup_interval: int = None):
         """Initialize webhook queue
         
         Args:
-            secret: Optional webhook secret for validation
+            secret: Webhook auth token for signature validation
             max_queue_size: Maximum size of the queue
             batch_size: Number of events to process in a batch
             max_retries: Maximum number of retries per event
@@ -485,39 +485,47 @@ class WebhookQueue:
         """Register handler for event type"""
         self.event_handlers[event_type] = handler
         
-    def validate_signature(self, signature: str, payload: str) -> bool:
-        """Validate webhook signature
+    def validate_signature(self, signature: str, payload: bytes) -> bool:
+        """Validate Blockfrost webhook signature
+        
+        The signature is a hex-encoded HMAC-SHA512 hash of the raw request body,
+        using the webhook auth token as the key.
         
         Args:
-            signature: Webhook signature from request
-            payload: Raw request payload
+            signature: Hex-encoded HMAC signature from Blockfrost-Signature-1 header
+            payload: Raw request body bytes
             
         Returns:
             bool: True if signature is valid
         """
         if not self.secret:
-            logger.error("Webhook secret not configured")
+            logger.error("No webhook auth token configured")
+            return False
+            
+        if not signature:
+            logger.error("No signature provided")
             return False
             
         try:
-            # Convert payload to bytes if it's a string
-            if isinstance(payload, str):
-                payload_bytes = payload.encode('utf-8')
-            else:
-                payload_bytes = payload
-
-            # Calculate HMAC using SHA-512
-            expected_signature = hmac.new(
-                self.secret.encode('utf-8'),
-                payload_bytes,
-                hashlib.sha512
+            # Calculate HMAC using SHA-512 of raw request body
+            expected = hmac.new(
+                key=self.secret.encode('utf-8'),
+                msg=payload,
+                digestmod=hashlib.sha512
             ).hexdigest()
             
-            # Use constant-time comparison
-            return hmac.compare_digest(signature, expected_signature)
+            # Use constant-time comparison (both lowercase to match Blockfrost behavior)
+            is_valid = hmac.compare_digest(signature.lower(), expected.lower())
+            
+            if not is_valid:
+                logger.warning("Invalid webhook signature")
+                logger.debug(f"Expected: {expected[:32]}...")
+                logger.debug(f"Received: {signature[:32]}...")
+                
+            return is_valid
             
         except Exception as e:
-            logger.error(f"Error validating signature: {e}")
+            logger.error(f"Error validating signature: {e}", exc_info=True)
             return False
             
     async def _validate_event(self, event_type: str, payload: Dict[str, Any]) -> bool:

@@ -18,7 +18,7 @@ from database import (
 from decorators import dm_only, has_blockfrost, check_yummi_balance, command_cooldown
 from cardano.address_validation import validate_cardano_address
 from cachetools import TTLCache
-from config import MINIMUM_YUMMI, COMMAND_COOLDOWN
+from config import MINIMUM_YUMMI, COMMAND_COOLDOWN, YUMMI_POLICY_ID, YUMMI_ASSET_NAME
 from utils import format_ada_amount, format_token_amount
 import os
 import asyncio
@@ -93,54 +93,66 @@ class WalletCommands(commands.Cog):
             logging.error(f"Error getting user wallets: {e}")
             return []
 
+    async def get_token_balance(self, address: str, policy_id: str, asset_name: str) -> int:
+        """Get token balance for a specific asset"""
+        try:
+            balance_data = await self.get_address_balance(address)
+            return balance_data['tokens'].get(f"{policy_id}{asset_name}", 0)
+        except Exception as e:
+            logging.error(f"Error fetching token balance for {address}: {e}")
+            return 0
+
     @app_commands.command(name="add", description="Add a wallet to monitor")
     @commands.dm_only()
-    @check_yummi_balance()
     @command_cooldown(COMMAND_COOLDOWN)
     async def add(self, interaction: discord.Interaction, address: str):
         """Add a wallet to monitor"""
         try:
-            await interaction.response.defer(ephemeral=True)
-            
             # Validate address format
             if not await self.validate_address(address):
-                await interaction.followup.send(
-                    "❌ Invalid Cardano address format. Please check the address and try again.",
+                await interaction.response.send_message(
+                    "❌ Invalid Cardano address format",
                     ephemeral=True
                 )
                 return
 
-            # Check if address exists on chain
-            try:
-                await self.bot.rate_limited_request(
-                    self.bot.blockfrost.addresses,
-                    address=address
+            # Check if address already exists for user
+            existing_wallets = await self.get_user_wallets(interaction.user.id)
+            if address in existing_wallets:
+                await interaction.response.send_message(
+                    "❌ This wallet is already registered",
+                    ephemeral=True
                 )
-            except Exception as e:
-                await interaction.followup.send(
-                    "❌ Could not verify address on the blockchain. Please check the address and try again.",
+                return
+
+            # Check YUMMI balance of the new wallet
+            balance = await self.get_token_balance(
+                address,
+                YUMMI_POLICY_ID,
+                YUMMI_ASSET_NAME
+            ) or 0
+
+            if balance < MINIMUM_YUMMI:
+                await interaction.response.send_message(
+                    f"❌ This wallet needs at least {MINIMUM_YUMMI:,} YUMMI tokens to be registered.\n"
+                    f"Current balance: {balance:,} YUMMI",
                     ephemeral=True
                 )
                 return
 
             # Add wallet to database
-            success = await add_wallet(str(interaction.user.id), address)
+            await add_wallet(interaction.user.id, address)
             
-            if success:
-                await interaction.followup.send(
-                    f"✅ Successfully added wallet `{address[:20]}...` to your monitored wallets!",
-                    ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ This wallet is already being monitored or there was an error adding it.",
-                    ephemeral=True
-                )
-
+            await interaction.response.send_message(
+                f"✅ Successfully added wallet `{address}`\n"
+                f"YUMMI Balance: {balance:,} YUMMI",
+                ephemeral=True
+            )
+            
         except Exception as e:
-            logging.error(f"Error in add command: {e}")
-            await interaction.followup.send(
-                "❌ An error occurred while adding the wallet. Please try again later.",
+            logger.error(f"Error adding wallet: {e}")
+            await interaction.response.send_message(
+                "❌ Error adding wallet. Please try again later.",
                 ephemeral=True
             )
 

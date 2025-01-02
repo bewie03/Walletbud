@@ -85,14 +85,14 @@ def validate_webhook_config(config: dict) -> None:
     if not isinstance(config.get('MAX_RETRIES'), int) or config['MAX_RETRIES'] < 0:
         raise ValueError("MAX_RETRIES must be a non-negative integer")
         
-    if not isinstance(config.get('RETRY_DELAY'), int) or config['RETRY_DELAY'] < 1:
-        raise ValueError("RETRY_DELAY must be a positive integer")
-        
     if not isinstance(config.get('MAX_EVENT_AGE'), int) or config['MAX_EVENT_AGE'] < 1:
         raise ValueError("MAX_EVENT_AGE must be a positive integer")
         
     if not isinstance(config.get('CLEANUP_INTERVAL'), int) or config['CLEANUP_INTERVAL'] < 1:
         raise ValueError("CLEANUP_INTERVAL must be a positive integer")
+        
+    if not isinstance(config.get('MAX_PAYLOAD_SIZE'), int) or config['MAX_PAYLOAD_SIZE'] < 1:
+        raise ValueError("MAX_PAYLOAD_SIZE must be a positive integer")
         
     if not isinstance(config.get('RATE_LIMIT_WINDOW'), int) or config['RATE_LIMIT_WINDOW'] < 1:
         raise ValueError("RATE_LIMIT_WINDOW must be a positive integer")
@@ -100,44 +100,8 @@ def validate_webhook_config(config: dict) -> None:
     if not isinstance(config.get('RATE_LIMIT_MAX_REQUESTS'), int) or config['RATE_LIMIT_MAX_REQUESTS'] < 1:
         raise ValueError("RATE_LIMIT_MAX_REQUESTS must be a positive integer")
         
-    if not isinstance(config.get('MAX_PAYLOAD_SIZE'), int) or config['MAX_PAYLOAD_SIZE'] < 1:
-        raise ValueError("MAX_PAYLOAD_SIZE must be a positive integer")
-        
-    if not isinstance(config.get('MAX_MEMORY_MB'), int) or config['MAX_MEMORY_MB'] < 1:
-        raise ValueError("MAX_MEMORY_MB must be a positive integer")
-
-# Webhook configuration
-WEBHOOK_CONFIG = {
-    'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '500')),  # Reduced from 1000
-    'BATCH_SIZE': int(os.getenv('WEBHOOK_BATCH_SIZE', '10')),  # Process webhooks in smaller batches
-    'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
-    'RETRY_DELAY': int(os.getenv('WEBHOOK_RETRY_DELAY', '5')),  # 5 seconds
-    'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '86400')),  # 24 hours
-    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),  # 5 minutes
-    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '60')),  # 1 minute
-    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '100')),  # 100 requests per minute
-    'MAX_PAYLOAD_SIZE': int(os.getenv('WEBHOOK_MAX_PAYLOAD_SIZE', '1048576')),  # 1MB
-    'MAX_MEMORY_MB': int(os.getenv('WEBHOOK_MAX_MEMORY_MB', '512')),  # 512MB max memory usage
-}
-
-# Validate webhook config
-try:
-    validate_webhook_config(WEBHOOK_CONFIG)
-except ValueError as e:
-    logger.error(f"Invalid webhook configuration: {e}")
-    raise
-
-# Blockfrost network configuration
-BLOCKFROST_NETWORKS = {
-    'mainnet': 'https://cardano-mainnet.blockfrost.io/api/v0',
-    'testnet': 'https://cardano-testnet.blockfrost.io/api/v0',
-    'preview': 'https://cardano-preview.blockfrost.io/api/v0',
-    'preprod': 'https://cardano-preprod.blockfrost.io/api/v0'
-}
-
-# Blockfrost configuration
-BLOCKFROST_PROJECT_ID = os.getenv('BLOCKFROST_PROJECT_ID')
-BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0')
+    if not isinstance(config.get('MEMORY_LIMIT_MB'), int) or config['MEMORY_LIMIT_MB'] < 1:
+        raise ValueError("MEMORY_LIMIT_MB must be a positive integer")
 
 def validate_positive_int(value: str, name: str) -> int:
     """Validate and convert to positive integer"""
@@ -221,14 +185,16 @@ def validate_blockfrost_webhook_secret(value: str, name: str) -> str:
     if not value:
         raise ValueError(f"{name} cannot be empty")
         
-    # Check minimum length
     if len(value) < 32:
         raise ValueError(f"{name} must be at least 32 characters long")
         
-    # Check character set (allow UUID format)
-    if not re.match(r'^[0-9a-f-]+$', value):
-        raise ValueError(f"{name} must be a valid UUID format")
+    # Check for common patterns that might indicate a test/default value
+    common_patterns = ['test', 'secret', '1234', 'abcd', 'webhook']
+    if any(pattern in value.lower() for pattern in common_patterns):
+        raise ValueError(f"{name} appears to be a test value")
         
+    # Log validation success but not the actual secret
+    logger.info(f"Successfully validated {name}")
     return value
 
 def validate_ip_ranges(value: str, name: str) -> list:
@@ -732,6 +698,35 @@ MAX_TX_PER_HOUR = int(os.getenv('MAX_TX_PER_HOUR', '100'))  # Maximum transactio
 YUMMI_POLICY_ID = os.getenv('YUMMI_POLICY_ID')  # YUMMI token policy ID
 YUMMI_TOKEN_NAME = os.getenv('YUMMI_TOKEN_NAME')  # YUMMI token name
 ASSET_ID = f"{YUMMI_POLICY_ID}{YUMMI_TOKEN_NAME}" if YUMMI_POLICY_ID and YUMMI_TOKEN_NAME else None
+
+# Webhook configuration with validation
+WEBHOOK_CONFIG = {
+    'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '500')),
+    'BATCH_SIZE': int(os.getenv('WEBHOOK_BATCH_SIZE', '10')),
+    'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
+    'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '3600')),
+    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),
+    'MAX_PAYLOAD_SIZE': int(os.getenv('WEBHOOK_MAX_PAYLOAD_SIZE', '100000')),
+    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '60')),
+    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '100')),
+    'MEMORY_LIMIT_MB': int(os.getenv('WEBHOOK_MEMORY_LIMIT_MB', '100')),
+    'IDENTIFIER': os.getenv('WEBHOOK_IDENTIFIER', 'WalletBud')
+}
+
+# Validate webhook configuration
+validate_webhook_config(WEBHOOK_CONFIG)
+
+# Blockfrost network configuration
+BLOCKFROST_NETWORKS = {
+    'mainnet': 'https://cardano-mainnet.blockfrost.io/api/v0',
+    'testnet': 'https://cardano-testnet.blockfrost.io/api/v0',
+    'preview': 'https://cardano-preview.blockfrost.io/api/v0',
+    'preprod': 'https://cardano-preprod.blockfrost.io/api/v0'
+}
+
+# Blockfrost configuration
+BLOCKFROST_PROJECT_ID = os.getenv('BLOCKFROST_PROJECT_ID')
+BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0')
 
 # Validate entire configuration
 def validate_config():

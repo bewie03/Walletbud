@@ -313,17 +313,23 @@ class WalletBudBot(commands.Bot):
         self.db_maintenance = DatabaseMaintenance()
         logger.info("DatabaseMaintenance initialized")
         
-        # Initialize webhook queue with secret
+        # Initialize webhook queue with auth token
         logger.info("Initializing webhook queue...")
+        webhook_auth = os.getenv('BLOCKFROST_WEBHOOK_SECRET')
+        if not webhook_auth:
+            logger.error("BLOCKFROST_WEBHOOK_SECRET environment variable not set")
+            raise ValueError("BLOCKFROST_WEBHOOK_SECRET environment variable not set")
+            
+        # Initialize webhook queue with auth token
         self.webhook_queue = WebhookQueue(
-            secret=WEBHOOK_SECRET,
+            secret=webhook_auth,
             max_queue_size=WEBHOOK_CONFIG['MAX_QUEUE_SIZE'],
             batch_size=WEBHOOK_CONFIG['BATCH_SIZE'],
             max_retries=WEBHOOK_CONFIG['MAX_RETRIES'],
             max_event_age=WEBHOOK_CONFIG['MAX_EVENT_AGE'],
             cleanup_interval=WEBHOOK_CONFIG['CLEANUP_INTERVAL']
         )
-        logger.info("Webhook queue initialized")
+        logger.info("Webhook queue initialized with auth token")
         
         # Initialize database pool
         self.pool = None  # Will be initialized in setup_hook
@@ -885,7 +891,7 @@ class WalletBudBot(commands.Bot):
                     raise Exception("Database pool not initialized")
                     
                 async with self.pool.acquire() as conn:
-                    await conn.execute("SELECT 1")
+                    await conn.fetchval('SELECT 1')
                     pool_stats = await conn.fetchrow("""
                         SELECT 
                             count(*) as used_connections,
@@ -1397,91 +1403,70 @@ class WalletBudBot(commands.Bot):
             raise
 
     async def handle_webhook(self, request: web.Request) -> web.Response:
-        """Handle incoming Blockfrost webhooks"""
-        request_id = get_request_id()
-        logger.info(f"Received webhook request {request_id}")
-        
+        """Handle incoming webhook request"""
         try:
             # Validate request method
             if request.method != 'POST':
-                logger.warning(f"Invalid method {request.method} for webhook request {request_id}")
-                return web.Response(status=405, text="Method not allowed")
-
+                logger.warning(f"Invalid request method: {request.method}")
+                return web.Response(status=405)
+                
             # Validate content type
             content_type = request.headers.get('Content-Type', '')
-            if 'application/json' not in content_type.lower():
-                logger.warning(f"Invalid content type {content_type} for webhook request {request_id}")
-                return web.Response(status=400, text="Invalid content type")
-
-            # Read raw payload once
-            try:
-                payload = await request.read()
-                if not payload:
-                    logger.warning(f"Empty payload for webhook request {request_id}")
-                    return web.Response(status=400, text="Empty payload")
-            except Exception as e:
-                logger.error(f"Error reading request payload: {e}")
-                return web.Response(status=400, text="Error reading payload")
-
-            # Check payload size
-            if len(payload) > WEBHOOK_CONFIG['MAX_PAYLOAD_SIZE']:
-                logger.warning(f"Payload too large ({len(payload)} bytes) for webhook request {request_id}")
-                return web.Response(status=413, text="Payload too large")
-
-            # Verify Blockfrost signature
-            signature = request.headers.get('blockfrost-signature')
+            if not content_type.startswith('application/json'):
+                logger.warning(f"Invalid content type: {content_type}")
+                return web.Response(status=415)
+                
+            # Get webhook signature
+            signature = request.headers.get('Blockfrost-Signature-1')
             if not signature:
-                logger.warning(f"Missing Blockfrost signature for webhook request {request_id}")
-                return web.Response(status=401, text="Missing signature")
-
-            # Validate signature
-            if not self.webhook_queue.validate_signature(signature, payload):
-                logger.warning(f"Invalid signature for webhook request {request_id}")
-                return web.Response(status=401, text="Invalid signature")
-
-            # Parse webhook data
+                logger.warning("Missing Blockfrost-Signature-1 header")
+                return web.Response(status=401)
+                
+            # Get payload size
+            content_length = request.content_length
+            if content_length is None:
+                logger.warning("Missing Content-Length header")
+                return web.Response(status=411)
+                
+            if content_length > WEBHOOK_CONFIG['MAX_PAYLOAD_SIZE']:
+                logger.warning(f"Payload too large: {content_length} bytes")
+                return web.Response(status=413)
+                
+            # Read raw payload bytes for signature validation
             try:
-                webhook_data = json.loads(payload)
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON in webhook request {request_id}: {str(e)}")
-                return web.Response(status=400, text="Invalid JSON")
-
-            # Validate webhook data structure
-            if not isinstance(webhook_data, dict):
-                logger.warning(f"Invalid webhook data type: {type(webhook_data)}")
-                return web.Response(status=400, text="Invalid webhook data format")
-
-            # Get the payload, which might be nested or direct
-            event_payload = webhook_data.get('payload', webhook_data)
-            if not isinstance(event_payload, dict):
-                logger.warning(f"Invalid payload type: {type(event_payload)}")
-                return web.Response(status=400, text="Invalid payload format")
-
-            # Validate required fields
-            required_fields = ['type', 'data']
-            missing_fields = [field for field in required_fields if field not in event_payload]
-            if missing_fields:
-                logger.warning(f"Missing required fields in payload: {missing_fields}")
-                return web.Response(status=400, text=f"Missing required fields: {', '.join(missing_fields)}")
-
-            # Add event to queue
-            try:
-                await self.webhook_queue.add_event(
-                    event_id=request_id,
-                    event_type=event_payload['type'],
-                    payload=event_payload['data'],
-                    headers=dict(request.headers)
-                )
-                logger.info(f"Successfully queued webhook event {request_id}")
-                return web.Response(status=202, text="Event accepted")
-
+                payload_bytes = await request.read()
+                if not payload_bytes:
+                    logger.warning("Empty request body")
+                    return web.Response(status=400)
             except Exception as e:
-                logger.error(f"Error queueing webhook event {request_id}: {e}")
-                return web.Response(status=500, text="Error processing webhook")
-
+                logger.error(f"Error reading payload: {e}")
+                return web.Response(status=400)
+                
+            # Validate signature using raw bytes
+            if not self.webhook_queue.validate_signature(signature, payload_bytes):
+                logger.warning("Invalid webhook signature")
+                return web.Response(status=401)
+                
+            # Parse JSON payload
+            try:
+                data = json.loads(payload_bytes)
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON payload: {e}")
+                return web.Response(status=400)
+                
+            # Queue webhook event
+            event_type = data.get('type')
+            if not event_type:
+                logger.warning("Missing event type in payload")
+                return web.Response(status=400)
+                
+            await self.webhook_queue.add_event(event_type, data)
+            logger.info(f"Queued {event_type} webhook event")
+            return web.Response(status=200)
+            
         except Exception as e:
-            logger.error(f"Error handling webhook request {request_id}: {e}")
-            return web.Response(status=500, text="Internal server error")
+            logger.error(f"Error handling webhook: {e}", exc_info=True)
+            return web.Response(status=500)
 
 async def main(app):
     """Main entry point for the bot when running locally"""

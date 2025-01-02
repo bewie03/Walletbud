@@ -174,21 +174,32 @@ def check_yummi_balance(min_balance: Optional[int] = None):
                     )
                     return
                 
-                # Check YUMMI balance across all wallets
-                total_yummi = 0
+                # Check YUMMI balance for each wallet individually
+                required = min_balance or self.MINIMUM_YUMMI
+                insufficient_wallets = []
+                
                 for wallet in wallets:
                     balance = await self.get_token_balance(
                         wallet['address'],
                         self.YUMMI_POLICY_ID,
                         self.YUMMI_ASSET_NAME
-                    )
-                    total_yummi += balance or 0
+                    ) or 0
+                    
+                    if balance < required:
+                        insufficient_wallets.append({
+                            'address': wallet['address'],
+                            'balance': balance
+                        })
                 
-                required = min_balance or self.MINIMUM_YUMMI
-                if total_yummi < required:
+                if insufficient_wallets:
+                    # Create detailed message about insufficient balances
+                    message = "❌ Insufficient YUMMI balance in the following wallets:\n"
+                    for wallet in insufficient_wallets:
+                        message += f"• `{wallet['address']}`: {wallet['balance']:,} YUMMI (Need {required:,})\n"
+                    message += f"\nEach wallet must hold at least {required:,} YUMMI to use this feature."
+                    
                     await interaction.response.send_message(
-                        f"❌ You need at least {required:,} YUMMI tokens to use this command. "
-                        f"Current balance: {total_yummi:,} YUMMI",
+                        message,
                         ephemeral=True
                     )
                     return
@@ -196,11 +207,12 @@ def check_yummi_balance(min_balance: Optional[int] = None):
                 return await func(self, interaction, *args, **kwargs)
                 
             except Exception as e:
-                logger.error(f"Error checking YUMMI balance: {e}\n{traceback.format_exc()}")
+                logger.error(f"Error in check_yummi_balance: {e}")
                 await interaction.response.send_message(
                     "❌ Error checking YUMMI balance. Please try again later.",
                     ephemeral=True
                 )
+                return
                 
         return wrapper
     return decorator
