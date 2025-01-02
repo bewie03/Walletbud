@@ -29,6 +29,7 @@ from config import (
     validate_config
 )
 from shutdown_manager import ShutdownManager
+from webhook_queue import WebhookQueue, WebhookEvent
 
 # Third-party imports
 import asyncpg
