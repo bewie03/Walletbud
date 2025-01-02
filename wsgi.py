@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # Global instances
+_init_lock = asyncio.Lock()
 bot: Optional[WalletBudBot] = None
 app: Optional[web.Application] = None
 
@@ -45,122 +46,142 @@ async def init_app():
     """Initialize the web application"""
     global app, bot
     
-    if app is not None:
-        return app
-    
-    # Create new application instance with optimized client config
-    app = web.Application(
-        client_max_size=1024**2 * 50,  # 50MB max request size
-        handler_args={
-            'tcp_keepalive': True,
-            'keepalive_timeout': 75.0,  # Heroku's timeout is 55s
-        }
-    )
-    
-    # Initialize bot if not already initialized
-    if bot is None:
-        logger.info("Initializing bot instance...")
-        try:
-            bot = WalletBudBot()
-            
-            # Configure bot's client session with optimized settings
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
-            connector = TCPConnector(
-                limit=100,  # Connection pool size
-                ttl_dns_cache=300,  # DNS cache TTL
-                use_dns_cache=True,
-                ssl=bot.ssl_context,
-                keepalive_timeout=75.0
-            )
-            
-            # Use orjson for faster serialization
-            json_dumps = partial(orjson.dumps, option=orjson.OPT_SERIALIZE_NUMPY)
-            
-            bot.session = aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                json_serialize=json_dumps
-            )
-            
-            # Add middleware for error handling
-            @web.middleware
-            async def error_middleware(request: web.Request, handler):
-                try:
-                    return await handler(request)
-                except web.HTTPException:
-                    raise
-                except aiohttp.ClientError as e:
-                    logger.error(f"Client error: {e}", exc_info=True)
-                    return web.json_response(
-                        {"error": "Service temporarily unavailable"},
-                        status=503
-                    )
-                except Exception as e:
-                    logger.error(f"Unhandled error: {e}", exc_info=True)
-                    return web.json_response(
-                        {"error": "Internal server error"},
-                        status=500
-                    )
-            
-            app.middlewares.append(error_middleware)
-            
-            # Add request tracking middleware
-            @web.middleware
-            async def request_tracking_middleware(request: web.Request, handler):
-                # Track request count
-                app['request_count'] = app.get('request_count', 0) + 1
-                
-                # Track request timing
-                start_time = asyncio.get_event_loop().time()
-                try:
-                    response = await handler(request)
-                    duration = asyncio.get_event_loop().time() - start_time
-                    
-                    # Update request metrics
-                    metrics = app.get('request_metrics', {'latency': [], 'status_codes': {}})
-                    metrics['latency'].append(duration)
-                    if len(metrics['latency']) > 100:  # Keep last 100 requests
-                        metrics['latency'] = metrics['latency'][-100:]
-                    
-                    metrics['status_codes'][response.status] = metrics['status_codes'].get(response.status, 0) + 1
-                    app['request_metrics'] = metrics
-                    
-                    return response
-                except Exception as e:
-                    duration = asyncio.get_event_loop().time() - start_time
-                    metrics = app.get('request_metrics', {'latency': [], 'status_codes': {}})
-                    metrics['latency'].append(duration)
-                    metrics['status_codes'][500] = metrics['status_codes'].get(500, 0) + 1
-                    app['request_metrics'] = metrics
-                    raise
-            
-            app.middlewares.append(request_tracking_middleware)
-            
-            # Add webhook tracking
-            app['webhook_metrics'] = {
-                'success_count': 0,
-                'failure_count': 0,
-                'last_success': None,
-                'last_failure': None,
-                'errors': []  # Keep last few errors
+    async with _init_lock:
+        if app is not None:
+            return app
+        
+        # Create new application instance with optimized client config
+        app = web.Application(
+            client_max_size=1024**2 * 50,  # 50MB max request size
+            handler_args={
+                'tcp_keepalive': True,
+                'keepalive_timeout': 75.0,  # Heroku's timeout is 55s
             }
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize bot: {e}", exc_info=True)
-            raise
-    
-    # Add routes with error handling
-    app.router.add_get('/health', health_check)
-    app.router.add_post('/webhook', bot.handle_webhook)
-    
-    # Add cleanup callback
-    app.on_cleanup.append(cleanup)
-    
-    # Start bot in background
-    if not bot.is_closed():
-        asyncio.create_task(bot.start(os.getenv('DISCORD_TOKEN')))
-    
-    return app
+        )
+        
+        # Initialize bot if not already initialized
+        if bot is None:
+            logger.info("Initializing bot instance...")
+            try:
+                bot = WalletBudBot()
+                
+                # Configure bot's client session with optimized settings
+                timeout = aiohttp.ClientTimeout(total=30, connect=10)
+                connector = TCPConnector(
+                    limit=100,  # Connection pool size
+                    ttl_dns_cache=300,  # DNS cache TTL
+                    use_dns_cache=True,
+                    ssl=bot.ssl_context,
+                    keepalive_timeout=75.0
+                )
+                
+                # Use orjson for faster serialization
+                json_dumps = partial(orjson.dumps, option=orjson.OPT_SERIALIZE_NUMPY)
+                
+                bot.session = aiohttp.ClientSession(
+                    timeout=timeout,
+                    connector=connector,
+                    json_serialize=json_dumps
+                )
+                
+                # Configure bot's blockfrost session with optimized settings
+                timeout = aiohttp.ClientTimeout(total=30, connect=10)
+                connector = TCPConnector(
+                    limit=100,  # Connection pool size
+                    ttl_dns_cache=300,  # DNS cache TTL
+                    use_dns_cache=True,
+                    ssl=bot.ssl_context,
+                    keepalive_timeout=75.0
+                )
+                
+                # Use orjson for faster serialization
+                json_dumps = partial(orjson.dumps, option=orjson.OPT_SERIALIZE_NUMPY)
+                
+                bot.blockfrost_session = aiohttp.ClientSession(
+                    timeout=timeout,
+                    connector=connector,
+                    json_serialize=json_dumps
+                )
+                
+                # Add middleware for error handling
+                @web.middleware
+                async def error_middleware(request: web.Request, handler):
+                    try:
+                        return await handler(request)
+                    except web.HTTPException:
+                        raise
+                    except aiohttp.ClientError as e:
+                        logger.error(f"Client error: {e}", exc_info=True)
+                        return web.json_response(
+                            {"error": "Service temporarily unavailable"},
+                            status=503
+                        )
+                    except Exception as e:
+                        logger.error(f"Unhandled error: {e}", exc_info=True)
+                        return web.json_response(
+                            {"error": "Internal server error"},
+                            status=500
+                        )
+                
+                app.middlewares.append(error_middleware)
+                
+                # Add request tracking middleware
+                @web.middleware
+                async def request_tracking_middleware(request: web.Request, handler):
+                    # Track request count
+                    app['request_count'] = app.get('request_count', 0) + 1
+                    
+                    # Track request timing
+                    start_time = asyncio.get_event_loop().time()
+                    try:
+                        response = await handler(request)
+                        duration = asyncio.get_event_loop().time() - start_time
+                        
+                        # Update request metrics
+                        metrics = app.get('request_metrics', {'latency': [], 'status_codes': {}})
+                        metrics['latency'].append(duration)
+                        if len(metrics['latency']) > 100:  # Keep last 100 requests
+                            metrics['latency'] = metrics['latency'][-100:]
+                        
+                        metrics['status_codes'][response.status] = metrics['status_codes'].get(response.status, 0) + 1
+                        app['request_metrics'] = metrics
+                        
+                        return response
+                    except Exception as e:
+                        duration = asyncio.get_event_loop().time() - start_time
+                        metrics = app.get('request_metrics', {'latency': [], 'status_codes': {}})
+                        metrics['latency'].append(duration)
+                        metrics['status_codes'][500] = metrics['status_codes'].get(500, 0) + 1
+                        app['request_metrics'] = metrics
+                        raise
+                
+                app.middlewares.append(request_tracking_middleware)
+                
+                # Add webhook tracking
+                app['webhook_metrics'] = {
+                    'success_count': 0,
+                    'failure_count': 0,
+                    'last_success': None,
+                    'last_failure': None,
+                    'errors': []  # Keep last few errors
+                }
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize bot: {e}", exc_info=True)
+                raise
+        
+        # Add routes with error handling
+        app.router.add_get('/health', health_check)
+        app.router.add_post('/webhook', bot.handle_webhook)
+        
+        # Add cleanup callback
+        app.on_cleanup.append(cleanup)
+        
+        # Start bot in background
+        if not bot.is_closed():
+            asyncio.create_task(bot.start(os.getenv('DISCORD_TOKEN')))
+        
+        return app
 
 async def health_check(request: web.Request) -> web.Response:
     """Health check endpoint that integrates with the bot's health check"""
@@ -255,34 +276,31 @@ async def health_check(request: web.Request) -> web.Response:
 async def cleanup(app):
     """Cleanup function to handle graceful shutdown"""
     global bot
-    logger.info("Starting cleanup...")
     
-    try:
-        if bot:
-            if not bot.is_closed():
-                logger.info("Shutting down bot...")
-                try:
-                    if hasattr(bot, 'session') and not bot.session.closed:
-                        await bot.session.close()
-                    await bot.close()
-                except Exception as e:
-                    logger.error(f"Error during bot cleanup: {e}", exc_info=True)
+    logger.info("Starting cleanup process...")
+    
+    if bot is not None:
+        try:
+            # Close bot's session first
+            if bot.session is not None:
+                await bot.session.close()
+                logger.info("Bot session closed successfully")
             
-            # Clear bot instance
+            # Close blockfrost session if it exists
+            if bot.blockfrost_session is not None:
+                await bot.blockfrost_session.close()
+                logger.info("Blockfrost session closed successfully")
+            
+            # Close the bot itself
+            await bot.close()
+            logger.info("Bot closed successfully")
+            
+        except Exception as e:
+            logger.error(f"Error during bot cleanup: {str(e)}")
+        finally:
             bot = None
-        
-        # Cancel all tasks
-        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-        if tasks:
-            logger.info(f"Cancelling {len(tasks)} pending tasks...")
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-        
-        logger.info("Cleanup completed successfully")
-    except Exception as e:
-        logger.error(f"Error during cleanup: {e}", exc_info=True)
-        raise
+    
+    logger.info("Cleanup completed")
 
 def signal_handler():
     """Handle system signals for graceful shutdown"""

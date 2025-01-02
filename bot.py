@@ -412,175 +412,125 @@ class WalletBudBot(commands.Bot):
     async def _cleanup_database(self):
         """Cleanup database connections"""
         try:
-            pool = await get_pool()
-            await pool.close()
-            logger.info("Database pool closed successfully")
+            if self.pool:
+                await self.pool.close()
+                self.pool = None
+                logger.info("Database pool closed successfully")
         except Exception as e:
             logger.error(f"Error closing database pool: {e}")
             
     async def _cleanup_session(self):
         """Cleanup aiohttp session"""
         try:
-            if self.session and not self.session.closed:
+            if self.session:
                 await self.session.close()
                 self.session = None
-            
-            # Wait a bit to ensure all connections are properly closed
-            await asyncio.sleep(0.25)
-            
-            if self.connector and not self.connector.closed:
+                logger.info("Session closed successfully")
+            if self.connector:
                 await self.connector.close()
                 self.connector = None
-                
-            logger.info("HTTP session and connector closed successfully")
+                logger.info("Connector closed successfully")
         except Exception as e:
-            logger.error(f"Error closing HTTP session: {e}")
-            
-    async def _cleanup_tasks(self):
-        """Cleanup background tasks"""
-        try:
-            # Cancel health check task
-            if hasattr(self, 'health_check_task'):
-                self.health_check_task.cancel()
-                
-            # Cancel YUMMI check task
-            if hasattr(self, 'check_yummi_balances'):
-                self.check_yummi_balances.cancel()
-                
-            logger.info("Background tasks cancelled successfully")
-        except Exception as e:
-            logger.error(f"Error cancelling background tasks: {e}")
+            logger.error(f"Error closing session: {e}")
             
     async def _cleanup_blockfrost(self):
         """Cleanup Blockfrost session"""
         try:
-            if self.blockfrost_session and not self.blockfrost_session.closed:
+            if self.blockfrost_session:
                 await self.blockfrost_session.close()
+                self.blockfrost_session = None
                 logger.info("Blockfrost session cleaned up")
         except Exception as e:
             logger.error(f"Error cleaning up Blockfrost session: {e}")
         finally:
             self.blockfrost_session = None
             
+    async def _cleanup_tasks(self):
+        """Cleanup background tasks"""
+        try:
+            if hasattr(self, 'check_yummi_balances'):
+                self.check_yummi_balances.cancel()
+            if hasattr(self, 'health_check_task'):
+                self.health_check_task.cancel()
+            logger.info("Background tasks cancelled")
+        except Exception as e:
+            logger.error(f"Error cancelling tasks: {e}")
+            
     async def _cleanup_webhook(self):
         """Cleanup webhook server"""
         try:
-            if hasattr(self, 'site') and self.site:
-                await self.site.stop()
-                logger.info("Webhook server stopped successfully")
+            # Additional webhook cleanup if needed
+            pass
         except Exception as e:
-            logger.error(f"Error stopping webhook server: {e}")
-            
+            logger.error(f"Error cleaning up webhook: {e}")
+
     async def close(self):
         """Clean up resources and perform graceful shutdown"""
-        logger.info("Starting graceful shutdown...")
-        
         try:
             # Cancel background tasks first
             await self._cancel_background_tasks()
             
-            # Run shutdown handlers through shutdown manager
-            await self.shutdown_manager.cleanup(timeout=30.0)
+            # Close database pool
+            await self._cleanup_database()
             
-            # Finally call parent close
+            # Close sessions
+            await self._cleanup_session()
+            await self._cleanup_blockfrost()
+            
+            # Close webhook server
+            await self._cleanup_webhook()
+            
+            # Call parent's close method
             await super().close()
             
-            logger.info("Graceful shutdown completed")
-            
+            logger.info("Bot shutdown completed successfully")
         except Exception as e:
-            logger.error(f"Error during graceful shutdown: {e}")
-            # Still try to call parent close
-            try:
-                await super().close()
-            except Exception as parent_error:
-                logger.error(f"Error in parent close: {parent_error}")
+            logger.error(f"Error during shutdown: {e}")
+            raise
 
     async def _cancel_background_tasks(self):
         """Cancel all background tasks"""
         try:
+            # Get all tasks
             tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            
+            # Cancel them
             for task in tasks:
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.error(f"Error cancelling task: {e}")
+                
+            # Wait for them to complete
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            
             logger.info(f"Cancelled {len(tasks)} background tasks")
         except Exception as e:
-            logger.error(f"Error in _cancel_background_tasks: {e}")
+            logger.error(f"Error cancelling background tasks: {e}")
 
     async def setup_hook(self):
         """Set up the bot's background tasks and signal handlers"""
         try:
-            logger.info("Starting setup_hook...")
+            # Initialize database first
+            await self.init_database()
             
-            # Initialize database
-            logger.info("Initializing database...")
-            try:
-                await init_db()
-                logger.info("Database initialized successfully")
-            except Exception as e:
-                logger.error(f"Database initialization failed: {str(e)}")
-                raise
+            # Initialize Blockfrost
+            await self.init_blockfrost()
             
-            # Initialize Blockfrost client
-            logger.info("Initializing Blockfrost client...")
-            try:
-                await self.init_blockfrost()
-                logger.info("Blockfrost client initialized successfully")
-            except Exception as e:
-                logger.error(f"Blockfrost initialization failed: {str(e)}")
-                raise
-            
-            # Load cogs
-            logger.info("Loading cogs...")
-            try:
-                await self.load_extension("cogs.system_commands")
-                logger.info("Loaded system_commands cog")
-                await self.load_extension("cogs.wallet_commands")
-                logger.info("Loaded wallet_commands cog")
-                logger.info("All cogs loaded successfully")
-            except Exception as e:
-                logger.error(f"Failed to load cogs: {str(e)}")
-                raise
-            
-            # Sync command tree with Discord
-            try:
-                logger.info("Starting command tree sync...")
-                await self.tree.sync()
-                logger.info("Command tree synced successfully")
-            except Exception as e:
-                logger.error(f"Failed to sync command tree: {str(e)}")
-                logger.error(f"Error type: {type(e)}")
-                if hasattr(e, '__dict__'):
-                    logger.error(f"Error details: {e.__dict__}")
-                raise
+            # Set up admin channel
+            await self.setup_admin_channel()
             
             # Start background tasks
-            logger.info("Starting background tasks...")
-            try:
-                self.check_yummi_balances.start()
-                logger.info("Started yummi balance check task")
-                self.health_check_task.start()
-                logger.info("Started health check task")
-                logger.info("All background tasks started successfully")
-            except Exception as e:
-                logger.error(f"Failed to start background tasks: {str(e)}")
-                raise
+            self.check_yummi_balances.start()
+            self.health_check_task.start()
             
-            # Set start time
-            self.health_metrics['start_time'] = datetime.utcnow()
+            # Start webhook server
+            await self.start_webhook()
+            
             logger.info("Bot setup completed successfully")
             
         except Exception as e:
-            logger.error(f"Error in setup_hook: {str(e)}")
-            logger.error(f"Error type: {type(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
+            logger.error(f"Error during setup: {e}")
             raise
-            
+
     async def on_error(self, event_method: str, *args, **kwargs):
         """Called when an error occurs in an event"""
         error = sys.exc_info()
@@ -1109,18 +1059,19 @@ class WalletBudBot(commands.Bot):
     async def init_database(self):
         """Initialize database connection with proper error handling"""
         try:
-            # Initialize the database pool
-            self.pool = await get_pool()
-            if not self.pool:
-                raise RuntimeError("Failed to create database pool")
-                
-            # Test the connection
-            async with self.pool.acquire() as conn:
-                await conn.fetchval('SELECT 1')
-                
-            logger.info("Database initialized successfully")
-            if self.admin_channel:
-                await self.admin_channel.send(" Database initialized successfully")
+            if self.pool is None:
+                # Initialize the database pool
+                self.pool = await get_pool()
+                if not self.pool:
+                    raise RuntimeError("Failed to create database pool")
+                    
+                # Test the connection
+                async with self.pool.acquire() as conn:
+                    await conn.fetchval('SELECT 1')
+                    
+                logger.info("Database initialized successfully")
+                if self.admin_channel:
+                    await self.admin_channel.send(" Database initialized successfully")
             
         except Exception as e:
             logger.error(f"Database initialization failed: {e}")
@@ -1131,31 +1082,29 @@ class WalletBudBot(commands.Bot):
     async def init_blockfrost(self):
         """Initialize Blockfrost API client with proper error handling"""
         try:
-            # Initialize connector and session
-            self.connector = aiohttp.TCPConnector(ssl=self.ssl_context, limit=100)
-            self.session = aiohttp.ClientSession(connector=self.connector)
-            
-            # Initialize Blockfrost session
-            self.blockfrost_session = aiohttp.ClientSession(
-                headers={'project_id': BLOCKFROST_PROJECT_ID},
-                connector=self.connector
-            )
-            
-            # Test connection using the full URL
-            async with self.blockfrost_session.get(f"{BLOCKFROST_BASE_URL}/health") as response:
-                if response.status != 200:
-                    raise Exception(f"Blockfrost API health check failed: {response.status}")
-                    
-            logger.info("Blockfrost API initialized successfully")
-            await self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
-            
-            if self.admin_channel:
-                await self.admin_channel.send(" Blockfrost API initialized successfully")
+            if self.blockfrost_session is None:
+                # Initialize connector and session
+                if self.connector is None:
+                    self.connector = aiohttp.TCPConnector(ssl=self.ssl_context, limit=100)
+                if self.session is None:
+                    self.session = aiohttp.ClientSession(connector=self.connector)
                 
+                # Initialize Blockfrost session
+                self.blockfrost_session = aiohttp.ClientSession(
+                    headers={'project_id': BLOCKFROST_PROJECT_ID},
+                    connector=self.connector
+                )
+                
+                # Test connection using the full URL
+                async with self.blockfrost_session.get(f"{BLOCKFROST_BASE_URL}/health") as response:
+                    if response.status != 200:
+                        raise Exception(f"Blockfrost API health check failed: {response.status}")
+                        
+                logger.info("Blockfrost API initialized successfully")
+                await self.update_health_metrics('blockfrost_init', datetime.now().isoformat())
+            
         except Exception as e:
-            logger.error(f"Failed to initialize Blockfrost API: {e}")
-            if self.admin_channel:
-                await self.admin_channel.send(f" Error: Failed to initialize Blockfrost API: {e}")
+            logger.error(f"Blockfrost initialization failed: {e}")
             raise
 
     async def blockfrost_request(
