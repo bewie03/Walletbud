@@ -1259,19 +1259,15 @@ class WalletBudBot(commands.Bot):
             return False  # Default to not notifying on error
 
     async def start_webhook(self):
-        """Start the webhook server"""
+        """Initialize webhook handling"""
         try:
-            # In production (Heroku), we use the web app from wsgi.py
-            # This method only needs to register the route
-            if hasattr(self, 'app'):
-                self.app.router.add_post('/webhook', self.handle_webhook)
-                logger.info("Webhook route registered")
-                await self.update_health_metrics('webhook_server', 'started')
-            else:
-                logger.warning("No app instance available for webhook registration")
+            # In production (Heroku), the route is registered in wsgi.py
+            # Just update metrics and log status
+            logger.info("Webhook handling initialized")
+            await self.update_health_metrics('webhook_server', 'started')
                 
         except Exception as e:
-            logger.error(f"Failed to register webhook route: {e}")
+            logger.error(f"Failed to initialize webhook handling: {e}")
             await self.update_health_metrics('webhook_server', 'failed')
             raise
 
