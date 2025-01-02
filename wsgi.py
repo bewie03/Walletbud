@@ -11,7 +11,7 @@ from config import DISCORD_TOKEN
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,32 @@ logger.info("Created aiohttp app")
 logger.info("Adding webhook route...")
 app.router.add_post('/webhook', bot.handle_webhook)
 logger.info("Webhook route added")
+
+# Add health check route
+async def health_check(request):
+    """Health check endpoint"""
+    try:
+        health_data = {
+            'status': 'healthy',
+            'bot_connected': bot.is_ready(),
+            'latency': round(bot.latency * 1000, 2) if bot.is_ready() else None,
+            'guild_count': len(bot.guilds) if bot.is_ready() else 0,
+        }
+        
+        # Check connections
+        connections = await bot.check_connections()
+        health_data['connections'] = connections
+        
+        return web.json_response(health_data)
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return web.json_response({
+            'status': 'unhealthy',
+            'error': str(e)
+        }, status=500)
+
+app.router.add_get('/health', health_check)
+logger.info("Health check route added")
 
 # Signal handlers
 def handle_exit(signame, app):
@@ -50,15 +76,22 @@ async def start_bot(app):
         
         # Set up signal handlers
         for signame in ('SIGINT', 'SIGTERM'):
-            app.loop.add_signal_handler(
-                getattr(signal, signame),
-                lambda s=signame: handle_exit(s, app)
-            )
+            if hasattr(app, 'loop'):
+                app.loop.add_signal_handler(
+                    getattr(signal, signame),
+                    lambda s=signame: handle_exit(s, app)
+                )
         
-        # Start the bot
-        logger.info("Calling bot.start() with Discord token...")
-        await bot.start(DISCORD_TOKEN)
-        logger.info("Bot started successfully in startup handler")
+        # Start the bot in a background task
+        app['bot_task'] = asyncio.create_task(bot.start(DISCORD_TOKEN))
+        logger.info("Bot start task created")
+        
+        # Wait a bit to ensure bot connects
+        try:
+            await asyncio.wait_for(bot.wait_until_ready(), timeout=30)
+            logger.info("Bot successfully connected to Discord")
+        except asyncio.TimeoutError:
+            logger.warning("Bot did not connect within timeout period")
         
     except Exception as e:
         logger.error(f"Failed to start bot in startup handler: {str(e)}")
@@ -72,6 +105,15 @@ async def cleanup(app):
     """Clean up when the app shuts down"""
     try:
         logger.info("Starting cleanup in shutdown handler...")
+        
+        # Cancel bot task if it exists
+        if 'bot_task' in app:
+            logger.info("Cancelling bot task...")
+            app['bot_task'].cancel()
+            try:
+                await app['bot_task']
+            except asyncio.CancelledError:
+                pass
         
         # Close Discord bot
         if hasattr(app, 'bot') and app.bot is not None:
@@ -125,11 +167,12 @@ if __name__ == "__main__":
         # Create new event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        app.loop = loop
         
         # Run the application
         port = int(os.environ.get("PORT", 8080))
         logger.info(f"Starting server on port {port}")
-        web.run_app(app, port=port, loop=loop)
+        web.run_app(app, port=port, loop=loop, access_log_format='%a %l %u %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"')
         logger.info("Application started")
         
     except Exception as e:

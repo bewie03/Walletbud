@@ -848,136 +848,129 @@ class WalletBudBot(commands.Bot):
     async def on_ready(self):
         """Called when the bot is ready and connected to Discord"""
         try:
-            # Set bot status
-            activity = discord.Activity(
-                type=discord.ActivityType.watching,
-                name="Cardano wallets | /help"
-            )
-            await self.change_presence(activity=activity, status=discord.Status.online)
-            logger.info("Bot status updated")
+            logger.info(f"Bot {self.user.name} is ready and connected to Discord!")
+            logger.info(f"Bot ID: {self.user.id}")
+            logger.info(f"Connected to {len(self.guilds)} guilds")
             
-            # Update health metrics
-            await self.update_health_metrics('start_time', datetime.now().isoformat())
+            # Log connection details
+            self.update_health_metrics('discord_connection', {
+                'connected_at': datetime.utcnow().isoformat(),
+                'guild_count': len(self.guilds),
+                'latency': round(self.latency * 1000, 2)  # in ms
+            })
             
-            # Log successful initialization
-            logger.info(f"Logged in as {self.user} ({self.user.id})")
-            logger.info("Bot initialization complete")
+            # Set up admin channel
+            await self.setup_admin_channel()
+            
+            # Log successful startup to admin channel
+            if self.admin_channel:
+                embed = discord.Embed(
+                    title="Bot Started Successfully",
+                    description="WalletBud bot is now online and ready!",
+                    color=discord.Color.green()
+                )
+                embed.add_field(
+                    name="Connection Details",
+                    value=f"Connected to {len(self.guilds)} guilds\nLatency: {round(self.latency * 1000, 2)}ms"
+                )
+                await self.admin_channel.send(embed=embed)
             
         except Exception as e:
-            logger.error(f"Error in on_ready: {e}")
-            
+            logger.error(f"Error in on_ready: {str(e)}")
+            if hasattr(e, '__dict__'):
+                logger.error(f"Error details: {e.__dict__}")
+
     async def on_connect(self):
         """Called when the bot connects to Discord"""
-        logger.info("Bot connected to Discord Gateway")
         try:
-            # Set initial presence
-            activity = discord.Activity(
-                type=discord.ActivityType.watching,
-                name="Cardano wallets | /help"
-            )
-            await self.change_presence(status=discord.Status.online, activity=activity)
+            logger.info("Bot connected to Discord")
+            self.update_health_metrics('discord_status', 'connected')
+            
+            # Check all connections on connect
+            await self.check_connections()
             
         except Exception as e:
-            logger.error(f"Error in on_connect: {str(e)}", exc_info=True)
+            logger.error(f"Error in on_connect: {str(e)}")
 
     async def on_disconnect(self):
         """Called when the bot disconnects from Discord"""
-        logger.warning("Bot disconnected from Discord Gateway")
         try:
-            # Log detailed connection info
-            logger.error("=== Connection Debug Info ===")
-            logger.error(f"Last sequence: {self.ws.sequence if hasattr(self, 'ws') else 'No websocket'}")
-            logger.error(f"Latency: {self.latency * 1000:.2f}ms")
-            logger.error(f"Is closed: {self.is_closed()}")
-            logger.error(f"Is ready: {self.is_ready()}")
-            logger.error(f"User: {self.user if hasattr(self, 'user') else 'No user'}")
+            logger.warning("Bot disconnected from Discord")
+            self.update_health_metrics('discord_status', 'disconnected')
             
-            # Try to reconnect if not shutting down
-            if not self.is_closed():
-                logger.info("Attempting to reconnect...")
+            # Log disconnect to admin channel
+            if self.admin_channel:
+                embed = discord.Embed(
+                    title="Bot Disconnected",
+                    description="WalletBud bot has disconnected from Discord. Attempting to reconnect...",
+                    color=discord.Color.red()
+                )
                 try:
-                    # Update presence to show reconnecting status
-                    activity = discord.Activity(
-                        type=discord.ActivityType.watching,
-                        name="Reconnecting..."
-                    )
-                    await self.change_presence(status=discord.Status.idle, activity=activity)
-                except Exception as e:
-                    logger.error(f"Failed to update presence: {e}")
-
+                    await self.admin_channel.send(embed=embed)
+                except:
+                    logger.error("Failed to send disconnect notification to admin channel")
+            
         except Exception as e:
-            logger.error(f"Error in on_disconnect: {str(e)}", exc_info=True)
+            logger.error(f"Error in on_disconnect: {str(e)}")
 
     async def check_connections(self):
         """Check all connections and log their status"""
         try:
+            logger.info("Checking all connections...")
+            
             # Check Discord connection
-            discord_status = "connected" if self.is_ready() else "disconnected"
-            logger.debug(f"Discord status: {discord_status}")
+            discord_status = "Connected" if self.is_ready() else "Disconnected"
+            logger.info(f"Discord Status: {discord_status}")
             
             # Check database connection
             try:
-                async with self.pool.acquire() as conn:
-                    await conn.execute("SELECT 1")
-                db_status = "connected"
+                await self.pool.fetchval('SELECT 1')
+                db_status = "Connected"
             except Exception as e:
-                logger.error(f"Database connection error: {e}")
-                db_status = "disconnected"
+                db_status = f"Error: {str(e)}"
+            logger.info(f"Database Status: {db_status}")
             
             # Check Blockfrost connection
             try:
-                async with self.blockfrost_session.get('/health') as response:
-                    if response.status == 200:
-                        health = await response.json()
-                        if health.get('is_healthy'):
-                            blockfrost_status = "connected"
-                        else:
-                            raise Exception(f"Blockfrost API is not healthy: {health}")
-                    else:
-                        raise Exception(f"Health check failed with status {response.status}")
+                health = await self.blockfrost_request('/health')
+                bf_status = "Connected" if health.get('is_healthy') else "Unhealthy"
             except Exception as e:
-                logger.error(f"Blockfrost connection error: {e}")
-                blockfrost_status = "disconnected"
+                bf_status = f"Error: {str(e)}"
+            logger.info(f"Blockfrost Status: {bf_status}")
             
             # Update health metrics
             self.update_health_metrics('connections', {
                 'discord': discord_status,
                 'database': db_status,
-                'blockfrost': blockfrost_status
+                'blockfrost': bf_status,
+                'checked_at': datetime.utcnow().isoformat()
             })
             
-            # Log overall status
-            logger.info(f"Connection status - Discord: {discord_status}, DB: {db_status}, Blockfrost: {blockfrost_status}")
-            
-            return {
-                'discord': discord_status,
-                'database': db_status,
-                'blockfrost': blockfrost_status
-            }
-            
-        except Exception as e:
-            logger.error(f"Error checking connections: {e}")
-            raise
-
-    async def setup_admin_channel(self):
-        """Set up admin channel for bot notifications"""
-        try:
-            if not self.admin_channel_id:
-                logger.warning("Admin channel ID not set")
-                return
-                
-            # Get the admin channel
-            self.admin_channel = await self.fetch_channel(self.admin_channel_id)
-            if not self.admin_channel:
-                logger.error("Could not find admin channel")
-                return
-                
-            logger.info("Admin channel setup successful")
-            await self.admin_channel.send(" Bot is starting up...")
+            # Log to admin channel if there are issues
+            if any(x.startswith("Error") for x in [discord_status, db_status, bf_status]):
+                if self.admin_channel:
+                    embed = discord.Embed(
+                        title="Connection Status Alert",
+                        description="One or more connections have issues:",
+                        color=discord.Color.orange()
+                    )
+                    embed.add_field(name="Discord", value=discord_status)
+                    embed.add_field(name="Database", value=db_status)
+                    embed.add_field(name="Blockfrost", value=bf_status)
+                    try:
+                        await self.admin_channel.send(embed=embed)
+                    except:
+                        logger.error("Failed to send connection status to admin channel")
             
         except Exception as e:
-            logger.error(f"Failed to set up admin channel: {e}")
-            # Don't raise here as bot can function without admin channel
+            logger.error(f"Error checking connections: {str(e)}")
+            
+    async def init_ssl_context() -> ssl.SSLContext:
+        """Initialize SSL context with proper security settings"""
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
+        ssl_context.check_hostname = True
+        return ssl_context
 
     async def init_database(self):
         """Initialize database connection with proper error handling"""
