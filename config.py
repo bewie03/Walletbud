@@ -20,6 +20,15 @@ logger = logging.getLogger('walletbud.config')
 # Load environment variables
 load_dotenv()
 
+# Get required environment variables
+BLOCKFROST_PROJECT_ID = os.getenv('BLOCKFROST_PROJECT_ID')
+if not BLOCKFROST_PROJECT_ID:
+    raise ValueError("BLOCKFROST_PROJECT_ID environment variable not set")
+
+BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0')
+BLOCKFROST_WEBHOOK_ID = os.getenv('BLOCKFROST_WEBHOOK_ID')
+BLOCKFROST_WEBHOOK_SECRET = os.getenv('BLOCKFROST_WEBHOOK_SECRET')
+
 # SSL Configuration
 SSL_CONFIG = {
     'verify': True,
@@ -701,6 +710,46 @@ BLOCKFROST_NETWORKS = {
 BLOCKFROST_PROJECT_ID = os.getenv('BLOCKFROST_PROJECT_ID')
 BLOCKFROST_BASE_URL = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0')
 
+# Webhook security configuration
+WEBHOOK_SECURITY = {
+    'RATE_LIMITS': {
+        'global': {
+            'requests_per_second': int(os.getenv('WEBHOOK_GLOBAL_RATE_LIMIT', '10')),
+            'burst': int(os.getenv('WEBHOOK_GLOBAL_BURST_LIMIT', '50'))
+        },
+        'per_ip': {
+            'requests_per_second': int(os.getenv('WEBHOOK_IP_RATE_LIMIT', '5')),
+            'burst': int(os.getenv('WEBHOOK_IP_BURST_LIMIT', '20'))
+        }
+    },
+    'MAX_PAYLOAD_SIZE': int(os.getenv('WEBHOOK_MAX_PAYLOAD_SIZE', '1048576')),  # 1MB
+    'MEMORY_THRESHOLDS': {
+        'warning': int(os.getenv('WEBHOOK_MEMORY_WARNING', '256')),  # 256MB
+        'critical': int(os.getenv('WEBHOOK_MEMORY_CRITICAL', '512'))  # 512MB
+    },
+    'ALLOWED_IPS': [ip.strip() for ip in os.getenv('WEBHOOK_ALLOWED_IPS', '').split(',') if ip.strip()],
+    'BLOCKED_IPS': [ip.strip() for ip in os.getenv('WEBHOOK_BLOCKED_IPS', '').split(',') if ip.strip()]
+}
+
+# Webhook queue configuration
+WEBHOOK_CONFIG = {
+    'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '1000')),
+    'BATCH_SIZE': int(os.getenv('WEBHOOK_BATCH_SIZE', '10')),
+    'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
+    'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '3600')),  # 1 hour
+    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),  # 5 minutes
+    'MAX_MEMORY_MB': int(os.getenv('WEBHOOK_MAX_MEMORY_MB', '512')),  # 512MB memory limit
+    'MAX_PAYLOAD_SIZE': int(os.getenv('WEBHOOK_MAX_PAYLOAD_SIZE', '1048576')),  # 1MB
+    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '60')),  # 1 minute window
+    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '60')),  # 60 requests per window
+    'RETRY_DELAY': int(os.getenv('WEBHOOK_RETRY_DELAY', '60')),  # 1 minute between retries
+    'SIGNATURE_EXPIRY': int(os.getenv('WEBHOOK_SIGNATURE_EXPIRY', '600')),  # 10 minutes signature validity
+    'SIGNATURE_REQUIRED': os.getenv('WEBHOOK_SIGNATURE_REQUIRED', 'true').lower() == 'true'
+}
+
+# Validate webhook configuration
+validate_webhook_config(WEBHOOK_CONFIG)
+
 # Validate entire configuration
 def validate_config():
     """Validate entire configuration"""
@@ -740,37 +789,3 @@ database_url = os.getenv('DATABASE_URL')
 if database_url and database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
     os.environ['DATABASE_URL'] = database_url
-
-# Webhook security configuration
-WEBHOOK_SECURITY = {
-    'RATE_LIMITS': {
-        'global': {
-            'requests_per_second': int(os.getenv('WEBHOOK_GLOBAL_RATE_LIMIT', '10')),
-            'burst': int(os.getenv('WEBHOOK_GLOBAL_BURST', '20'))
-        },
-        'per_ip': {
-            'requests_per_second': int(os.getenv('WEBHOOK_IP_RATE_LIMIT', '5')),
-            'burst': int(os.getenv('WEBHOOK_IP_BURST', '10'))
-        }
-    },
-    'MAX_PAYLOAD_SIZE': int(os.getenv('WEBHOOK_MAX_PAYLOAD_SIZE', '1048576')),  # 1MB
-    'ALLOWED_IPS': os.getenv('WEBHOOK_ALLOWED_IPS', '').split(','),
-    'BLOCKED_IPS': os.getenv('WEBHOOK_BLOCKED_IPS', '').split(',')
-}
-
-# Webhook queue configuration
-WEBHOOK_CONFIG = {
-    'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '1000')),
-    'BATCH_SIZE': int(os.getenv('WEBHOOK_BATCH_SIZE', '10')),
-    'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
-    'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '3600')),  # 1 hour
-    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),  # 5 minutes
-    'MAX_MEMORY_MB': int(os.getenv('WEBHOOK_MAX_MEMORY_MB', '512')),  # 512MB memory limit
-    'MAX_PAYLOAD_SIZE': WEBHOOK_SECURITY['MAX_PAYLOAD_SIZE'],  # Use same limit from security config
-    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '60')),  # 1 minute window
-    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '60')),  # 60 requests per window
-    'RETRY_DELAY': int(os.getenv('WEBHOOK_RETRY_DELAY', '60'))  # 1 minute between retries
-}
-
-# Validate webhook configuration
-validate_webhook_config(WEBHOOK_CONFIG)

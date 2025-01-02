@@ -159,7 +159,14 @@ class WebhookQueue:
     """Queue for processing webhooks with rate limiting and retries"""
     
     def __init__(self, secret: str = None, max_queue_size: int = 1000, batch_size: int = 10, max_retries: int = 3):
-        """Initialize webhook queue"""
+        """Initialize webhook queue
+        
+        Args:
+            secret: Webhook secret for signature validation
+            max_queue_size: Maximum size of event queue
+            batch_size: Number of events to process in batch
+            max_retries: Maximum number of retry attempts
+        """
         self.secret = secret
         self.max_queue_size = max_queue_size
         self.batch_size = batch_size
@@ -174,27 +181,7 @@ class WebhookQueue:
         # Initialize event handlers
         self.event_handlers: Dict[str, Callable] = {}
         
-        # Initialize metrics
-        self.processed_count = 0
-        self.error_count = 0
-        self.last_processed = None
-        
-        # Initialize error tracking
-        self.errors = deque(maxlen=100)
-        self.error_counts = defaultdict(int)
-        
-        logger.info(f"Initialized WebhookQueue with max_size={max_queue_size}, batch_size={batch_size}")
-        
-        # Initialize rate limiters
-        self.global_limiter = IPRateLimiter(
-            WEBHOOK_SECURITY['RATE_LIMITS']['global']['requests_per_second'],
-            WEBHOOK_SECURITY['RATE_LIMITS']['global']['burst']
-        )
-        self.ip_limiter = IPRateLimiter(
-            WEBHOOK_SECURITY['RATE_LIMITS']['per_ip']['requests_per_second'],
-            WEBHOOK_SECURITY['RATE_LIMITS']['per_ip']['burst']
-        )
-        
+        # Initialize metrics with more detailed tracking
         self.stats = {
             'total_received': 0,
             'total_processed': 0,
@@ -204,24 +191,77 @@ class WebhookQueue:
             'total_invalid': 0,
             'total_rate_limited': 0,
             'total_blocked_ips': 0,
-            'memory_usage_mb': 0.0
+            'total_signature_failures': 0,
+            'total_expired_events': 0,
+            'memory_usage_mb': 0.0,
+            'current_queue_size': 0,
+            'last_processed_at': None,
+            'last_error_at': None,
+            'processing_time_ms': 0.0,
+            'retry_success_rate': 0.0,
+            'error_rate': 0.0
         }
         
+        # Initialize error tracking with categorization
+        self.errors = deque(maxlen=100)
+        self.error_counts = defaultdict(int)
+        self.error_categories = {
+            'validation': ['missing_fields', 'invalid_timestamp', 'invalid_address', 
+                         'invalid_tx_hash', 'invalid_pool_id', 'invalid_policy_id'],
+            'security': ['signature_failure', 'rate_limit', 'blocked_ip', 'oversized_payload'],
+            'processing': ['queue_full', 'memory_limit', 'timeout', 'retry_failed'],
+            'system': ['database_error', 'network_error', 'internal_error']
+        }
+        
+        # Initialize rate limiters with configuration
+        self.global_limiter = IPRateLimiter(
+            WEBHOOK_SECURITY['RATE_LIMITS']['global']['requests_per_second'],
+            WEBHOOK_SECURITY['RATE_LIMITS']['global']['burst']
+        )
+        self.ip_limiter = IPRateLimiter(
+            WEBHOOK_SECURITY['RATE_LIMITS']['per_ip']['requests_per_second'],
+            WEBHOOK_SECURITY['RATE_LIMITS']['per_ip']['burst']
+        )
+        
+        # Initialize cleanup task
+        self._cleanup_task = None
+        self._shutdown = False
+        
+        logger.info(
+            f"Initialized WebhookQueue with max_size={max_queue_size}, "
+            f"batch_size={batch_size}, max_retries={max_retries}"
+        )
+        
     async def start(self):
-        """Start the webhook queue processor"""
+        """Start the webhook queue processor and cleanup tasks"""
         self._shutdown = False
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         await self.process_queue()
         
     async def stop(self):
-        """Stop the webhook queue processor"""
+        """Stop the webhook queue processor and cleanup tasks"""
         self._shutdown = True
+        
+        # Cancel cleanup task
         if self._cleanup_task:
             self._cleanup_task.cancel()
             try:
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
+                
+        # Clear queue
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+                
+        # Reset processing state
+        self.processing = False
+        self.stop_event.set()
+        
+        logger.info("WebhookQueue stopped")
         
     async def _cleanup_loop(self):
         """Periodically clean up old events and rate limit data"""
@@ -250,7 +290,7 @@ class WebhookQueue:
                         self.queue.put_nowait(event)
 
                 # Update memory usage stats
-                self.stats['memory_usage_mb'] = self._get_memory_usage()
+                self.stats['memory_usage_mb'] = await self._check_memory_usage()
 
                 # Log cleanup stats
                 logger.info(f"Cleanup completed. Queue size: {self.queue.qsize()}, "
@@ -336,9 +376,11 @@ class WebhookQueue:
                 
         except Exception as e:
             logger.error(f"Error adding event {event_id}: {e}")
-            self._add_error('add_event_error',
-                          f'Error adding event: {str(e)}',
-                          event_id)
+            self._add_error(
+                'add_event_error',
+                f'Error adding event: {str(e)}',
+                event_id
+            )
             return False
             
     async def _check_memory_usage(self) -> float:
@@ -414,12 +456,22 @@ class WebhookQueue:
         """Process a batch of webhook events"""
         for event in batch:
             try:
+                # Get handler for event type
+                handler = self.event_handlers.get(event.event_type)
+                if not handler:
+                    raise ValueError(f"No handler registered for event type: {event.event_type}")
+                
                 # Process the event
-                # This would call your webhook handling logic
-                logger.info(f"Processing webhook event {event.id}")
+                start_time = time.time()
+                await handler(event.payload)
+                processing_time = (time.time() - start_time) * 1000  # Convert to ms
                 
                 # Update stats
                 self.stats['total_processed'] += 1
+                self.stats['processing_time_ms'] = processing_time
+                self.stats['last_processed_at'] = datetime.now().isoformat()
+                
+                logger.info(f"Successfully processed webhook event {event.id} in {processing_time:.2f}ms")
                 
             except Exception as e:
                 event.retries += 1
@@ -433,75 +485,179 @@ class WebhookQueue:
                 else:
                     self.stats['total_failed'] += 1
                     logger.error(f"Webhook event {event.id} failed permanently. Error: {e}")
-
+                    self.stats['last_error_at'] = datetime.now().isoformat()
+                    self._add_error('processing_error', str(e), event.id)
+                    
     async def process_webhook(self, request: web.Request) -> web.Response:
         """Process incoming webhook request"""
         try:
+            # Log request info
+            logger.info(f"Received webhook request from {request.remote} "
+                      f"with content length {request.content_length}")
+
             # Get request body
-            body = await request.text()
+            try:
+                body = await request.text()
+            except Exception as e:
+                logger.error(f"Error reading request body: {e}", exc_info=True)
+                return web.Response(text="Error reading request body", status=400)
             
             # Verify signature
             if not self.validate_signature(dict(request.headers), body):
+                self.stats['total_signature_failures'] += 1
+                logger.warning(f"Invalid webhook signature from {request.remote}")
                 return web.Response(text="Invalid signature", status=401)
             
             # Parse JSON data
-            data = json.loads(body)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in webhook request: {e}", exc_info=True)
+                return web.Response(text=f"Invalid JSON: {str(e)}", status=400)
             
             # Check security limits
-            if not await self.check_request(len(body), request.remote):
-                return web.Response(text="Rate limit exceeded", status=429)
+            is_allowed, error_msg = await self.check_request(len(body), request.remote)
+            if not is_allowed:
+                logger.warning(f"Request blocked: {error_msg} from {request.remote}")
+                return web.Response(text=error_msg, status=429)
                 
             # Verify required fields
             if not isinstance(data, list):
                 data = [data]  # Convert single event to list
                 
+            processed_events = 0
+            errors = []
+            
             for event in data:
-                if 'type' not in event or 'payload' not in event:
-                    return web.Response(text="Missing required fields", status=400)
+                try:
+                    if 'type' not in event or 'payload' not in event:
+                        errors.append("Missing required fields 'type' or 'payload'")
+                        continue
+
+                    event_id = event.get('id', str(uuid.uuid4()))
                     
-                # Add to queue
-                await self.add_event(
-                    event_id=event.get('id', str(uuid.uuid4())),
-                    event_type=event['type'],
-                    payload=event['payload'],
-                    headers=dict(request.headers)
-                )
+                    # Add to queue
+                    success = await self.add_event(
+                        event_id=event_id,
+                        event_type=event['type'],
+                        payload=event['payload'],
+                        headers=dict(request.headers)
+                    )
+                    
+                    if success:
+                        processed_events += 1
+                    else:
+                        errors.append(f"Failed to queue event {event_id}")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing event: {e}", exc_info=True)
+                    errors.append(f"Error processing event: {str(e)}")
             
-            # Return success (must be 2xx as per Blockfrost docs)
-            return web.Response(text="OK", status=200)
+            # Log processing summary
+            logger.info(f"Processed {processed_events}/{len(data)} events from {request.remote}")
+            if errors:
+                logger.warning(f"Errors processing webhook: {'; '.join(errors)}")
             
-        except json.JSONDecodeError:
-            return web.Response(text="Invalid JSON", status=400)
+            # Return success if at least one event was processed
+            if processed_events > 0:
+                return web.Response(text="OK", status=200)
+            else:
+                return web.Response(text="; ".join(errors), status=400)
+            
         except Exception as e:
-            logger.error(f"Error processing webhook: {e}")
-            return web.Response(text=str(e), status=500)
+            logger.error(f"Unhandled error processing webhook: {e}", exc_info=True)
+            return web.Response(text="Internal server error", status=500)
 
     def register_handler(self, event_type: str, handler: Callable):
         """Register handler for event type"""
         self.event_handlers[event_type] = handler
         
-    def validate_signature(self, headers: Dict[str, str], payload: Union[str, bytes]) -> bool:
-        """Validate Blockfrost webhook signature"""
+    async def check_request(self, request_size: int, client_ip: str) -> Tuple[bool, str]:
+        """Check if request passes security checks
+        
+        Args:
+            request_size: Size of the request in bytes
+            client_ip: Client IP address
+            
+        Returns:
+            Tuple[bool, str]: (is_allowed, error_message)
+        """
         try:
+            # Check if IP is blocked
+            if client_ip in WEBHOOK_SECURITY['BLOCKED_IPS']:
+                self.stats['total_blocked_ips'] += 1
+                return False, "IP address is blocked"
+                
+            # Check if IP is allowed (if allowlist is configured)
+            if WEBHOOK_SECURITY['ALLOWED_IPS'] and client_ip not in WEBHOOK_SECURITY['ALLOWED_IPS']:
+                self.stats['total_blocked_ips'] += 1
+                return False, "IP address not in allowed list"
+            
+            # Check request size
+            if request_size > WEBHOOK_SECURITY['MAX_PAYLOAD_SIZE']:
+                self.stats['total_oversized'] += 1
+                return False, f"Request size {request_size} exceeds limit {WEBHOOK_SECURITY['MAX_PAYLOAD_SIZE']}"
+                
+            # Check rate limits
+            if not await self.global_limiter.is_allowed("global"):
+                self.stats['total_rate_limited'] += 1
+                return False, "Global rate limit exceeded"
+                
+            if not await self.ip_limiter.is_allowed(client_ip):
+                self.stats['total_rate_limited'] += 1
+                return False, "IP rate limit exceeded"
+                
+            # Check memory usage
+            memory_usage = await self._check_memory_usage()
+            if memory_usage > WEBHOOK_SECURITY['MEMORY_THRESHOLDS']['critical']:
+                logger.error(f"Memory usage critical: {memory_usage}MB")
+                return False, "Server under high memory pressure"
+            elif memory_usage > WEBHOOK_SECURITY['MEMORY_THRESHOLDS']['warning']:
+                logger.warning(f"Memory usage warning: {memory_usage}MB")
+                
+            return True, ""
+            
+        except Exception as e:
+            logger.error(f"Error in security check: {e}", exc_info=True)
+            return False, f"Security check error: {str(e)}"
+            
+    def validate_signature(self, headers: Dict[str, str], payload: Union[str, bytes]) -> bool:
+        """Validate Blockfrost webhook signature
+        
+        Args:
+            headers: Request headers
+            payload: Request payload
+            
+        Returns:
+            bool: True if signature is valid
+        """
+        try:
+            if not WEBHOOK_CONFIG['SIGNATURE_REQUIRED']:
+                return True
+                
+            if not self.secret:
+                self._add_error('signature_error', "Webhook secret not configured")
+                return False
+                
             # Get signature header (case-insensitive)
             signature_header = next(
                 (v for k, v in headers.items() if k.lower() == 'blockfrost-signature'),
                 None
             )
             if not signature_header:
-                logger.warning("Missing Blockfrost-Signature header")
+                self._add_error('signature_error', "Missing Blockfrost-Signature header")
                 return False
 
             # Parse header parts
             try:
                 header_parts = dict(part.split('=') for part in signature_header.split(','))
             except ValueError:
-                logger.warning("Invalid signature header format")
+                self._add_error('signature_error', "Invalid signature header format")
                 return False
 
             # Verify required parts
             if not all(k in header_parts for k in ['t', 'v1']):
-                logger.warning("Missing required signature components")
+                self._add_error('signature_error', "Missing required signature components")
                 return False
 
             # Extract parts
@@ -512,13 +668,14 @@ class WebhookQueue:
             try:
                 timestamp_int = int(timestamp)
             except ValueError:
-                logger.warning("Invalid timestamp format")
+                self._add_error('signature_error', "Invalid timestamp format")
                 return False
 
-            # Check timestamp is within window (600s default in Blockfrost)
+            # Check timestamp is within window
             now = int(time.time())
-            if abs(now - timestamp_int) > 600:
-                logger.warning(f"Webhook timestamp too old: {abs(now - timestamp_int)} seconds")
+            if abs(now - timestamp_int) > WEBHOOK_CONFIG['SIGNATURE_EXPIRY']:
+                self._add_error('signature_error', 
+                              f"Webhook timestamp too old: {abs(now - timestamp_int)} seconds")
                 return False
 
             # Ensure payload is string
@@ -536,62 +693,58 @@ class WebhookQueue:
             ).hexdigest()
 
             # Use constant-time comparison
-            return hmac.compare_digest(signature.lower(), expected.lower())
+            is_valid = hmac.compare_digest(signature.lower(), expected.lower())
+            if not is_valid:
+                self._add_error('signature_error', "Invalid signature")
+                
+            return is_valid
 
         except Exception as e:
-            logger.error(f"Error validating signature: {e}", exc_info=True)
+            self._add_error('signature_error', f"Error validating signature: {str(e)}")
             return False
             
-    async def check_request(self, request_size: int, client_ip: str) -> Tuple[bool, str]:
-        """Check if request passes security checks"""
-        # Check request size
-        if request_size > WEBHOOK_SECURITY['MAX_REQUEST_SIZE']:
-            return False, "Request size exceeds limit"
-            
-        # Check rate limits
-        if not await self.global_limiter.is_allowed("global"):
-            self.stats['total_rate_limited'] += 1
-            return False, "Global rate limit exceeded"
-            
-        if not await self.ip_limiter.is_allowed(client_ip):
-            self.stats['total_rate_limited'] += 1
-            return False, "IP rate limit exceeded"
-            
-        # Check memory usage
-        memory_usage = await self._check_memory_usage()
-        if memory_usage > WEBHOOK_SECURITY['MEMORY_THRESHOLDS']['critical']:
-            return False, "Server under high memory pressure"
-            
-        return True, ""
-        
     async def _validate_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
-        """Validate event payload with comprehensive checks"""
+        """Validate event payload with comprehensive checks
+        
+        Args:
+            event_type: Type of event
+            payload: Event payload
+            
+        Returns:
+            bool: True if payload is valid
+        """
         try:
             # Check payload size
             payload_size = len(json.dumps(payload))
-            if payload_size > 100000:
-                self._add_error('oversized_payload', f'Payload size {payload_size} exceeds limit')
+            if payload_size > WEBHOOK_CONFIG['MAX_PAYLOAD_SIZE']:
+                self._add_error('oversized_payload', 
+                              f'Payload size {payload_size} exceeds limit {WEBHOOK_CONFIG["MAX_PAYLOAD_SIZE"]}')
                 return False
                 
             # Basic structure validation
             required_fields = {'address', 'timestamp', 'data'}
             if not all(field in payload for field in required_fields):
-                self._add_error('missing_fields', 'Missing required fields')
+                missing = required_fields - set(payload.keys())
+                missing_str = ", ".join(sorted(missing))
+                self._add_error('missing_fields', f'Missing required fields: {missing_str}')
                 return False
                 
             # Validate timestamp
             try:
-                event_time = datetime.fromisoformat(payload['timestamp'])
-                if abs((datetime.now() - event_time).total_seconds()) > 3600:
-                    self._add_error('invalid_timestamp', 'Event timestamp too old or future')
+                event_time = datetime.fromisoformat(payload['timestamp'].replace('Z', '+00:00'))
+                age = (datetime.now(event_time.tzinfo) - event_time).total_seconds()
+                if abs(age) > WEBHOOK_CONFIG['MAX_EVENT_AGE']:
+                    self._add_error('invalid_timestamp', 
+                                  f'Event timestamp too old: {age} seconds')
                     return False
-            except ValueError:
-                self._add_error('invalid_timestamp', 'Invalid timestamp format')
+            except (ValueError, TypeError) as e:
+                self._add_error('invalid_timestamp', f'Invalid timestamp format: {e}')
                 return False
                 
             # Validate address format
             if not payload['address'].startswith(('addr1', 'stake1')):
-                self._add_error('invalid_address', 'Invalid address format')
+                self._add_error('invalid_address', 
+                              f'Invalid address format: {payload["address"]}')
                 return False
                 
             # Event-specific validation
@@ -599,15 +752,35 @@ class WebhookQueue:
                 if 'tx_hash' not in payload['data']:
                     self._add_error('missing_tx_hash', 'Transaction missing tx_hash')
                     return False
+                if not re.match(r'^[a-f0-9]{64}$', payload['data']['tx_hash']):
+                    self._add_error('invalid_tx_hash', 
+                                  f'Invalid transaction hash: {payload["data"]["tx_hash"]}')
+                    return False
+                    
             elif event_type == 'delegation':
                 if 'pool_id' not in payload['data']:
                     self._add_error('missing_pool_id', 'Delegation missing pool_id')
+                    return False
+                if not re.match(r'^pool1[a-z0-9]{50,55}$', payload['data']['pool_id']):
+                    self._add_error('invalid_pool_id', 
+                                  f'Invalid pool ID: {payload["data"]["pool_id"]}')
+                    return False
+                    
+            elif event_type == 'asset':
+                if not all(k in payload['data'] for k in ['policy_id', 'asset_name']):
+                    self._add_error('missing_asset_info', 
+                                  'Asset event missing policy_id or asset_name')
+                    return False
+                if not re.match(r'^[a-f0-9]{56}$', payload['data']['policy_id']):
+                    self._add_error('invalid_policy_id', 
+                                  f'Invalid policy ID: {payload["data"]["policy_id"]}')
                     return False
                     
             return True
             
         except Exception as e:
-            self._add_error('validation_error', str(e))
+            logger.error(f"Error validating event: {e}", exc_info=True)
+            self._add_error('validation_error', f'Event validation error: {str(e)}')
             return False
             
     def _add_error(self, error_type: str, message: str, event_id: Optional[str] = None,
