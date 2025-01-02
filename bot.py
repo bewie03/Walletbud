@@ -239,6 +239,45 @@ class WalletBudBot(commands.Bot):
         "NFT/Token Contract": ["721", "20", "nft", "token"]  # NFT and Token standards
     }
 
+    async def _check_yummi_balances(self):
+        """Check Yummi token balances for all registered users"""
+        try:
+            logger.info("Starting Yummi balance check")
+            async with self.pool.acquire() as conn:
+                # Get all registered users
+                users = await conn.fetch("SELECT user_id, stake_address FROM users WHERE stake_address IS NOT NULL")
+                
+                for user in users:
+                    try:
+                        # Get user's stake address assets
+                        assets = await self.blockfrost_request(f'/accounts/{user["stake_address"]}/addresses/assets')
+                        
+                        # Find Yummi tokens
+                        yummi_assets = [
+                            asset for asset in assets 
+                            if asset.get('unit', '').startswith(YUMMI_POLICY_ID)
+                        ]
+                        
+                        if yummi_assets:
+                            # Calculate total Yummi balance
+                            total_yummi = sum(int(asset.get('quantity', 0)) for asset in yummi_assets)
+                            
+                            # Update user's Yummi balance
+                            await conn.execute(
+                                "UPDATE users SET yummi_balance = $1 WHERE user_id = $2",
+                                total_yummi, user['user_id']
+                            )
+                            
+                            logger.info(f"Updated Yummi balance for user {user['user_id']}: {total_yummi}")
+                    except Exception as e:
+                        logger.error(f"Error checking Yummi balance for user {user['user_id']}: {str(e)}")
+                        continue
+                        
+            logger.info("Completed Yummi balance check")
+            
+        except Exception as e:
+            logger.error(f"Error in Yummi balance check: {str(e)}")
+
     def __init__(self, *args, **kwargs):
         """Initialize the bot with required intents"""
         intents = discord.Intents.default()
@@ -1307,210 +1346,91 @@ class WalletBudBot(commands.Bot):
                 return web.Response(status=401, text="Missing signature")
 
             try:
+                # Get webhook secret
+                webhook_secret = os.getenv('BLOCKFROST_WEBHOOK_SECRET')
+                if not webhook_secret:
+                    logger.error("BLOCKFROST_WEBHOOK_SECRET environment variable not set")
+                    return web.Response(status=500, text="Server configuration error")
+
+                # Read raw payload once
                 payload = await request.read()
+                if not payload:
+                    logger.warning(f"Empty payload for webhook request {request_id}")
+                    return web.Response(status=400, text="Empty payload")
+
+                # Calculate expected signature
                 expected_signature = hmac.new(
-                    os.getenv('BLOCKFROST_WEBHOOK_SECRET').encode(),
+                    webhook_secret.encode(),
                     payload,
                     hashlib.sha512
                 ).hexdigest()
                 
+                # Use constant-time comparison
                 if not hmac.compare_digest(signature, expected_signature):
                     logger.warning(f"Invalid signature for webhook request {request_id}")
                     return web.Response(status=401, text="Invalid signature")
-            except Exception as e:
-                logger.error(f"Error verifying signature for webhook request {request_id}: {str(e)}")
-                return web.Response(status=500, text="Error verifying signature")
 
-            # Validate webhook data
-            try:
-                # Log the raw webhook data for debugging
-                logger.debug(f"Raw webhook data type: {type(webhook_data)}")
-                logger.debug(f"Raw webhook data: {webhook_data}")
-                
-                # Handle string input
-                if isinstance(webhook_data, str):
-                    try:
-                        webhook_data = json.loads(webhook_data)
-                    except json.JSONDecodeError:
-                        raise ValueError("Invalid payload: string payload is not valid JSON")
-                
-                # Ensure we have a dictionary
+                # Parse webhook data
+                try:
+                    webhook_data = json.loads(payload)
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid JSON in webhook request {request_id}: {str(e)}")
+                    return web.Response(status=400, text="Invalid JSON")
+
+                # Validate webhook data structure
                 if not isinstance(webhook_data, dict):
-                    raise ValueError(f"Invalid payload: must be a dictionary, got {type(webhook_data)}")
-                
+                    logger.warning(f"Invalid webhook data type: {type(webhook_data)}")
+                    return web.Response(status=400, text="Invalid webhook data format")
+
                 # Get the payload, which might be nested or direct
                 payload = webhook_data.get('payload', webhook_data)
                 if not isinstance(payload, dict):
-                    raise ValueError(f"Invalid payload structure: payload must be a dictionary, got {type(payload)}")
-                
+                    logger.warning(f"Invalid payload type: {type(payload)}")
+                    return web.Response(status=400, text="Invalid payload format")
+
+                # Validate required fields
+                required_fields = ['type', 'data']
+                missing_fields = [field for field in required_fields if field not in payload]
+                if missing_fields:
+                    logger.warning(f"Missing required fields in payload: {missing_fields}")
+                    return web.Response(status=400, text=f"Missing required fields: {', '.join(missing_fields)}")
+
                 # Validate webhook type
-                webhook_type = payload.get('type')
-                if not webhook_type:
-                    raise ValueError("Missing required field: type")
-                
-                if webhook_type not in ['transaction', 'delegation']:
-                    raise ValueError(f"Invalid webhook type: {webhook_type}")
-                
-                # Add to webhook queue
-                await self.webhook_queue.add_event(
-                    event_id=request_id,
-                    event_type=webhook_type,
-                    payload=payload,
-                    headers=dict(request.headers)
-                )
-                
-                logger.info(f"Successfully queued webhook {request_id} of type {webhook_type}")
-                return web.Response(status=202, text="Webhook queued for processing")
-                
-            except ValueError as e:
-                error_msg = str(e)
-                logger.error(f"Invalid webhook structure in request {request_id}: {error_msg}")
-                return web.Response(status=400, text=error_msg)
-            
-        except Exception as e:
-            logger.error(f"Error processing webhook request {request_id}: {str(e)}")
-            return web.Response(status=500, text="Internal server error")
+                webhook_type = payload['type']
+                if not isinstance(webhook_type, str):
+                    logger.warning(f"Invalid webhook type: {webhook_type}")
+                    return web.Response(status=400, text="Invalid webhook type")
 
-    def _validate_webhook_structure(self, webhook_data: dict):
-        """Validate webhook data structure"""
-        try:
-            # Use config validation for webhook secret
-            if not validate_blockfrost_webhook_secret(os.getenv('BLOCKFROST_WEBHOOK_SECRET'), 'BLOCKFROST_WEBHOOK_SECRET'):
-                raise ValueError("Invalid webhook secret configuration")
-            
-            # Validate basic structure
-            if not isinstance(webhook_data, dict):
-                raise ValueError("Invalid webhook data: must be a dictionary")
-            
-            # Handle both direct payload and nested payload structures
-            payload = webhook_data.get('payload', webhook_data)
-            if not isinstance(payload, dict):
-                raise ValueError("Invalid payload: must be a dictionary")
-            
-            # Get webhook type from payload
-            webhook_type = payload.get('type')
-            if not webhook_type:
-                raise ValueError("Missing required field: type in payload")
-            
-            # Validate webhook type
-            if webhook_type not in ['transaction', 'delegation']:
-                raise ValueError(f"Invalid webhook type: {webhook_type}")
-            
-            # Validate payload structure based on type
-            if webhook_type == 'transaction':
-                required_tx_fields = ['tx', 'block', 'confirmations']
-                for field in required_tx_fields:
-                    if field not in payload:
-                        raise ValueError(f"Missing required transaction field: {field}")
-                    
-            elif webhook_type == 'delegation':
-                required_del_fields = ['stake_address', 'pool_id', 'amount']
-                for field in required_del_fields:
-                    if field not in payload:
-                        raise ValueError(f"Missing required delegation field: {field}")
-                        
-            # Return the validated payload
-            return payload
-            
-        except Exception as e:
-            logger.error(f"Webhook validation error: {str(e)}")
-            raise ValueError(f"Webhook validation failed: {str(e)}")
+                # Validate webhook data
+                webhook_data = payload['data']
+                if not isinstance(webhook_data, dict):
+                    logger.warning(f"Invalid webhook data: {webhook_data}")
+                    return web.Response(status=400, text="Invalid webhook data")
 
-    async def _handle_transaction_webhook(self, payload: dict):
-        """Handle transaction webhook from Blockfrost"""
-        try:
-            # Register handlers with webhook queue
-            self.webhook_queue.register_handler('transaction', self._process_transaction)
-            self.webhook_queue.register_handler('delegation', self._process_delegation)
-            
-            # Let the queue handle the processing
-            await self.webhook_queue.process_queue()
-            
-        except Exception as e:
-            logger.error(f"Error handling transaction webhook: {str(e)}")
-            raise
-            
-    async def _process_transaction(self, event: WebhookEvent):
-        """Process a transaction event from the queue"""
-        try:
-            payload = event.payload
-            tx_hash = payload.get('tx', {}).get('hash')
-            if not tx_hash:
-                raise ValueError("Missing transaction hash in payload")
-                
-            # Get transaction details
-            tx_details = await self.blockfrost_request(f'/txs/{tx_hash}')
-            
-            # Process transaction based on type
-            if 'metadata' in tx_details:
-                await self._handle_metadata_transaction(tx_details)
-            else:
-                await self._handle_standard_transaction(tx_details)
-                
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error processing transaction: {str(e)}")
-            return False
-            
-    async def _process_delegation(self, event: WebhookEvent):
-        """Process a delegation event from the queue"""
-        try:
-            payload = event.payload
-            stake_address = payload.get('stake_address')
-            if not stake_address:
-                raise ValueError("Missing stake address in payload")
-                
-            # Get delegation details
-            delegation = await self.blockfrost_request(f'/accounts/{stake_address}/delegations')
-            
-            # Process delegation
-            await self._handle_delegation_update(stake_address, delegation)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error processing delegation: {str(e)}")
-            return False
+                # Process webhook based on type
+                try:
+                    if webhook_type == 'transaction':
+                        await self._handle_transaction_webhook(webhook_data)
+                    elif webhook_type == 'delegation':
+                        await self._handle_delegation_webhook(webhook_data)
+                    else:
+                        logger.warning(f"Unsupported webhook type: {webhook_type}")
+                        return web.Response(status=400, text="Unsupported webhook type")
 
-    async def _check_yummi_balances(self):
-        """Check Yummi token balances for all registered users"""
-        try:
-            logger.info("Starting Yummi balance check")
-            async with self.pool.acquire() as conn:
-                # Get all registered users
-                users = await conn.fetch("SELECT user_id, stake_address FROM users WHERE stake_address IS NOT NULL")
-                
-                for user in users:
-                    try:
-                        # Get user's stake address assets
-                        assets = await self.blockfrost_request(f'/accounts/{user["stake_address"]}/addresses/assets')
-                        
-                        # Find Yummi tokens
-                        yummi_assets = [
-                            asset for asset in assets 
-                            if asset.get('unit', '').startswith(YUMMI_POLICY_ID)
-                        ]
-                        
-                        if yummi_assets:
-                            # Calculate total Yummi balance
-                            total_yummi = sum(int(asset.get('quantity', 0)) for asset in yummi_assets)
-                            
-                            # Update user's Yummi balance
-                            await conn.execute(
-                                "UPDATE users SET yummi_balance = $1 WHERE user_id = $2",
-                                total_yummi, user['user_id']
-                            )
-                            
-                            logger.info(f"Updated Yummi balance for user {user['user_id']}: {total_yummi}")
-                    except Exception as e:
-                        logger.error(f"Error checking Yummi balance for user {user['user_id']}: {str(e)}")
-                        continue
-                        
-            logger.info("Completed Yummi balance check")
-            
-        except Exception as e:
-            logger.error(f"Error in Yummi balance check: {str(e)}")
+                    # Update metrics
+                    await self.update_health_metrics('webhook_success')
+                    return web.Response(status=200, text="Webhook processed successfully")
+
+                except Exception as e:
+                    logger.error(f"Error processing webhook: {str(e)}")
+                    await self.update_health_metrics('webhook_failure')
+                    return web.Response(status=500, text="Error processing webhook")
+
+            except Exception as e:
+                logger.error(f"Error handling webhook request {request_id}: {str(e)}")
+                await self.update_health_metrics('webhook_failure')
+                return web.Response(status=500, text="Internal server error")
+{{ ... }}
 
 async def main(app):
     """Main entry point for the bot when running locally"""
