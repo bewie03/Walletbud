@@ -14,7 +14,7 @@ import re
 from typing import Dict, Any, Optional, List, Callable, Tuple, Union
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from collections import deque
+from collections import deque, defaultdict
 import sys
 from aiohttp import web
 
@@ -160,14 +160,29 @@ class IPRateLimiter:
 class WebhookQueue:
     """Queue for processing webhooks with rate limiting and retries"""
     
-    def __init__(self, secret: str = None, max_queue_size: int = None,
-                 batch_size: int = None, max_retries: int = None):
+    def __init__(self, secret: str = None, max_queue_size: int = 1000, batch_size: int = 10, max_retries: int = 3):
         """Initialize webhook queue"""
         self.secret = secret
-        self.queue = deque(maxlen=max_queue_size or WEBHOOK_CONFIG['MAX_QUEUE_SIZE'])
-        self.processing = False
-        self.process_lock = asyncio.Lock()
+        self.max_queue_size = max_queue_size
+        self.batch_size = batch_size
+        self.max_retries = max_retries
+        
+        # Initialize queue and locks
+        self.queue = asyncio.Queue(maxsize=max_queue_size)
         self.queue_lock = asyncio.Lock()
+        self.processing = False
+        self.stop_event = asyncio.Event()
+        
+        # Initialize metrics
+        self.processed_count = 0
+        self.error_count = 0
+        self.last_processed = None
+        
+        # Initialize error tracking
+        self.errors = deque(maxlen=100)
+        self.error_counts = defaultdict(int)
+        
+        logger.info(f"Initialized WebhookQueue with max_size={max_queue_size}, batch_size={batch_size}")
         
         # Initialize rate limiters
         self.global_limiter = IPRateLimiter(
@@ -218,17 +233,26 @@ class WebhookQueue:
                 # Clean up old events
                 now = datetime.now()
                 async with self.queue_lock:
-                    self.queue = deque(
-                        [event for event in self.queue 
-                         if (now - event.created_at).total_seconds() <= WEBHOOK_CONFIG['MAX_EVENT_AGE']],
-                        maxlen=self.queue.maxlen
-                    )
+                    events = []
+                    while not self.queue.empty():
+                        event = self.queue.get_nowait()
+                        if (now - event.created_at).total_seconds() <= WEBHOOK_CONFIG['MAX_EVENT_AGE']:
+                            events.append(event)
+                        else:
+                            self._add_error(
+                                'event_expired',
+                                f'Event {event.id} expired after {WEBHOOK_CONFIG["MAX_EVENT_AGE"]} seconds',
+                                event.id,
+                                {'age': (now - event.created_at).total_seconds()}
+                            )
+                    for event in events:
+                        self.queue.put_nowait(event)
 
                 # Update memory usage stats
                 self.stats['memory_usage_mb'] = self._get_memory_usage()
 
                 # Log cleanup stats
-                logger.info(f"Cleanup completed. Queue size: {len(self.queue)}, "
+                logger.info(f"Cleanup completed. Queue size: {self.queue.qsize()}, "
                           f"Memory usage: {self.stats['memory_usage_mb']:.2f}MB")
 
             except Exception as e:
@@ -241,13 +265,15 @@ class WebhookQueue:
         try:
             async with self.queue_lock:
                 current_time = datetime.now()
-                old_events = [
-                    event for event in self.queue
-                    if (current_time - event.created_at).total_seconds() > WEBHOOK_CONFIG['MAX_EVENT_AGE']
-                ]
+                old_events = []
+                while not self.queue.empty():
+                    event = self.queue.get_nowait()
+                    if (current_time - event.created_at).total_seconds() > WEBHOOK_CONFIG['MAX_EVENT_AGE']:
+                        old_events.append(event)
+                    else:
+                        self.queue.put_nowait(event)
                 
                 for event in old_events:
-                    self.queue.remove(event)
                     self._add_error(
                         'event_expired',
                         f'Event {event.id} expired after {WEBHOOK_CONFIG["MAX_EVENT_AGE"]} seconds',
@@ -283,30 +309,29 @@ class WebhookQueue:
                 return False
             
             # Check queue capacity
-            async with self.queue_lock:
-                if len(self.queue) >= WEBHOOK_CONFIG['MAX_QUEUE_SIZE']:
-                    self._add_error('queue_full',
-                                  f'Queue full ({WEBHOOK_CONFIG["MAX_QUEUE_SIZE"]} events)',
-                                  event_id)
-                    return False
+            if self.queue.full():
+                self._add_error('queue_full',
+                              f'Queue full ({self.max_queue_size} events)',
+                              event_id)
+                return False
                 
-                # Add event to queue
-                event = WebhookEvent(
-                    id=event_id,
-                    event_type=event_type,
-                    payload=payload,
-                    headers=headers,
-                    created_at=datetime.now()
-                )
-                self.queue.append(event)
-                self.stats['total_received'] += 1
-                self.stats['current_queue_size'] = len(self.queue)
+            # Add event to queue
+            event = WebhookEvent(
+                id=event_id,
+                event_type=event_type,
+                payload=payload,
+                headers=headers,
+                created_at=datetime.now()
+            )
+            await self.queue.put(event)
+            self.stats['total_received'] += 1
+            self.stats['current_queue_size'] = self.queue.qsize()
                 
-                # Start processing if not already running
-                if not self.processing:
-                    asyncio.create_task(self.process_queue())
+            # Start processing if not already running
+            if not self.processing:
+                asyncio.create_task(self.process_queue())
                 
-                return True
+            return True
                 
         except Exception as e:
             logger.error(f"Error adding event {event_id}: {e}")
@@ -341,8 +366,8 @@ class WebhookQueue:
                 
                 # Remove oldest events until under limit
                 async with self.queue_lock:
-                    while memory_mb > WEBHOOK_SECURITY['MEMORY_THRESHOLDS']['critical'] and self.queue:
-                        event = self.queue.popleft()
+                    while memory_mb > WEBHOOK_SECURITY['MEMORY_THRESHOLDS']['critical'] and not self.queue.empty():
+                        event = self.queue.get_nowait()
                         self._add_error(
                             'memory_limit',
                             f'Removed event {event.id} due to memory limit',
@@ -359,22 +384,21 @@ class WebhookQueue:
         """Process queued webhook events"""
         while not self._shutdown:
             try:
-                async with self.process_lock:
-                    if not self.queue:
+                async with self.queue_lock:
+                    if self.queue.empty():
                         await asyncio.sleep(1)
                         continue
 
                     # Process events in batches
-                    batch_size = min(len(self.queue), WEBHOOK_CONFIG['BATCH_SIZE'])
+                    batch_size = min(self.batch_size, self.queue.qsize())
                     batch = []
                     for _ in range(batch_size):
-                        if self.queue:
-                            event = self.queue.popleft()
-                            if event.should_retry():
-                                batch.append(event)
-                            else:
-                                self.stats['total_failed'] += 1
-                                logger.warning(f"Event {event.id} exceeded retry limit or age limit")
+                        event = await self.queue.get()
+                        if event.should_retry():
+                            batch.append(event)
+                        else:
+                            self.stats['total_failed'] += 1
+                            logger.warning(f"Event {event.id} exceeded retry limit or age limit")
 
                     if batch:
                         await self._process_batch(batch)
@@ -402,7 +426,7 @@ class WebhookQueue:
                 event.error = str(e)
                 
                 if event.should_retry():
-                    self.queue.append(event)
+                    await self.queue.put(event)
                     self.stats['total_retried'] += 1
                     logger.warning(f"Webhook event {event.id} failed, retrying. Error: {e}")
                 else:
@@ -430,14 +454,21 @@ class WebhookQueue:
                 return web.Response(text="Missing required fields", status=400)
                 
             # Add to queue
-            await self.queue.put(data)
+            event = WebhookEvent(
+                id=data['type'],
+                event_type=data['type'],
+                payload=data['payload'],
+                headers=dict(request.headers),
+                created_at=datetime.now()
+            )
+            await self.queue.put(event)
             logger.debug(f"Added {data['type']} webhook to queue")
             
             # Return success (must be 2xx as per Blockfrost docs)
             return web.Response(text="OK", status=200)
             
         except Exception as e:
-            logger.error(f"Error processing webhook: {e}", exc_info=True)
+            logger.error(f"Error processing webhook: {e}")
             return web.Response(text=str(e), status=500)
 
     def register_handler(self, event_type: str, handler: Callable):
