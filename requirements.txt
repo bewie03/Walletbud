@@ -16,7 +16,6 @@ aiodns==3.1.1  # For async DNS resolution
 orjson==3.9.10  # Faster JSON parsing
 gunicorn==21.2.0  # Required for Heroku
 gunicorn[aiohttp]==21.2.0  # For async workers
-aiohttp-wsgi==0.10.0  # For WSGI support
 cachetools==5.3.2  # For caching
 requests==2.31.0  # For HTTP requests
 PyNaCl==1.5.0  # For voice support
