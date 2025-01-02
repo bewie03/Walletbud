@@ -738,42 +738,32 @@ if database_url and database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
     os.environ['DATABASE_URL'] = database_url
 
-# Webhook configuration with validation
+# Webhook security configuration
 WEBHOOK_SECURITY = {
-    'MAX_REQUEST_SIZE': 1024 * 1024,  # 1MB limit
-    'MEMORY_THRESHOLDS': {
-        'warning': 75,    # 75% of memory limit
-        'critical': 90    # 90% of memory limit
-    },
     'RATE_LIMITS': {
         'global': {
-            'requests_per_second': 10,
-            'burst': 20
+            'requests_per_second': int(os.getenv('WEBHOOK_GLOBAL_RATE_LIMIT', '10')),
+            'burst': int(os.getenv('WEBHOOK_GLOBAL_BURST', '20'))
         },
         'per_ip': {
-            'requests_per_second': 5,
-            'burst': 10
+            'requests_per_second': int(os.getenv('WEBHOOK_IP_RATE_LIMIT', '5')),
+            'burst': int(os.getenv('WEBHOOK_IP_BURST', '10'))
         }
     },
-    'CORS': {
-        'allowed_origins': ['https://blockfrost.io'],
-        'allowed_methods': ['POST'],
-        'allowed_headers': ['Content-Type', 'Blockfrost-Signature'],
-        'max_age': 3600
-    },
+    'MAX_PAYLOAD_SIZE': int(os.getenv('WEBHOOK_MAX_PAYLOAD_SIZE', '1048576')),  # 1MB
+    'ALLOWED_IPS': os.getenv('WEBHOOK_ALLOWED_IPS', '').split(','),
+    'BLOCKED_IPS': os.getenv('WEBHOOK_BLOCKED_IPS', '').split(',')
 }
 
+# Webhook queue configuration
 WEBHOOK_CONFIG = {
-    'MAX_QUEUE_SIZE': 1000,
-    'BATCH_SIZE': 10,
-    'MAX_RETRIES': 3,
-    'MAX_EVENT_AGE': 3600,  # 1 hour
-    'CLEANUP_INTERVAL': 300,  # 5 minutes
-    'MAX_PAYLOAD_SIZE': 1024 * 1024,  # 1MB
-    'RATE_LIMIT_WINDOW': 60,  # 1 minute
-    'RATE_LIMIT_MAX_REQUESTS': 60,  # 60 requests per minute
-    'MEMORY_LIMIT_MB': 512,  # 512MB
-    'RETRY_DELAY': 60  # 1 minute between retries
+    'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '1000')),
+    'BATCH_SIZE': int(os.getenv('WEBHOOK_BATCH_SIZE', '10')),
+    'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
+    'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '3600')),  # 1 hour
+    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),  # 5 minutes
+    'MAX_MEMORY_MB': int(os.getenv('WEBHOOK_MAX_MEMORY_MB', '512')),  # 512MB memory limit
+    'MAX_PAYLOAD_SIZE': WEBHOOK_SECURITY['MAX_PAYLOAD_SIZE']  # Use same limit from security config
 }
 
 # Validate webhook configuration
