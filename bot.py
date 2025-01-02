@@ -1461,54 +1461,28 @@ if __name__ == "__main__":
     # Create aiohttp app
     app = web.Application()
 
-    # Create bot instance
+    # Initialize bot instance
     bot = WalletBudBot()
 
     # Add webhook route
     app.router.add_post('/webhook', bot.handle_webhook)
 
+    async def main():
+        """Main entry point"""
+        try:
+            # Initialize database
+            await init_db()
+            
+            # Start bot
+            await bot.start(DISCORD_TOKEN)
+            
+        except Exception as e:
+            logger.error(f"Fatal error: {str(e)}")
+            raise
+
+    # Run everything in the event loop
     try:
-        # Configure logging for production
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
-
-        # Configure event loop policy for Windows
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
-        async def main():
-            try:
-                # Create event loop
-                loop = asyncio.get_running_loop()
-                
-                # Set up signal handlers for graceful shutdown
-                for sig in (signal.SIGTERM, signal.SIGINT):
-                    loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(
-                        bot.close()
-                    ))
-                
-                try:
-                    # Start the bot (this will call setup_hook)
-                    await bot.start(DISCORD_TOKEN)
-                    
-                except Exception as e:
-                    logger.error(f"Error during bot operation: {e}")
-                    raise
-                finally:
-                    # Ensure cleanup happens
-                    if not loop.is_closed():
-                        await bot.close()
-                        
-            except Exception as e:
-                logger.error(f"Error during bot initialization: {e}")
-                raise
-
-        # Run everything in the event loop
         asyncio.run(main())
-        
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal error: {str(e)}")
         sys.exit(1)
