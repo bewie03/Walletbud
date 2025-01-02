@@ -446,109 +446,6 @@ ENV_VARS = {
         validator=validate_positive_int,
         required=False
     ),
-    'BATCH_SIZE': EnvVar(
-        name='BATCH_SIZE',
-        description="Batch size for processing operations",
-        default="100",
-        validator=validate_positive_int,
-        required=False
-    ),
-    'MAX_WEBHOOK_SIZE': EnvVar(
-        name='MAX_WEBHOOK_SIZE',
-        description="Max webhook size in bytes",
-        default="1048576",  # 1MB
-        validator=validate_positive_int,
-        required=False
-    ),
-    'WEBHOOK_RATE_LIMIT': EnvVar(
-        name='WEBHOOK_RATE_LIMIT',
-        description="Maximum webhooks per minute",
-        default="100",
-        validator=validate_positive_int,
-        required=False
-    ),
-    'PROCESS_INTERVAL': EnvVar(
-        name='PROCESS_INTERVAL',
-        description="Queue processing interval in seconds",
-        default="5",
-        validator=validate_positive_int,
-        required=False
-    ),
-    'MAX_ERROR_HISTORY': EnvVar(
-        name='MAX_ERROR_HISTORY',
-        description="Maximum errors to keep in history",
-        default="1000",
-        validator=validate_positive_int,
-        required=False
-    ),
-    'WALLET_CHECK_INTERVAL': EnvVar(
-        name='WALLET_CHECK_INTERVAL',
-        description="Wallet check interval in seconds",
-        default="300",
-        validator=validate_positive_int,
-        required=False
-    ),
-    'MIN_ADA_BALANCE': EnvVar(
-        name='MIN_ADA_BALANCE',
-        description="Minimum ADA balance for alerts",
-        default="5.0",
-        validator=lambda x, _: float(x)
-    ),
-    'MAX_TX_PER_HOUR': EnvVar(
-        name='MAX_TX_PER_HOUR',
-        description="Maximum transactions per hour",
-        default="100",
-        validator=validate_positive_int,
-        required=False
-    ),
-    'MINIMUM_YUMMI': EnvVar(
-        name='MINIMUM_YUMMI',
-        description="Minimum YUMMI tokens required",
-        default="1000",
-        validator=validate_positive_int,
-        required=False
-    ),
-    'YUMMI_POLICY_ID': EnvVar(
-        name='YUMMI_POLICY_ID',
-        description="Policy ID for YUMMI tokens",
-        validator=validate_policy_id,
-        required=True,
-    ),
-    'YUMMI_TOKEN_NAME': EnvVar(
-        name='YUMMI_TOKEN_NAME',
-        description="YUMMI Token Name (hex)",
-        validator=validate_token_name,
-        required=False,
-        default=None
-    ),
-    'RATE_LIMIT_WINDOW': EnvVar(
-        name='RATE_LIMIT_WINDOW',
-        description="Rate limit window in seconds",
-        default="60",
-        validator=validate_positive_int,
-        required=False
-    ),
-    'RATE_LIMIT_MAX_REQUESTS': EnvVar(
-        name='RATE_LIMIT_MAX_REQUESTS',
-        description="Maximum requests per rate limit window",
-        default="100",
-        validator=validate_positive_int,
-        required=False
-    ),
-    'MAX_QUEUE_SIZE': EnvVar(
-        name='MAX_QUEUE_SIZE',
-        description="Maximum webhook queue size",
-        default="1000",
-        validator=validate_positive_int,
-        required=False
-    ),
-    'MAX_EVENT_AGE': EnvVar(
-        name='MAX_EVENT_AGE',
-        description="Maximum event age in seconds",
-        default="3600",
-        validator=validate_positive_int,
-        required=False
-    ),
     'COMMAND_COOLDOWN': EnvVar(
         name='COMMAND_COOLDOWN',
         description="Cooldown between command uses (seconds)",
@@ -761,6 +658,19 @@ COMMAND_COOLDOWN = 3
 BALANCE_CHECK_INTERVAL = 300  # 5 minutes
 YUMMI_WARNING_THRESHOLD = 3   # Number of warnings before reset
 MINIMUM_YUMMI = 1000         # Minimum YUMMI tokens required
+
+# Webhook Queue Configuration
+WEBHOOK_CONFIG = {
+    'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '500')),  # Reduced from 1000
+    'BATCH_SIZE': int(os.getenv('WEBHOOK_BATCH_SIZE', '10')),  # Process webhooks in smaller batches
+    'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
+    'RETRY_DELAY': int(os.getenv('WEBHOOK_RETRY_DELAY', '5')),  # 5 seconds
+    'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '3600')),  # 1 hour
+    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '60')),  # 1 minute
+    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '100')),  # per window
+    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),  # 5 minutes
+    'MEMORY_LIMIT_MB': int(os.getenv('WEBHOOK_MEMORY_LIMIT_MB', '500')),  # 500MB memory limit
+}
 
 def validate_config():
     """Validate entire configuration"""
