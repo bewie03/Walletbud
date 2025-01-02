@@ -707,7 +707,8 @@ WEBHOOK_SECURITY = {
     'ALLOWED_IPS': [
         '52.19.143.237',  # Blockfrost IP 1
         '52.19.140.219',  # Blockfrost IP 2
-        '52.19.250.245'   # Blockfrost IP 3
+        '52.19.250.245',   # Blockfrost IP 3
+        '159.223.233.21'  # Additional Blockfrost IP
     ],
     'MEMORY_THRESHOLDS': {
         'warning': 75,    # 75% of memory limit
