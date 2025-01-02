@@ -125,6 +125,9 @@ def setup_logging():
 
 setup_logging()
 
+# Create logger for this module
+logger = logging.getLogger('walletbud.bot')
+
 class RateLimiter:
     """Rate limiter with burst support and per-endpoint tracking"""
     def __init__(self, max_requests: int, burst_limit: int, cooldown_seconds: int):
