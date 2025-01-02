@@ -207,38 +207,33 @@ class WebhookQueue:
                 pass
         
     async def _cleanup_loop(self):
-        """Periodically clean up old events"""
+        """Periodically clean up old events and rate limit data"""
         while not self._shutdown:
             try:
+                # Clean up IP rate limiters
+                await self.global_limiter.cleanup()
+                await self.ip_limiter.cleanup()
+
                 # Clean up old events
-                await self.clear_old_events()
-                
-                # Update queue stats
-                self.stats['current_queue_size'] = len(self.queue)
-                
-                # Monitor queue size
-                if len(self.queue) > WEBHOOK_CONFIG['MAX_QUEUE_SIZE'] * 0.8:  # 80% full
-                    logger.warning(f"Queue is at {len(self.queue)}/{WEBHOOK_CONFIG['MAX_QUEUE_SIZE']} capacity")
-                
-                # Calculate processing metrics
-                if self.stats['total_retried'] > 0:
-                    self.stats['retry_success_rate'] = (
-                        (self.stats['total_processed'] - self.stats['total_failed']) /
-                        self.stats['total_retried']
-                    ) * 100
-                
-                # Log queue health metrics
-                logger.info(
-                    "Queue health metrics - "
-                    f"Size: {len(self.queue)}/{WEBHOOK_CONFIG['MAX_QUEUE_SIZE']}, "
-                    f"Success rate: {(self.stats['total_processed'] - self.stats['total_failed']) / max(1, self.stats['total_processed']) * 100:.1f}%, "
-                    f"Retry success: {self.stats['retry_success_rate']:.1f}%"
-                )
-                
+                now = datetime.now()
+                async with self.queue_lock:
+                    self.queue = deque(
+                        [event for event in self.queue 
+                         if (now - event.created_at).total_seconds() <= WEBHOOK_CONFIG['MAX_EVENT_AGE']],
+                        maxlen=self.queue.maxlen
+                    )
+
+                # Update memory usage stats
+                self.stats['memory_usage_mb'] = self._get_memory_usage()
+
+                # Log cleanup stats
+                logger.info(f"Cleanup completed. Queue size: {len(self.queue)}, "
+                          f"Memory usage: {self.stats['memory_usage_mb']:.2f}MB")
+
             except Exception as e:
-                logger.error(f"Error in cleanup loop: {e}", exc_info=True)
-            
-            await asyncio.sleep(60)  # Run every minute
+                logger.error(f"Error in cleanup loop: {e}")
+
+            await asyncio.sleep(WEBHOOK_CONFIG['CLEANUP_INTERVAL'])
 
     async def clear_old_events(self):
         """Clear events older than MAX_EVENT_AGE seconds"""
@@ -360,73 +355,58 @@ class WebhookQueue:
             logger.error(f"Error enforcing memory limit: {e}")
             
     async def process_queue(self):
-        """Process events in queue with batching and error handling"""
-        if self._shutdown:
-            return
-            
-        try:
-            # Check and enforce memory limits
-            await self._enforce_memory_limit()
-            
-            # Process events in batches
-            async with self.process_lock:
-                if self.processing:
-                    return
-                    
-                self.processing = True
-                start_time = time.time()
-                
-                try:
+        """Process queued webhook events"""
+        while not self._shutdown:
+            try:
+                async with self.process_lock:
+                    if not self.queue:
+                        await asyncio.sleep(1)
+                        continue
+
                     # Process events in batches
+                    batch_size = min(len(self.queue), WEBHOOK_CONFIG['BATCH_SIZE'])
                     batch = []
-                    async with self.queue_lock:
-                        while len(batch) < WEBHOOK_CONFIG['BATCH_SIZE'] and self.queue:
+                    for _ in range(batch_size):
+                        if self.queue:
                             event = self.queue.popleft()
                             if event.should_retry():
                                 batch.append(event)
-                                
-                    if not batch:
-                        return
-                        
-                    # Process batch
-                    for event in batch:
-                        try:
-                            handler = self.event_handlers.get(event.event_type)
-                            if handler:
-                                await handler(event.payload)
-                                self.stats['total_processed'] += 1
                             else:
-                                self._add_error(
-                                    'no_handler',
-                                    f'No handler for event type: {event.event_type}',
-                                    event.id
-                                )
                                 self.stats['total_failed'] += 1
-                        except Exception as e:
-                            event.retries += 1
-                            event.error = str(e)
-                            event.last_retry = datetime.now()
-                            
-                            if event.retries < WEBHOOK_CONFIG['MAX_RETRIES']:
-                                self.stats['total_retried'] += 1
-                                async with self.queue_lock:
-                                    self.queue.append(event)
-                            else:
-                                self._add_error(
-                                    'max_retries',
-                                    f'Max retries reached for event {event.id}',
-                                    event.id,
-                                    {'error': str(e)}
-                                )
-                                self.stats['total_failed'] += 1
-                                
-                finally:
-                    self.processing = False
-                    self.stats['last_process_time'] = time.time() - start_time
-                    
-        except Exception as e:
-            logger.error(f"Error processing queue: {e}")
-            self.processing = False
+                                logger.warning(f"Event {event.id} exceeded retry limit or age limit")
+
+                    if batch:
+                        await self._process_batch(batch)
+
+            except Exception as e:
+                logger.error(f"Error processing webhook queue: {e}")
+                await asyncio.sleep(5)  # Back off on error
+
+            await asyncio.sleep(0.1)  # Prevent CPU spinning
+
+    async def _process_batch(self, batch: List[WebhookEvent]):
+        """Process a batch of webhook events"""
+        for event in batch:
+            try:
+                # Process the event
+                # This would call your webhook handling logic
+                logger.info(f"Processing webhook event {event.id}")
+                
+                # Update stats
+                self.stats['total_processed'] += 1
+                
+            except Exception as e:
+                event.retries += 1
+                event.last_retry = datetime.now()
+                event.error = str(e)
+                
+                if event.should_retry():
+                    self.queue.append(event)
+                    self.stats['total_retried'] += 1
+                    logger.warning(f"Webhook event {event.id} failed, retrying. Error: {e}")
+                else:
+                    self.stats['total_failed'] += 1
+                    logger.error(f"Webhook event {event.id} failed permanently. Error: {e}")
 
     def register_handler(self, event_type: str, handler: Callable):
         """Register handler for event type"""

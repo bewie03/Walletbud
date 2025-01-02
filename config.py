@@ -732,16 +732,16 @@ WEBHOOK_SECURITY = {
 }
 
 WEBHOOK_CONFIG = {
-    'MAX_QUEUE_SIZE': int(os.getenv('WEBHOOK_MAX_QUEUE_SIZE', '500')),
-    'BATCH_SIZE': int(os.getenv('WEBHOOK_BATCH_SIZE', '10')),
-    'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
-    'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '3600')),
-    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),
-    'MAX_PAYLOAD_SIZE': int(os.getenv('WEBHOOK_MAX_PAYLOAD_SIZE', '1048576')),  # 1MB
-    'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '1')),      # 1 second window
-    'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '10')), # 10 req/sec
-    'MEMORY_LIMIT_MB': int(os.getenv('WEBHOOK_MEMORY_LIMIT_MB', '100')),
-    'IDENTIFIER': os.getenv('WEBHOOK_IDENTIFIER', 'WalletBud')
+    'MAX_QUEUE_SIZE': 1000,
+    'BATCH_SIZE': 10,
+    'MAX_RETRIES': 3,
+    'MAX_EVENT_AGE': 3600,  # 1 hour
+    'CLEANUP_INTERVAL': 300,  # 5 minutes
+    'MAX_PAYLOAD_SIZE': 1024 * 1024,  # 1MB
+    'RATE_LIMIT_WINDOW': 60,  # 1 minute
+    'RATE_LIMIT_MAX_REQUESTS': 60,  # 60 requests per minute
+    'MEMORY_LIMIT_MB': 512,  # 512MB
+    'RETRY_DELAY': 60  # 1 minute between retries
 }
 
 # Validate webhook configuration
