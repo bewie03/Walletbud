@@ -1294,7 +1294,7 @@ class WalletBudBot(commands.Bot):
             # Get webhook data
             try:
                 webhook_data = await request.json()
-                logger.debug(f"Received webhook data: {json.dumps(webhook_data, indent=2)}")
+                logger.debug(f"Received webhook data: {json.dumps(webhook_data)}")
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON in webhook request {request_id}: {str(e)}")
                 return web.Response(status=400, text="Invalid JSON")
@@ -1322,27 +1322,50 @@ class WalletBudBot(commands.Bot):
 
             # Validate webhook data
             try:
-                validated_payload = self._validate_webhook_structure(webhook_data)
-            except ValueError as e:
-                logger.error(f"Invalid webhook structure in request {request_id}: {str(e)}")
-                return web.Response(status=400, text=str(e))
-
-            # Add to webhook queue for processing
-            try:
-                webhook_type = validated_payload.get('type', 'unknown')
+                # Log the raw webhook data for debugging
+                logger.debug(f"Raw webhook data type: {type(webhook_data)}")
+                logger.debug(f"Raw webhook data: {webhook_data}")
+                
+                # Handle string input
+                if isinstance(webhook_data, str):
+                    try:
+                        webhook_data = json.loads(webhook_data)
+                    except json.JSONDecodeError:
+                        raise ValueError("Invalid payload: string payload is not valid JSON")
+                
+                # Ensure we have a dictionary
+                if not isinstance(webhook_data, dict):
+                    raise ValueError(f"Invalid payload: must be a dictionary, got {type(webhook_data)}")
+                
+                # Get the payload, which might be nested or direct
+                payload = webhook_data.get('payload', webhook_data)
+                if not isinstance(payload, dict):
+                    raise ValueError(f"Invalid payload structure: payload must be a dictionary, got {type(payload)}")
+                
+                # Validate webhook type
+                webhook_type = payload.get('type')
+                if not webhook_type:
+                    raise ValueError("Missing required field: type")
+                
+                if webhook_type not in ['transaction', 'delegation']:
+                    raise ValueError(f"Invalid webhook type: {webhook_type}")
+                
+                # Add to webhook queue
                 await self.webhook_queue.add_event(
                     event_id=request_id,
                     event_type=webhook_type,
-                    payload=validated_payload,
+                    payload=payload,
                     headers=dict(request.headers)
                 )
-                logger.info(f"Added webhook {request_id} to queue for processing")
+                
+                logger.info(f"Successfully queued webhook {request_id} of type {webhook_type}")
                 return web.Response(status=202, text="Webhook queued for processing")
                 
-            except Exception as e:
-                logger.error(f"Error queueing webhook {request_id}: {str(e)}")
-                return web.Response(status=500, text="Error queueing webhook")
-
+            except ValueError as e:
+                error_msg = str(e)
+                logger.error(f"Invalid webhook structure in request {request_id}: {error_msg}")
+                return web.Response(status=400, text=error_msg)
+            
         except Exception as e:
             logger.error(f"Error processing webhook request {request_id}: {str(e)}")
             return web.Response(status=500, text="Internal server error")
