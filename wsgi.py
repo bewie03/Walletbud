@@ -77,5 +77,4 @@ if __name__ == '__main__':
         signal.signal(sig, lambda s, f: signal_handler())
     
     # Run the application
-    app = asyncio.get_event_loop().run_until_complete(init_app())
-    web.run_app(app, port=int(os.getenv('PORT', 8080)))
+    web.run_app(init_app(), port=int(os.getenv('PORT', 8080)))
