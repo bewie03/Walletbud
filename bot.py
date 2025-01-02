@@ -1473,6 +1473,45 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error processing delegation: {str(e)}")
             return False
 
+    async def _check_yummi_balances(self):
+        """Check Yummi token balances for all registered users"""
+        try:
+            logger.info("Starting Yummi balance check")
+            async with self.pool.acquire() as conn:
+                # Get all registered users
+                users = await conn.fetch("SELECT user_id, stake_address FROM users WHERE stake_address IS NOT NULL")
+                
+                for user in users:
+                    try:
+                        # Get user's stake address assets
+                        assets = await self.blockfrost_request(f'/accounts/{user["stake_address"]}/addresses/assets')
+                        
+                        # Find Yummi tokens
+                        yummi_assets = [
+                            asset for asset in assets 
+                            if asset.get('unit', '').startswith(YUMMI_POLICY_ID)
+                        ]
+                        
+                        if yummi_assets:
+                            # Calculate total Yummi balance
+                            total_yummi = sum(int(asset.get('quantity', 0)) for asset in yummi_assets)
+                            
+                            # Update user's Yummi balance
+                            await conn.execute(
+                                "UPDATE users SET yummi_balance = $1 WHERE user_id = $2",
+                                total_yummi, user['user_id']
+                            )
+                            
+                            logger.info(f"Updated Yummi balance for user {user['user_id']}: {total_yummi}")
+                    except Exception as e:
+                        logger.error(f"Error checking Yummi balance for user {user['user_id']}: {str(e)}")
+                        continue
+                        
+            logger.info("Completed Yummi balance check")
+            
+        except Exception as e:
+            logger.error(f"Error in Yummi balance check: {str(e)}")
+
 async def main(app):
     """Main entry point for the bot when running locally"""
     try:
