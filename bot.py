@@ -633,21 +633,24 @@ class WalletBudBot(commands.Bot):
             await self.init_database()
             await self.init_blockfrost()
             
-            # Start webhook queue
+            # Start webhook queue processor
             logger.info("Starting webhook queue processor...")
-            self.webhook_queue.start()
+            await self.webhook_queue.start()
             
-            # Start background tasks
+            # Start webhook server
+            await self.start_webhook()
+            
+            # Start Yummi balance check
+            logger.info("Starting Yummi balance check")
             self.check_yummi_balances.start()
+            
+            # Start health check
             self.health_check_task.start()
             
             # Get admin channel
             self.admin_channel = self.get_channel(self.admin_channel_id)
             if not self.admin_channel:
                 logger.warning(f"Could not find admin channel with ID {self.admin_channel_id}")
-            
-            # Start webhook server
-            await self.start_webhook()
             
             logger.info("Bot setup completed successfully")
             
@@ -1173,53 +1176,32 @@ class WalletBudBot(commands.Bot):
     async def init_blockfrost(self):
         """Initialize Blockfrost API client with proper error handling"""
         try:
-            # Check if we already have a session
-            if self.blockfrost_session:
-                try:
-                    # Test the session
-                    await self.blockfrost_request('/health')
-                    logger.info("Reusing existing Blockfrost session")
-                    return
-                except Exception:
-                    # Session is invalid, close it
-                    await self._cleanup_blockfrost()
-            
-            # Get project ID from environment
+            # Get project ID and network
             project_id = os.getenv('BLOCKFROST_PROJECT_ID')
             if not project_id:
-                raise Exception("BLOCKFROST_PROJECT_ID not set")
-            
-            # Create connector with proper SSL context
-            connector = aiohttp.TCPConnector(
-                limit=100,  # Connection pool size
-                ttl_dns_cache=300,  # DNS cache TTL
-                use_dns_cache=True,
-                ssl=self.ssl_context
-            )
-            
-            # Create session with proper timeout and headers
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+                raise ValueError("BLOCKFROST_PROJECT_ID environment variable not set")
+                
+            # Determine network from project ID
+            network = project_id[0:7]  # mainnet or testnet
+            self.blockfrost_base_url = BLOCKFROST_NETWORKS.get(network)
+            if not self.blockfrost_base_url:
+                raise ValueError(f"Invalid network prefix in project ID: {network}")
+                
+            # Create session with proper SSL context
             self.blockfrost_session = aiohttp.ClientSession(
-                headers={
-                    'project_id': project_id,
-                    'Content-Type': 'application/json'
-                },
-                timeout=timeout,
-                connector=connector,
-                raise_for_status=True
+                headers={'project_id': project_id},
+                connector=aiohttp.TCPConnector(ssl=self.ssl_context)
             )
             
-            # Store base URL
-            self.blockfrost_base_url = os.getenv('BLOCKFROST_BASE_URL', 'https://cardano-mainnet.blockfrost.io/api/v0').rstrip('/')
-            
-            # Test the connection
+            # Test connection
             await self.blockfrost_request('/health')
             logger.info("Blockfrost session initialized successfully")
-            await self.update_health_metrics('blockfrost_init', True)
             
         except Exception as e:
-            logger.error(f"Failed to initialize Blockfrost: {e}", exc_info=True)
-            await self.update_health_metrics('blockfrost_init', False)
+            logger.error(f"Failed to initialize Blockfrost session: {e}")
+            if self.blockfrost_session:
+                await self.blockfrost_session.close()
+                logger.info("Blockfrost session closed")
             raise
 
     async def blockfrost_request(self, endpoint: str, method: str = 'GET', **kwargs):
@@ -1379,25 +1361,17 @@ class WalletBudBot(commands.Bot):
     async def start_webhook(self):
         """Initialize webhook handling"""
         try:
-            # Initialize webhook app
-            app = web.Application()
-            app.router.add_post('/webhook', self.handle_webhook)
-            app.router.add_get('/health', self.health_check)
-            
-            # Add cleanup callback
-            app.on_cleanup.append(self.close)
-            
-            # Get port from environment, default to $PORT for Heroku
+            # Get port from environment variable (Heroku sets this)
             port = int(os.getenv('PORT', 8080))
             logger.info(f"Using port {port} for webhook server")
             
-            # Start webhook server
-            runner = web.AppRunner(app)
+            # Create webhook runner
+            runner = web.AppRunner(web.Application())
             await runner.setup()
-            site = web.TCPSite(runner, '0.0.0.0', port, ssl_context=self.ssl_context)
-            await site.start()
             
-            logger.info(f"Webhook server started on port {port}")
+            # Create site
+            site = web.TCPSite(runner, '0.0.0.0', port)
+            await site.start()
             
         except Exception as e:
             logger.error(f"Failed to start webhook server: {e}")
