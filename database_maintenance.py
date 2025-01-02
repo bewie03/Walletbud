@@ -32,11 +32,18 @@ class DatabaseMaintenance:
     """Handles database maintenance tasks"""
     def __init__(self):
         """Initialize database maintenance"""
-        self._maintenance_lock = asyncio.Lock()
+        self._maintenance_lock = None
         self._is_maintaining = False
         self._last_maintenance: Optional[datetime] = None
         self._maintenance_stats: Dict[str, Any] = {}
         self._pool = None
+        logger.info("DatabaseMaintenance initialized")
+
+    async def _ensure_lock(self):
+        """Ensure maintenance lock is created"""
+        if self._maintenance_lock is None:
+            self._maintenance_lock = asyncio.Lock()
+        return self._maintenance_lock
 
     async def _get_pool(self):
         """Get database pool, initializing if necessary"""
@@ -68,7 +75,8 @@ class DatabaseMaintenance:
                 await asyncio.sleep(sleep_seconds)
                 
                 # Run maintenance
-                await self.run_maintenance()
+                async with await self._ensure_lock():
+                    await self.run_maintenance()
                 
             except Exception as e:
                 logger.error(f"Error in maintenance task: {str(e)}")
@@ -87,66 +95,42 @@ class DatabaseMaintenance:
             logger.warning("Maintenance already in progress")
             return self._maintenance_stats
         
-        async with self._maintenance_lock:
+        async with await self._ensure_lock():
             try:
                 self._is_maintaining = True
                 start_time = datetime.now()
                 self._maintenance_stats = {
-                    'started_at': start_time,
+                    'start_time': start_time,
+                    'end_time': None,
+                    'duration': None,
                     'archived_transactions': 0,
                     'deleted_transactions': 0,
                     'optimized_tables': 0,
                     'errors': []
                 }
                 
-                logger.info("Starting database maintenance")
                 pool = await self._get_pool()
-                
-                # Get a dedicated connection for maintenance
                 async with pool.acquire() as conn:
-                    # Archive and delete in a transaction
-                    async with conn.transaction():
-                        try:
-                            # Archive old transactions
-                            archived = await self._archive_old_transactions(conn)
-                            self._maintenance_stats['archived_transactions'] = archived
-                            
-                            # Delete very old archived transactions
-                            deleted = await self._delete_old_archived_transactions(conn)
-                            self._maintenance_stats['deleted_transactions'] = deleted
-                            
-                        except Exception as e:
-                            logger.error(f"Error during archive/delete: {str(e)}")
-                            self._maintenance_stats['errors'].append(str(e))
-                            raise
+                    # Run maintenance tasks
+                    self._maintenance_stats['archived_transactions'] = await self._archive_old_transactions(conn)
+                    self._maintenance_stats['deleted_transactions'] = await self._delete_old_archived_transactions(conn)
+                    self._maintenance_stats['optimized_tables'] = await self._optimize_tables(conn)
                     
-                    # Optimize tables outside transaction
-                    try:
-                        optimized = await self._optimize_tables(conn)
-                        self._maintenance_stats['optimized_tables'] = optimized
-                    except Exception as e:
-                        logger.error(f"Error during optimization: {str(e)}")
-                        self._maintenance_stats['errors'].append(str(e))
+                end_time = datetime.now()
+                self._maintenance_stats['end_time'] = end_time
+                self._maintenance_stats['duration'] = (end_time - start_time).total_seconds()
+                self._last_maintenance = end_time
                 
-                # Update completion time
-                self._maintenance_stats['completed_at'] = datetime.now()
-                self._maintenance_stats['duration'] = (
-                    self._maintenance_stats['completed_at'] - 
-                    self._maintenance_stats['started_at']
-                ).total_seconds()
-                
-                logger.info(
-                    f"Maintenance completed in {self._maintenance_stats['duration']:.1f}s: "
-                    f"Archived {archived} transactions, "
-                    f"Deleted {deleted} old transactions, "
-                    f"Optimized {optimized} tables"
-                )
-                
+                logger.info(f"Maintenance completed in {self._maintenance_stats['duration']} seconds")
                 return self._maintenance_stats
+                
+            except Exception as e:
+                logger.error(f"Error during maintenance: {e}")
+                self._maintenance_stats['errors'].append(str(e))
+                raise DatabaseMaintenanceError(f"Maintenance failed: {e}")
                 
             finally:
                 self._is_maintaining = False
-                self._last_maintenance = datetime.now()
 
     async def _archive_old_transactions(self, conn) -> int:
         """Archive transactions older than ARCHIVE_AFTER_DAYS
@@ -154,46 +138,47 @@ class DatabaseMaintenance:
         Returns:
             int: Number of transactions archived
         """
-        total_archived = 0
-        cutoff_date = datetime.now() - timedelta(days=ARCHIVE_AFTER_DAYS)
-        
-        try:
-            # Get old transactions in batches
-            while True:
-                query = """
-                    WITH old_txs AS (
-                        SELECT tx_hash 
-                        FROM transactions 
-                        WHERE created_at < $1
-                        AND NOT archived
-                        LIMIT $2
-                        FOR UPDATE SKIP LOCKED
-                    )
-                    UPDATE transactions t
-                    SET archived = true,
-                        archived_at = NOW()
-                    FROM old_txs
-                    WHERE t.tx_hash = old_txs.tx_hash
-                    RETURNING t.tx_hash
-                """
-                
-                result = await conn.fetch(query, cutoff_date, BATCH_SIZE)
-                
-                if not result:
-                    break
+        async with await self._ensure_lock():
+            total_archived = 0
+            cutoff_date = datetime.now() - timedelta(days=ARCHIVE_AFTER_DAYS)
+            
+            try:
+                # Get old transactions in batches
+                while True:
+                    query = """
+                        WITH old_txs AS (
+                            SELECT tx_hash 
+                            FROM transactions 
+                            WHERE created_at < $1
+                            AND NOT archived
+                            LIMIT $2
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        UPDATE transactions t
+                        SET archived = true,
+                            archived_at = NOW()
+                        FROM old_txs
+                        WHERE t.tx_hash = old_txs.tx_hash
+                        RETURNING t.tx_hash
+                    """
                     
-                count = len(result)
-                total_archived += count
-                logger.info(f"Archived {count} transactions")
+                    result = await conn.fetch(query, cutoff_date, BATCH_SIZE)
+                    
+                    if not result:
+                        break
+                        
+                    count = len(result)
+                    total_archived += count
+                    logger.info(f"Archived {count} transactions")
+                    
+                    # Small delay between batches
+                    await asyncio.sleep(0.1)
                 
-                # Small delay between batches
-                await asyncio.sleep(0.1)
-            
-            return total_archived
-            
-        except Exception as e:
-            logger.error(f"Error archiving transactions: {str(e)}")
-            raise DatabaseMaintenanceError(f"Error archiving transactions: {str(e)}")
+                return total_archived
+                
+            except Exception as e:
+                logger.error(f"Error archiving transactions: {str(e)}")
+                raise DatabaseMaintenanceError(f"Error archiving transactions: {str(e)}")
 
     async def _delete_old_archived_transactions(self, conn) -> int:
         """Delete archived transactions older than DELETE_AFTER_DAYS
@@ -201,44 +186,45 @@ class DatabaseMaintenance:
         Returns:
             int: Number of transactions deleted
         """
-        total_deleted = 0
-        cutoff_date = datetime.now() - timedelta(days=DELETE_AFTER_DAYS)
-        
-        try:
-            # Delete in batches
-            while True:
-                query = """
-                    WITH old_archived AS (
-                        SELECT tx_hash 
-                        FROM transactions 
-                        WHERE archived 
-                        AND archived_at < $1
-                        LIMIT $2
-                        FOR UPDATE SKIP LOCKED
-                    )
-                    DELETE FROM transactions t
-                    USING old_archived
-                    WHERE t.tx_hash = old_archived.tx_hash
-                    RETURNING t.tx_hash
-                """
-                
-                result = await conn.fetch(query, cutoff_date, BATCH_SIZE)
-                
-                if not result:
-                    break
+        async with await self._ensure_lock():
+            total_deleted = 0
+            cutoff_date = datetime.now() - timedelta(days=DELETE_AFTER_DAYS)
+            
+            try:
+                # Delete in batches
+                while True:
+                    query = """
+                        WITH old_archived AS (
+                            SELECT tx_hash 
+                            FROM transactions 
+                            WHERE archived 
+                            AND archived_at < $1
+                            LIMIT $2
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        DELETE FROM transactions t
+                        USING old_archived
+                        WHERE t.tx_hash = old_archived.tx_hash
+                        RETURNING t.tx_hash
+                    """
                     
-                count = len(result)
-                total_deleted += count
-                logger.info(f"Deleted {count} old archived transactions")
+                    result = await conn.fetch(query, cutoff_date, BATCH_SIZE)
+                    
+                    if not result:
+                        break
+                        
+                    count = len(result)
+                    total_deleted += count
+                    logger.info(f"Deleted {count} old archived transactions")
+                    
+                    # Small delay between batches
+                    await asyncio.sleep(0.1)
                 
-                # Small delay between batches
-                await asyncio.sleep(0.1)
-            
-            return total_deleted
-            
-        except Exception as e:
-            logger.error(f"Error deleting old transactions: {str(e)}")
-            raise DatabaseMaintenanceError(f"Error deleting old transactions: {str(e)}")
+                return total_deleted
+                
+            except Exception as e:
+                logger.error(f"Error deleting old transactions: {str(e)}")
+                raise DatabaseMaintenanceError(f"Error deleting old transactions: {str(e)}")
 
     async def _optimize_tables(self, conn) -> int:
         """Optimize database tables
@@ -246,43 +232,44 @@ class DatabaseMaintenance:
         Returns:
             int: Number of tables optimized
         """
-        tables_optimized = 0
-        
-        try:
-            # Get list of tables
-            tables = await conn.fetch("""
-                SELECT tablename 
-                FROM pg_tables 
-                WHERE schemaname = 'public'
-                AND tablename NOT LIKE 'pg_%'
-                AND tablename NOT LIKE 'sql_%'
-            """)
+        async with await self._ensure_lock():
+            tables_optimized = 0
             
-            for table in tables:
-                table_name = table['tablename']
-                try:
-                    # Run ANALYZE first
-                    await conn.execute(f"ANALYZE {table_name}")
-                    logger.info(f"Analyzed table: {table_name}")
-                    
-                    # Then try VACUUM
-                    await conn.execute(f"VACUUM {table_name}")
-                    logger.info(f"Vacuumed table: {table_name}")
-                    
-                    tables_optimized += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error optimizing table {table_name}: {str(e)}")
-                    continue
+            try:
+                # Get list of tables
+                tables = await conn.fetch("""
+                    SELECT tablename 
+                    FROM pg_tables 
+                    WHERE schemaname = 'public'
+                    AND tablename NOT LIKE 'pg_%'
+                    AND tablename NOT LIKE 'sql_%'
+                """)
                 
-                # Small delay between tables
-                await asyncio.sleep(0.1)
-            
-            return tables_optimized
-            
-        except Exception as e:
-            logger.error(f"Error during table optimization: {str(e)}")
-            raise DatabaseMaintenanceError(f"Error during table optimization: {str(e)}")
+                for table in tables:
+                    table_name = table['tablename']
+                    try:
+                        # Run ANALYZE first
+                        await conn.execute(f"ANALYZE {table_name}")
+                        logger.info(f"Analyzed table: {table_name}")
+                        
+                        # Then try VACUUM
+                        await conn.execute(f"VACUUM {table_name}")
+                        logger.info(f"Vacuumed table: {table_name}")
+                        
+                        tables_optimized += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Error optimizing table {table_name}: {str(e)}")
+                        continue
+                        
+                    # Small delay between tables
+                    await asyncio.sleep(0.1)
+                
+                return tables_optimized
+                
+            except Exception as e:
+                logger.error(f"Error during table optimization: {str(e)}")
+                raise DatabaseMaintenanceError(f"Error during table optimization: {str(e)}")
 
     async def get_maintenance_stats(self) -> Dict[str, Any]:
         """Get statistics about the last maintenance run
@@ -290,11 +277,12 @@ class DatabaseMaintenance:
         Returns:
             Dict[str, Any]: Maintenance statistics
         """
-        return {
-            'last_run': self._last_maintenance,
-            'is_maintaining': self._is_maintaining,
-            'stats': self._maintenance_stats
-        }
+        async with await self._ensure_lock():
+            return {
+                'last_run': self._last_maintenance,
+                'is_maintaining': self._is_maintaining,
+                'stats': self._maintenance_stats
+            }
 
     async def cleanup(self):
         """Cleanup resources"""
@@ -319,7 +307,8 @@ class DatabaseMaintenanceWorker:
         """Run maintenance tasks"""
         try:
             logger.info("Starting database maintenance")
-            await self.maintenance.run_maintenance()
+            async with await self.maintenance._ensure_lock():
+                await self.maintenance.run_maintenance()
             self.last_maintenance = datetime.utcnow()
             logger.info("Database maintenance completed successfully")
         except Exception as e:

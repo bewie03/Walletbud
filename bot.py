@@ -240,6 +240,7 @@ class WalletBudBot(commands.Bot):
             *args,
             **kwargs
         )
+        logger.info("Base bot initialized")
         
         # Initialize shutdown manager
         self.shutdown_manager = ShutdownManager()
@@ -250,13 +251,21 @@ class WalletBudBot(commands.Bot):
         self.admin_channel = None  # Will be set in setup_hook
         
         # Initialize components
+        logger.info("Starting RateLimiter initialization...")
         self.rate_limiter = RateLimiter(MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_COOLDOWN)
+        logger.info("RateLimiter initialized")
+        
+        logger.info("Starting DatabaseMaintenance initialization...")
         self.db_maintenance = DatabaseMaintenance()
+        logger.info("DatabaseMaintenance initialized")
+        
         self.blockfrost_session = None
         self.session = None
         self.connector = None
+        logger.info("Session variables initialized to None")
         
         # Initialize health metrics
+        logger.info("Initializing health metrics...")
         self.health_metrics = {
             'start_time': None,
             'last_api_call': None,
@@ -267,6 +276,7 @@ class WalletBudBot(commands.Bot):
             'webhook_failure': 0,
             'errors': []
         }
+        logger.info("Health metrics initialized")
         
         # Initialize monitoring state
         self.monitoring_paused = False
@@ -301,13 +311,9 @@ class WalletBudBot(commands.Bot):
         
         # Add command locks
         self.command_locks = {}
-        self.health_lock = asyncio.Lock()  # Specific lock for health command
         
         # Initialize webhook rate limiting
         self.webhook_rate_limits = {}
-        
-        # Initialize health check task
-        self.health_lock = asyncio.Lock()
         
         # Initialize Discord rate limiting
         self.dm_rate_limits = defaultdict(lambda: {
@@ -458,19 +464,27 @@ class WalletBudBot(commands.Bot):
     async def setup_hook(self):
         """Set up the bot's background tasks and signal handlers"""
         try:
+            logger.info("Starting setup_hook...")
+            
             # Initialize database
+            logger.info("Initializing database...")
             await init_db()
+            logger.info("Database initialized")
             
             # Initialize Blockfrost client
+            logger.info("Initializing Blockfrost client...")
             await self.init_blockfrost()
+            logger.info("Blockfrost client initialized")
             
             # Load cogs
+            logger.info("Loading cogs...")
             await self.load_extension("cogs.system_commands")
             await self.load_extension("cogs.wallet_commands")
             logger.info("Loaded all cogs")
             
             # Sync command tree with Discord
             try:
+                logger.info("Syncing command tree...")
                 await self.tree.sync()
                 logger.info("Synced command tree with Discord")
             except Exception as e:
@@ -478,8 +492,10 @@ class WalletBudBot(commands.Bot):
                 raise
             
             # Start background tasks
+            logger.info("Starting background tasks...")
             self.check_yummi_balances.start()
             self.health_check_task.start()
+            logger.info("Background tasks started")
             
             # Set start time
             self.health_metrics['start_time'] = datetime.utcnow()
