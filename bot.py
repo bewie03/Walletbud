@@ -130,6 +130,36 @@ class RateLimiter:
         async with ep['lock']:
             ep['tokens'] = min(ep['tokens'] + 1, self.burst_limit)
 
+class ShutdownManager:
+    """Manages graceful shutdown of bot components"""
+    def __init__(self):
+        self._handlers = []
+        self._is_shutting_down = False
+        
+    def add_handler(self, handler):
+        """Add a cleanup handler to be called during shutdown"""
+        self._handlers.append(handler)
+        
+    def remove_handler(self, handler):
+        """Remove a cleanup handler"""
+        if handler in self._handlers:
+            self._handlers.remove(handler)
+            
+    async def shutdown(self):
+        """Execute all cleanup handlers in reverse order"""
+        if self._is_shutting_down:
+            return
+            
+        self._is_shutting_down = True
+        for handler in reversed(self._handlers):
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler()
+                else:
+                    handler()
+            except Exception as e:
+                logger.error(f"Error during shutdown handler execution: {e}")
+
 class WalletBudBot(commands.Bot):
     """WalletBud Discord bot"""
     NOTIFICATION_TYPES = {
