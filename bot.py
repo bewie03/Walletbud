@@ -794,11 +794,16 @@ class WalletBudBot(commands.Bot):
             # Check Discord connection
             discord_health = {
                 'healthy': self.is_ready() and self.health_metrics.get('discord_connection', False),
-                'latency': round(self.latency * 1000, 2),  # ms
+                'latency': round(self.latency * 1000, 2),  # in ms
                 'guild_count': len(self.guilds) if self.is_ready() else 0,
                 'status': self.health_metrics.get('discord_status', 'unknown')
             }
-            if not discord_health['healthy']:
+
+            # Only mark as unhealthy if we're not in the startup phase
+            startup_grace_period = 30  # seconds
+            bot_uptime = (datetime.utcnow() - self.health_metrics.get('start_time', datetime.utcnow())).total_seconds() if self.health_metrics.get('start_time') else 0
+            
+            if not discord_health['healthy'] and bot_uptime > startup_grace_period:
                 health_data['status'] = 'unhealthy'
                 discord_health['error'] = 'Bot is not connected to Discord'
             health_data['components']['discord'] = discord_health
@@ -969,15 +974,11 @@ class WalletBudBot(commands.Bot):
             logger.info(f"Bot ID: {self.user.id}")
             logger.info(f"Connected to {len(self.guilds)} guilds")
             
-            # Log connection details
-            await self.update_health_metrics('discord_connection', {
-                'connected_at': datetime.utcnow().isoformat(),
-                'guild_count': len(self.guilds),
-                'latency': round(self.latency * 1000, 2)  # in ms
-            })
-            
-            # Set up admin channel
-            await self.setup_admin_channel()
+            # Update health metrics
+            if not self.health_metrics.get('start_time'):
+                await self.update_health_metrics('start_time', datetime.utcnow())
+            await self.update_health_metrics('discord_connection', True)
+            await self.update_health_metrics('discord_status', 'connected')
             
             # Log successful startup to admin channel
             if self.admin_channel:
@@ -1194,11 +1195,14 @@ class WalletBudBot(commands.Bot):
                         error_text = await response.text()
                         raise Exception(f"Blockfrost API request failed: {response.status} - {error_text}")
             finally:
-                # Release rate limit token
-                self.rate_limiter.release('blockfrost')
-                
+                try:
+                    # Release rate limit token
+                    await self.rate_limiter.release('blockfrost')
+                except Exception as e:
+                    logger.error(f"Error releasing rate limit token: {e}", exc_info=True)
+                    
         except Exception as e:
-            logger.error(f"Error in Blockfrost request: {e}")
+            logger.error(f"Error in Blockfrost request: {e}", exc_info=True)
             raise
             
     async def on_resumed(self):
