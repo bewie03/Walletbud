@@ -920,61 +920,28 @@ class WalletBudBot(commands.Bot):
     async def on_ready(self):
         """Called when the bot is ready and connected to Discord"""
         try:
-            logger.info(f"Bot {self.user.name} is ready and connected to Discord!")
-            logger.info(f"Bot ID: {self.user.id}")
-            logger.info(f"Connected to {len(self.guilds)} guilds")
-            
-            # Update health metrics
-            if not self.health_metrics.get('start_time'):
-                await self.update_health_metrics('start_time', datetime.utcnow())
-            await self.update_health_metrics('discord_connection', True)
-            await self.update_health_metrics('discord_status', 'connected')
-            
-            # Log successful startup to admin channel
-            if self.admin_channel:
-                embed = discord.Embed(
-                    title="Bot Started Successfully",
-                    description="WalletBud bot is now online and ready!",
-                    color=discord.Color.green()
-                )
-                embed.add_field(
-                    name="Connection Details",
-                    value=f"Connected to {len(self.guilds)} guilds\nLatency: {round(self.latency * 1000, 2)}ms"
-                )
-                await self.admin_channel.send(embed=embed)
-            
+            if not hasattr(self, '_ready_once'):
+                self._ready_once = True
+                logger.info(f"Bot {self.user.name} is ready and connected to Discord!")
+                logger.info(f"Bot ID: {self.user.id}")
+                logger.info(f"Connected to {len(self.guilds)} guilds")
+                
+                # Set up admin channel
+                await self.setup_admin_channel()
+                
+                # Start background tasks if not already running
+                if not self.check_yummi_balances.is_running():
+                    self.check_yummi_balances.start()
+                if not self.health_check_task.is_running():
+                    self.health_check_task.start()
+                
+                # Update health metrics
+                await self.update_health_metrics('start_time', datetime.now().isoformat())
+                await self.update_health_metrics('discord_connection', True)
         except Exception as e:
-            logger.error(f"Error in on_ready: {str(e)}")
-            if hasattr(e, '__dict__'):
-                logger.error(f"Error details: {e.__dict__}")
-
-    async def setup_admin_channel(self):
-        """Set up the admin channel for bot notifications"""
-        try:
-            if not self.admin_channel_id:
-                logger.warning("No admin channel ID configured")
-                return
-
-            # Try to fetch the channel
-            channel = self.get_channel(int(self.admin_channel_id))
-            if not channel:
-                logger.error(f"Could not find admin channel with ID {self.admin_channel_id}")
-                return
-
-            self.admin_channel = channel
-            logger.info(f"Admin channel set up successfully: {channel.name}")
+            logger.error(f"Error in on_ready: {e}", exc_info=True)
+            await self.update_health_metrics('discord_connection', False)
             
-            # Update health metrics
-            await self.update_health_metrics('admin_channel', {
-                'id': self.admin_channel_id,
-                'name': channel.name,
-                'guild': channel.guild.name if channel.guild else None
-            })
-            
-        except Exception as e:
-            logger.error(f"Error setting up admin channel: {e}", exc_info=True)
-            self.admin_channel = None
-
     async def on_connect(self):
         """Called when the bot connects to Discord"""
         try:
@@ -999,7 +966,7 @@ class WalletBudBot(commands.Bot):
         """Check all connections and log their status"""
         try:
             # Check Discord connection
-            discord_status = "connected" if self.is_ready() else "disconnected"
+            discord_status = "connected" if self.is_ready() and not self.is_closed() else "disconnected"
             logger.info(f"Discord Status: {discord_status}")
             await self.update_health_metrics('discord_status', discord_status)
 

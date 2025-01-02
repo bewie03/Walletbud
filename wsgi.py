@@ -178,8 +178,8 @@ async def init_app():
         # Add cleanup callback
         app.on_cleanup.append(cleanup)
         
-        # Start bot in background
-        if not bot.is_closed():
+        # Start bot in background only if not running locally
+        if not bot.is_closed() and not os.getenv('LOCAL_DEV'):
             asyncio.create_task(bot.start(os.getenv('DISCORD_TOKEN')))
         
         return app
@@ -325,6 +325,9 @@ if __name__ == '__main__':
     # Register signal handlers
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda s, f: signal_handler())
+    
+    # Set local development flag
+    os.environ['LOCAL_DEV'] = 'true'
     
     # Run the application with optimized settings
     web.run_app(
