@@ -1458,28 +1458,15 @@ class WalletBudBot(commands.Bot):
             logger.error(f"Error in YUMMI balance check: {e}")
 
 if __name__ == "__main__":
-    # Create aiohttp app
+    # Create aiohttp app for local development
     app = web.Application()
-
+    
     # Initialize bot instance
     bot = WalletBudBot()
-
+    
     # Add webhook route
     app.router.add_post('/webhook', bot.handle_webhook)
-
-    async def main():
-        """Main entry point"""
-        try:
-            # Initialize database
-            await init_db()
-            
-            # Start bot
-            await bot.start(DISCORD_TOKEN)
-            
-        except Exception as e:
-            logger.error(f"Fatal error: {str(e)}")
-            raise
-
+    
     # Run everything in the event loop
     try:
         asyncio.run(main())
