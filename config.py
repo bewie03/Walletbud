@@ -699,12 +699,46 @@ WEBHOOK_CONFIG = {
     'MAX_RETRIES': int(os.getenv('WEBHOOK_MAX_RETRIES', '3')),
     'RETRY_DELAY': int(os.getenv('WEBHOOK_RETRY_DELAY', '5')),  # 5 seconds
     'MAX_EVENT_AGE': int(os.getenv('WEBHOOK_MAX_EVENT_AGE', '3600')),  # 1 hour
+    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),  # 5 minutes
     'RATE_LIMIT_WINDOW': int(os.getenv('WEBHOOK_RATE_LIMIT_WINDOW', '60')),  # 1 minute
     'RATE_LIMIT_MAX_REQUESTS': int(os.getenv('WEBHOOK_RATE_LIMIT_MAX_REQUESTS', '100')),  # per window
-    'CLEANUP_INTERVAL': int(os.getenv('WEBHOOK_CLEANUP_INTERVAL', '300')),  # 5 minutes
     'MEMORY_LIMIT_MB': int(os.getenv('WEBHOOK_MEMORY_LIMIT_MB', '500')),  # 500MB memory limit
 }
 
+def validate_webhook_config(config: dict) -> None:
+    """Validate webhook configuration values"""
+    if not isinstance(config.get('MAX_QUEUE_SIZE'), int) or config['MAX_QUEUE_SIZE'] < 1:
+        raise ValueError("WEBHOOK_MAX_QUEUE_SIZE must be a positive integer")
+    
+    if not isinstance(config.get('BATCH_SIZE'), int) or config['BATCH_SIZE'] < 1:
+        raise ValueError("WEBHOOK_BATCH_SIZE must be a positive integer")
+        
+    if not isinstance(config.get('MAX_RETRIES'), int) or config['MAX_RETRIES'] < 0:
+        raise ValueError("WEBHOOK_MAX_RETRIES must be a non-negative integer")
+        
+    if not isinstance(config.get('RETRY_DELAY'), int) or config['RETRY_DELAY'] < 1:
+        raise ValueError("WEBHOOK_RETRY_DELAY must be a positive integer")
+        
+    if not isinstance(config.get('MAX_EVENT_AGE'), int) or config['MAX_EVENT_AGE'] < 1:
+        raise ValueError("WEBHOOK_MAX_EVENT_AGE must be a positive integer")
+        
+    if not isinstance(config.get('CLEANUP_INTERVAL'), int) or config['CLEANUP_INTERVAL'] < 1:
+        raise ValueError("WEBHOOK_CLEANUP_INTERVAL must be a positive integer")
+        
+    if not isinstance(config.get('RATE_LIMIT_WINDOW'), int) or config['RATE_LIMIT_WINDOW'] < 1:
+        raise ValueError("WEBHOOK_RATE_LIMIT_WINDOW must be a positive integer")
+        
+    if not isinstance(config.get('RATE_LIMIT_MAX_REQUESTS'), int) or config['RATE_LIMIT_MAX_REQUESTS'] < 1:
+        raise ValueError("WEBHOOK_RATE_LIMIT_MAX_REQUESTS must be a positive integer")
+
+# Validate webhook config
+try:
+    validate_webhook_config(WEBHOOK_CONFIG)
+except ValueError as e:
+    logging.error(f"Webhook configuration validation failed: {e}")
+    raise
+
+# Validate entire configuration
 def validate_config():
     """Validate entire configuration"""
     errors = []

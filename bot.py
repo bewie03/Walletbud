@@ -25,19 +25,9 @@ from config import (
     DISCORD_TOKEN, APPLICATION_ID, ADMIN_CHANNEL_ID,
     BLOCKFROST_PROJECT_ID, BLOCKFROST_BASE_URL, DATABASE_URL, WEBHOOK_SECRET,
     MAX_REQUESTS_PER_SECOND, BURST_LIMIT, RATE_LIMIT_COOLDOWN,
-    YUMMI_POLICY_ID, HEALTH_METRICS_TTL,
+    YUMMI_POLICY_ID, HEALTH_METRICS_TTL, WEBHOOK_CONFIG,
     validate_config
 )
-from shutdown_manager import ShutdownManager
-from webhook_queue import WebhookQueue, WebhookEvent
-
-# Third-party imports
-import asyncpg
-import requests
-import psutil
-from blockfrost import BlockFrostApi, ApiUrls
-from blockfrost.api.cardano.network import network
-from urllib3.exceptions import InsecureRequestWarning
 
 # Local imports
 from database import (
@@ -88,11 +78,21 @@ from utils import (
     validate_policy_id,
     validate_token_name
 )
+from shutdown_manager import ShutdownManager
+from webhook_queue import WebhookQueue
 
 import random
 import functools
 from functools import wraps
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+# Third-party imports
+import asyncpg
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+from blockfrost import BlockFrostApi, ApiUrls
+from blockfrost.api.cardano.network import network
+from urllib3.exceptions import InsecureRequestWarning
 
 def get_request_id() -> str:
     """Generate a unique request ID for logging"""
@@ -315,7 +315,14 @@ class WalletBudBot(commands.Bot):
         
         # Initialize webhook queue with secret
         logger.info("Initializing webhook queue...")
-        self.webhook_queue = WebhookQueue(secret=WEBHOOK_SECRET)
+        self.webhook_queue = WebhookQueue(
+            secret=WEBHOOK_SECRET,
+            max_queue_size=WEBHOOK_CONFIG['MAX_QUEUE_SIZE'],
+            batch_size=WEBHOOK_CONFIG['BATCH_SIZE'],
+            max_retries=WEBHOOK_CONFIG['MAX_RETRIES'],
+            max_event_age=WEBHOOK_CONFIG['MAX_EVENT_AGE'],
+            cleanup_interval=WEBHOOK_CONFIG['CLEANUP_INTERVAL']
+        )
         logger.info("Webhook queue initialized")
         
         # Initialize database pool
@@ -424,36 +431,52 @@ class WalletBudBot(commands.Bot):
 
     def register_cleanup_handlers(self):
         """Register all cleanup handlers for graceful shutdown"""
-        # Database cleanup
-        self.shutdown_manager.register_handler(
-            'database',
-            self._cleanup_database
-        )
-        
-        # Session cleanup
-        self.shutdown_manager.register_handler(
-            'session',
-            self._cleanup_session
-        )
-        
-        # Tasks cleanup
-        self.shutdown_manager.register_handler(
-            'tasks',
-            self._cleanup_tasks
-        )
-        
-        # Blockfrost cleanup
-        self.shutdown_manager.register_handler(
-            'blockfrost',
-            self._cleanup_blockfrost
-        )
-        
-        # Webhook server cleanup
-        self.shutdown_manager.register_handler(
-            'webhook',
-            self._cleanup_webhook
-        )
-        
+        try:
+            # Register signal handlers
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGBREAK):
+                try:
+                    signal.signal(sig, self._handle_shutdown_signal)
+                    logger.info(f"Registered signal handler for {sig.name}")
+                except Exception as e:
+                    logger.warning(f"Failed to register signal handler for {sig.name}: {e}")
+                    
+            # Register atexit handler
+            atexit.register(self._handle_shutdown_atexit)
+            logger.info("Registered atexit handler")
+            
+            # Database cleanup
+            self.shutdown_manager.register_handler(
+                'database',
+                self._cleanup_database
+            )
+            
+            # Session cleanup
+            self.shutdown_manager.register_handler(
+                'session',
+                self._cleanup_session
+            )
+            
+            # Tasks cleanup
+            self.shutdown_manager.register_handler(
+                'tasks',
+                self._cleanup_tasks
+            )
+            
+            # Blockfrost cleanup
+            self.shutdown_manager.register_handler(
+                'blockfrost',
+                self._cleanup_blockfrost
+            )
+            
+            # Webhook server cleanup
+            self.shutdown_manager.register_handler(
+                'webhook',
+                self._cleanup_webhook
+            )
+            
+        except Exception as e:
+            logger.error(f"Error registering cleanup handlers: {e}")
+            
     async def _cleanup_database(self):
         """Cleanup database connections"""
         try:
@@ -511,46 +534,92 @@ class WalletBudBot(commands.Bot):
 
     async def close(self):
         """Clean up resources and perform graceful shutdown"""
+        logger.info("Starting graceful shutdown...")
+        
+        # Set shutdown flag
+        self._shutdown = True
+        
         try:
-            # Cancel background tasks first
+            # Cancel all background tasks
             await self._cancel_background_tasks()
             
-            # Close database pool
+            # Clean up components in order
+            await self._cleanup_webhook()
+            await self._cleanup_blockfrost()
+            await self._cleanup_session()
             await self._cleanup_database()
             
-            # Close sessions
-            await self._cleanup_session()
-            await self._cleanup_blockfrost()
-            
-            # Close webhook server
-            await self._cleanup_webhook()
-            
-            # Call parent's close method
+            # Call parent cleanup
             await super().close()
             
-            logger.info("Bot shutdown completed successfully")
+            logger.info("Graceful shutdown completed")
+            
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
             raise
-
+            
     async def _cancel_background_tasks(self):
         """Cancel all background tasks"""
         try:
-            # Get all tasks
-            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-            
-            # Cancel them
-            for task in tasks:
-                task.cancel()
+            if self.check_yummi_balances.is_running():
+                self.check_yummi_balances.cancel()
                 
-            # Wait for them to complete
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            if self.health_check_task.is_running():
+                self.health_check_task.cancel()
+                
+            logger.info("Background tasks cancelled")
             
-            logger.info(f"Cancelled {len(tasks)} background tasks")
         except Exception as e:
             logger.error(f"Error cancelling background tasks: {e}")
-
+            
+    async def _cleanup_webhook(self):
+        """Cleanup webhook server"""
+        try:
+            if hasattr(self, 'webhook_queue'):
+                await self.webhook_queue.stop()
+            logger.info("Webhook server stopped")
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up webhook server: {e}")
+            
+    async def _cleanup_blockfrost(self):
+        """Cleanup Blockfrost session"""
+        try:
+            if self.blockfrost_session:
+                await self.blockfrost_session.close()
+                self.blockfrost_session = None
+            logger.info("Blockfrost session closed")
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up Blockfrost session: {e}")
+            
+    async def _cleanup_session(self):
+        """Cleanup aiohttp session"""
+        try:
+            if self.session:
+                await self.session.close()
+                self.session = None
+                
+            if self.connector:
+                await self.connector.close()
+                self.connector = None
+                
+            logger.info("HTTP session closed")
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up HTTP session: {e}")
+            
+    async def _cleanup_database(self):
+        """Cleanup database connections"""
+        try:
+            if self.pool:
+                await self.pool.close()
+                self.pool = None
+            logger.info("Database connections closed")
+            
+        except Exception as e:
+            logger.error(f"Error cleaning up database connections: {e}")
+            
     async def setup_hook(self):
         """Set up the bot's background tasks and signal handlers"""
         try:
@@ -1304,14 +1373,27 @@ class WalletBudBot(commands.Bot):
     async def start_webhook(self):
         """Initialize webhook handling"""
         try:
-            # In production (Heroku), the route is registered in wsgi.py
-            # Just update metrics and log status
-            logger.info("Webhook handling initialized")
-            await self.update_health_metrics('webhook_server', 'started')
-                
+            # Initialize webhook app
+            app = web.Application()
+            app.router.add_post('/webhook', self.handle_webhook)
+            app.router.add_get('/health', self.health_check)
+            
+            # Add cleanup callback
+            app.on_cleanup.append(self.close)
+            
+            # Get port from environment
+            port = int(os.getenv('PORT', 8080))
+            
+            # Start webhook server
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, '0.0.0.0', port, ssl_context=self.ssl_context)
+            await site.start()
+            
+            logger.info(f"Webhook server started on port {port}")
+            
         except Exception as e:
-            logger.error(f"Failed to initialize webhook handling: {e}")
-            await self.update_health_metrics('webhook_server', 'failed')
+            logger.error(f"Failed to start webhook server: {e}")
             raise
 
     async def handle_webhook(self, request: web.Request) -> web.Response:
@@ -1430,12 +1512,18 @@ class WalletBudBot(commands.Bot):
                 logger.error(f"Error handling webhook request {request_id}: {str(e)}")
                 await self.update_health_metrics('webhook_failure')
                 return web.Response(status=500, text="Internal server error")
-{{ ... }}
+        
+        except Exception as e:
+            logger.error(f"Error in handle_webhook: {str(e)}")
+            await self.update_health_metrics('webhook_failure')
+            return web.Response(status=500, text="Internal server error")
 
 async def main(app):
     """Main entry point for the bot when running locally"""
+    global bot
     try:
         # Initialize the bot
+        bot = WalletBudBot()
         await bot.start(os.getenv('DISCORD_TOKEN'))
     except Exception as e:
         logger.error(f"Failed to start bot: {str(e)}")

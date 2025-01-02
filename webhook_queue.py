@@ -62,25 +62,24 @@ class WebhookEvent:
     last_retry: Optional[datetime] = None
     error: Optional[str] = None
     
-    @property
     def age_seconds(self) -> float:
         """Get age of event in seconds"""
         return (datetime.now() - self.created_at).total_seconds()
-    
-    @property
+        
     def should_retry(self) -> bool:
         """Check if event should be retried based on age and retry count"""
+        # Check if max retries exceeded
         if self.retries >= WEBHOOK_CONFIG['MAX_RETRIES']:
             return False
             
-        if self.age_seconds > WEBHOOK_CONFIG['MAX_EVENT_AGE']:
+        # Check if event is too old
+        if self.age_seconds() > WEBHOOK_CONFIG['MAX_EVENT_AGE']:
             return False
             
-        # Implement exponential backoff
+        # Check retry delay
         if self.last_retry:
-            backoff = min(300, 2 ** self.retries)  # Cap at 5 minutes
-            next_retry = self.last_retry + timedelta(seconds=backoff)
-            if datetime.now() < next_retry:
+            time_since_retry = (datetime.now() - self.last_retry).total_seconds()
+            if time_since_retry < WEBHOOK_CONFIG['RETRY_DELAY']:
                 return False
                 
         return True
@@ -107,9 +106,9 @@ class WebhookEvent:
             payload=data['payload'],
             headers=data['headers'],
             created_at=datetime.fromisoformat(data['created_at']),
-            retries=data['retries'],
-            last_retry=datetime.fromisoformat(data['last_retry']) if data['last_retry'] else None,
-            error=data['error']
+            retries=data.get('retries', 0),
+            last_retry=datetime.fromisoformat(data['last_retry']) if data.get('last_retry') else None,
+            error=data.get('error')
         )
 
 class RateLimiter:
@@ -128,15 +127,14 @@ class RateLimiter:
         async with self.lock:
             now = datetime.now()
             
-            # Cleanup old entries periodically
-            if (now - self.last_cleanup).total_seconds() > 60:  # Cleanup every minute
-                await self.cleanup()
+            # Clean up old entries if needed
+            await self.cleanup()
             
-            # Initialize if IP not seen before
+            # Get or initialize request history
             if ip not in self._requests:
                 self._requests[ip] = []
-            
-            # Remove old requests outside the window
+                
+            # Remove requests outside window
             window_start = now - timedelta(seconds=self.window)
             self._requests[ip] = [
                 ts for ts in self._requests[ip]
@@ -144,65 +142,77 @@ class RateLimiter:
             ]
             
             # Check if under limit
-            if len(self._requests[ip]) >= self.max_requests:
-                return False
+            if len(self._requests[ip]) < self.max_requests:
+                self._requests[ip].append(now)
+                return True
+                
+            return False
             
-            # Add new request timestamp
-            self._requests[ip].append(now)
-            
-            # Update memory tracking
-            self._total_memory = sum(
-                sys.getsizeof(timestamps) 
-                for timestamps in self._requests.values()
-            )
-            
-            # Check memory limit
-            if self._total_memory > WEBHOOK_CONFIG['MEMORY_LIMIT_MB'] * 1024 * 1024:
-                logger.warning(f"Rate limiter memory usage exceeds limit: {self._total_memory / (1024*1024):.1f}MB")
-                await self.cleanup(force=True)
-            
-            return True
-    
-    async def cleanup(self, force: bool = False):
+    async def cleanup(self, force: bool = False) -> None:
         """Remove old rate limit data"""
         now = datetime.now()
-        self.last_cleanup = now
         
-        # Calculate cutoff time
-        if force:
-            # If forced, remove everything older than 1 minute
-            cutoff = now - timedelta(minutes=1)
-        else:
-            cutoff = now - timedelta(seconds=self.window)
-        
-        # Remove old entries
-        for ip in list(self._requests.keys()):
-            self._requests[ip] = [
-                ts for ts in self._requests[ip]
-                if ts > cutoff
-            ]
+        # Only clean up every minute unless forced
+        if not force and (now - self.last_cleanup).total_seconds() < 60:
+            return
             
-            # Remove empty IPs
-            if not self._requests[ip]:
-                del self._requests[ip]
+        self.last_cleanup = now
+        window_start = now - timedelta(seconds=self.window)
         
-        # Update memory tracking
-        self._total_memory = sum(
-            sys.getsizeof(timestamps) 
-            for timestamps in self._requests.values()
-        )
-
+        # Remove old timestamps and empty IPs
+        async with self.lock:
+            for ip in list(self._requests.keys()):
+                self._requests[ip] = [
+                    ts for ts in self._requests[ip]
+                    if ts > window_start
+                ]
+                if not self._requests[ip]:
+                    del self._requests[ip]
+                    
+            # Update memory usage estimate
+            self._update_memory_usage()
+            
+    def _update_memory_usage(self) -> None:
+        """Update memory usage estimate"""
+        try:
+            # Rough estimate: 
+            # - Each IP is ~32 bytes
+            # - Each timestamp is ~24 bytes
+            # - Dict overhead ~48 bytes per entry
+            memory = 0
+            for ip, timestamps in self._requests.items():
+                memory += 32  # IP string
+                memory += 24 * len(timestamps)  # Timestamps
+                memory += 48  # Dict entry overhead
+                
+            self._total_memory = memory
+            
+            # Log warning if memory usage is high
+            memory_mb = memory / (1024 * 1024)
+            if memory_mb > 100:  # Warning at 100MB
+                logger.warning(f"Rate limiter memory usage high: {memory_mb:.2f}MB")
+                
+        except Exception as e:
+            logger.error(f"Error updating memory usage: {e}")
+            
 class WebhookQueue:
     """Queue for processing webhooks with rate limiting and retries"""
     
-    def __init__(self, secret: Optional[str] = None):
+    def __init__(self, secret: Optional[str] = None, max_queue_size: int = None,
+                 batch_size: int = None, max_retries: int = None, 
+                 max_event_age: int = None, cleanup_interval: int = None):
         """Initialize webhook queue
         
         Args:
             secret: Optional webhook secret for validation
+            max_queue_size: Maximum size of the queue
+            batch_size: Number of events to process in a batch
+            max_retries: Maximum number of retries per event
+            max_event_age: Maximum age of events in seconds
+            cleanup_interval: Interval for cleaning up old events
         """
         self.secret = secret
-        self.queue = deque(maxlen=WEBHOOK_CONFIG['MAX_QUEUE_SIZE'])
+        self.queue = deque(maxlen=max_queue_size or WEBHOOK_CONFIG['MAX_QUEUE_SIZE'])
         self.processing = False
         self.process_lock = asyncio.Lock()
         self.queue_lock = asyncio.Lock()
@@ -210,7 +220,7 @@ class WebhookQueue:
             window=WEBHOOK_CONFIG['RATE_LIMIT_WINDOW'],
             max_requests=WEBHOOK_CONFIG['RATE_LIMIT_MAX_REQUESTS']
         )
-        self.errors = deque(maxlen=WEBHOOK_CONFIG['MAX_QUEUE_SIZE'])
+        self.errors = deque(maxlen=max_queue_size or WEBHOOK_CONFIG['MAX_QUEUE_SIZE'])
         self.stats = {
             'total_received': 0,
             'total_processed': 0,
@@ -228,6 +238,10 @@ class WebhookQueue:
         self.event_handlers = {}
         self._shutdown = False
         self._cleanup_task = None
+        self.batch_size = batch_size or WEBHOOK_CONFIG['BATCH_SIZE']
+        self.max_retries = max_retries or WEBHOOK_CONFIG['MAX_RETRIES']
+        self.max_event_age = max_event_age or WEBHOOK_CONFIG['MAX_EVENT_AGE']
+        self.cleanup_interval = cleanup_interval or WEBHOOK_CONFIG['CLEANUP_INTERVAL']
         
     async def start(self):
         """Start the webhook queue processor"""
@@ -286,14 +300,14 @@ class WebhookQueue:
                 current_time = datetime.now()
                 old_events = [
                     event for event in self.queue
-                    if (current_time - event.created_at).total_seconds() > WEBHOOK_CONFIG['MAX_EVENT_AGE']
+                    if (current_time - event.created_at).total_seconds() > self.max_event_age
                 ]
                 
                 for event in old_events:
                     self.queue.remove(event)
                     self._add_error(
                         'event_expired',
-                        f'Event {event.id} expired after {WEBHOOK_CONFIG["MAX_EVENT_AGE"]} seconds',
+                        f'Event {event.id} expired after {self.max_event_age} seconds',
                         event.id,
                         {'age': (current_time - event.created_at).total_seconds()}
                     )
@@ -358,81 +372,114 @@ class WebhookQueue:
                           event_id)
             return False
             
+    async def _check_memory_usage(self) -> float:
+        """Check current memory usage of the queue
+        
+        Returns:
+            float: Current memory usage in MB
+        """
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
+            self.stats['memory_usage_mb'] = memory_mb
+            return memory_mb
+        except Exception as e:
+            logger.error(f"Error checking memory usage: {e}")
+            return 0.0
+            
+    async def _enforce_memory_limit(self) -> None:
+        """Enforce memory limits by removing old events if necessary"""
+        try:
+            memory_mb = await self._check_memory_usage()
+            if memory_mb > WEBHOOK_CONFIG['MEMORY_LIMIT_MB']:
+                logger.warning(f"Memory usage ({memory_mb:.2f}MB) exceeds limit ({WEBHOOK_CONFIG['MEMORY_LIMIT_MB']}MB)")
+                
+                # Remove oldest events until under limit
+                async with self.queue_lock:
+                    while memory_mb > WEBHOOK_CONFIG['MEMORY_LIMIT_MB'] and self.queue:
+                        event = self.queue.popleft()
+                        self._add_error(
+                            'memory_limit',
+                            f'Removed event {event.id} due to memory limit',
+                            event.id,
+                            {'memory_usage_mb': memory_mb}
+                        )
+                        memory_mb = await self._check_memory_usage()
+                        
+                logger.info(f"Memory usage after cleanup: {memory_mb:.2f}MB")
+        except Exception as e:
+            logger.error(f"Error enforcing memory limit: {e}")
+            
     async def process_queue(self):
         """Process events in queue with batching and error handling"""
-        if self.processing:
+        if self._shutdown:
             return
             
-        async with self.process_lock:
-            self.processing = True
-            start_time = time.time()
+        try:
+            # Check and enforce memory limits
+            await self._enforce_memory_limit()
             
-            try:
-                while self.queue and not self._shutdown:
+            # Process events in batches
+            async with self.process_lock:
+                if self.processing:
+                    return
+                    
+                self.processing = True
+                start_time = time.time()
+                
+                try:
                     # Process events in batches
                     batch = []
                     async with self.queue_lock:
-                        while len(batch) < WEBHOOK_CONFIG['BATCH_SIZE'] and self.queue:
+                        while len(batch) < self.batch_size and self.queue:
                             event = self.queue.popleft()
                             if event.should_retry():
                                 batch.append(event)
-                            else:
-                                self._add_error(
-                                    'max_retries_exceeded',
-                                    f'Event {event.id} exceeded max retries',
-                                    event.id,
-                                    {'retries': event.retries}
-                                )
-                    
+                                
+                    if not batch:
+                        return
+                        
                     # Process batch
                     for event in batch:
                         try:
-                            # Get handler for event type
                             handler = self.event_handlers.get(event.event_type)
-                            if not handler:
-                                raise ValueError(f"No handler for event type: {event.event_type}")
-                            
-                            # Process event
-                            await handler(event.payload)
-                            self.stats['total_processed'] += 1
-                            
-                            # Update processing time average
-                            process_time = time.time() - start_time
-                            if self.stats['processing_time_avg'] == 0:
-                                self.stats['processing_time_avg'] = process_time
+                            if handler:
+                                await handler(event.payload)
+                                self.stats['total_processed'] += 1
                             else:
-                                self.stats['processing_time_avg'] = (
-                                    self.stats['processing_time_avg'] * 0.9 +
-                                    process_time * 0.1
+                                self._add_error(
+                                    'no_handler',
+                                    f'No handler for event type: {event.event_type}',
+                                    event.id
                                 )
-                            
+                                self.stats['total_failed'] += 1
                         except Exception as e:
                             event.retries += 1
                             event.error = str(e)
                             event.last_retry = datetime.now()
                             
-                            if event.should_retry():
-                                # Re-queue event
+                            if event.retries < self.max_retries:
+                                self.stats['total_retried'] += 1
                                 async with self.queue_lock:
                                     self.queue.append(event)
-                                self.stats['total_retried'] += 1
                             else:
+                                self._add_error(
+                                    'max_retries',
+                                    f'Max retries reached for event {event.id}',
+                                    event.id,
+                                    {'error': str(e)}
+                                )
                                 self.stats['total_failed'] += 1
-                            
-                            self._add_error(
-                                'processing_error',
-                                f'Error processing event {event.id}: {str(e)}',
-                                event.id,
-                                {'retries': event.retries}
-                            )
+                                
+                finally:
+                    self.processing = False
+                    self.stats['last_process_time'] = time.time() - start_time
                     
-                    # Update last process time
-                    self.stats['last_process_time'] = datetime.now()
-                    
-            except Exception as e:
-                logger.error(f"Error in process_queue: {e}", exc_info=True)
-            finally:
-                self.processing = False
+        except Exception as e:
+            logger.error(f"Error processing queue: {e}")
+            self.processing = False
 
     def register_handler(self, event_type: str, handler: Callable):
         """Register handler for event type"""
